@@ -32,7 +32,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--camera-id", default="camera_1")
     parser.add_argument("--model", default="yolov8n.pt")
     parser.add_argument("--confidence", type=float, default=0.25)
-    parser.add_argument("--overlap-threshold", type=float, default=0.18)
+    parser.add_argument(
+        "--anchor-y-ratio",
+        type=float,
+        default=0.9,
+        help="Vertical position inside the YOLO box used as the vehicle ground anchor.",
+    )
+    parser.add_argument(
+        "--fallback-overlap-threshold",
+        type=float,
+        default=0.7,
+        help="Only use bbox overlap when no anchor lands inside a space and overlap is very strong.",
+    )
     return parser.parse_args()
 
 
@@ -169,19 +180,21 @@ def store_occupancy(
     image_id: int,
     spaces: list[dict[str, Any]],
     stored_detections: list[tuple[int, Detection]],
-    overlap_threshold: float,
+    anchor_y_ratio: float,
+    fallback_overlap_threshold: float,
 ) -> None:
     now = utc_now()
+    occupied_by_space_id = assign_detections_to_spaces(
+        spaces,
+        stored_detections,
+        anchor_y_ratio,
+        fallback_overlap_threshold,
+    )
     for space in spaces:
-        best_detection_id = None
-        best_score = 0.0
-        for detection_id, detection in stored_detections:
-            score = occupancy_score(space["polygon"], detection.box)
-            if score > best_score:
-                best_detection_id = detection_id
-                best_score = score
-
-        occupied = int(best_score >= overlap_threshold)
+        match = occupied_by_space_id.get(space["id"])
+        occupied = int(match is not None)
+        best_detection_id = match["detection_id"] if match else None
+        best_score = match["score"] if match else 0.0
         conn.execute(
             """
             INSERT INTO occupancy_observations
@@ -197,21 +210,87 @@ def store_occupancy(
         )
 
 
+def assign_detections_to_spaces(
+    spaces: list[dict[str, Any]],
+    stored_detections: list[tuple[int, Detection]],
+    anchor_y_ratio: float,
+    fallback_overlap_threshold: float,
+) -> dict[int, dict[str, float | int]]:
+    candidates_by_space_id: dict[int, list[dict[str, float | int]]] = {
+        space["id"]: [] for space in spaces
+    }
+
+    for detection_id, detection in stored_detections:
+        anchor = box_anchor(detection.box, anchor_y_ratio)
+        containing_spaces = [
+            space
+            for space in spaces
+            if point_in_polygon(anchor, space["polygon"])
+        ]
+        if containing_spaces:
+            best_space = max(
+                containing_spaces,
+                key=lambda space: occupancy_overlap_score(space["polygon"], detection.box),
+            )
+            candidates_by_space_id[best_space["id"]].append(
+                {
+                    "detection_id": detection_id,
+                    "score": 1.0,
+                    "confidence": detection.confidence,
+                }
+            )
+            continue
+
+        fallback_space = None
+        fallback_score = 0.0
+        for space in spaces:
+            score = occupancy_overlap_score(space["polygon"], detection.box)
+            if score > fallback_score:
+                fallback_space = space
+                fallback_score = score
+        if fallback_space and fallback_score >= fallback_overlap_threshold:
+            candidates_by_space_id[fallback_space["id"]].append(
+                {
+                    "detection_id": detection_id,
+                    "score": fallback_score,
+                    "confidence": detection.confidence,
+                }
+            )
+
+    occupied_by_space_id = {}
+    for space_id, candidates in candidates_by_space_id.items():
+        if candidates:
+            occupied_by_space_id[space_id] = max(
+                candidates,
+                key=lambda candidate: (candidate["score"], candidate["confidence"]),
+            )
+    return occupied_by_space_id
+
+
 def box_to_json(box: tuple[float, float, float, float]) -> dict[str, float]:
     x1, y1, x2, y2 = box
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
 
 
-def occupancy_score(polygon: list[dict[str, float]], box: tuple[float, float, float, float]) -> float:
+def occupancy_overlap_score(
+    polygon: list[dict[str, float]],
+    box: tuple[float, float, float, float],
+) -> float:
     clipped = clip_polygon_to_box(polygon, box)
-    overlap_ratio = polygon_area(clipped) / max(polygon_area(polygon), 1.0)
-    center_bonus = 1.0 if point_in_polygon(box_center(box), polygon) else 0.0
-    return max(overlap_ratio, center_bonus)
+    return polygon_area(clipped) / max(polygon_area(polygon), 1.0)
+
+
+def box_anchor(box: tuple[float, float, float, float], y_ratio: float) -> dict[str, float]:
+    x1, y1, x2, y2 = box
+    clamped_ratio = max(0.0, min(1.0, y_ratio))
+    return {
+        "x": (x1 + x2) / 2,
+        "y": y1 + (y2 - y1) * clamped_ratio,
+    }
 
 
 def box_center(box: tuple[float, float, float, float]) -> dict[str, float]:
-    x1, y1, x2, y2 = box
-    return {"x": (x1 + x2) / 2, "y": (y1 + y2) / 2}
+    return box_anchor(box, 0.5)
 
 
 def polygon_area(points: list[dict[str, float]]) -> float:
@@ -328,7 +407,8 @@ def main() -> None:
                 image["id"],
                 spaces,
                 stored_detections,
-                args.overlap_threshold,
+                args.anchor_y_ratio,
+                args.fallback_overlap_threshold,
             )
             occupied_count = conn.execute(
                 """

@@ -36,6 +36,8 @@ python3 -m venv .venv
 
 The detector writes raw YOLO vehicle boxes to `detections` and per-space occupied/empty decisions to `occupancy_observations`. The UI will show vehicle boxes and tint marked spaces after detection results exist for the selected image.
 
+Occupancy is assigned using a vehicle ground-anchor point near the bottom-center of each YOLO box. Each detection can occupy at most one marked space, which avoids marking a neighboring space occupied just because a car visually overlaps it in the 2D image.
+
 ## Project Shape
 
 ```text
