@@ -87,6 +87,32 @@ class Database:
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(camera_id) REFERENCES cameras(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS detections (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    model_name TEXT NOT NULL,
+                    class_id INTEGER NOT NULL,
+                    class_name TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    bbox_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(image_id) REFERENCES images(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS occupancy_observations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    image_id INTEGER NOT NULL,
+                    parking_space_id INTEGER NOT NULL,
+                    occupied INTEGER NOT NULL,
+                    score REAL NOT NULL,
+                    detection_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(image_id, parking_space_id),
+                    FOREIGN KEY(image_id) REFERENCES images(id),
+                    FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
+                    FOREIGN KEY(detection_id) REFERENCES detections(id)
+                );
                 """
             )
             conn.execute(
@@ -168,6 +194,39 @@ class Database:
             )
             return [space_from_row(row) for row in rows]
 
+    def get_image_observations(self, image_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            detections = [
+                detection_from_row(row)
+                for row in conn.execute(
+                    """
+                    SELECT id, image_id, model_name, class_id, class_name, confidence, bbox_json
+                    FROM detections
+                    WHERE image_id = ?
+                    ORDER BY confidence DESC
+                    """,
+                    (image_id,),
+                )
+            ]
+            occupancy = [
+                {
+                    "space_id": row["parking_space_id"],
+                    "occupied": bool(row["occupied"]),
+                    "score": row["score"],
+                    "detection_id": row["detection_id"],
+                }
+                for row in conn.execute(
+                    """
+                    SELECT parking_space_id, occupied, score, detection_id
+                    FROM occupancy_observations
+                    WHERE image_id = ?
+                    ORDER BY parking_space_id
+                    """,
+                    (image_id,),
+                )
+            ]
+            return {"image_id": image_id, "detections": detections, "occupancy": occupancy}
+
     def create_space(self, camera_id: str, label: str, polygon: list[dict[str, float]]) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
@@ -231,6 +290,12 @@ def space_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
+def detection_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    item["bbox"] = json.loads(item.pop("bbox_json"))
+    return item
+
+
 db = Database(DB_PATH)
 
 
@@ -259,6 +324,13 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/spaces":
             camera_id = query.get("camera_id", [DEFAULT_CAMERA_ID])[0]
             self.send_json({"spaces": db.list_spaces(camera_id)})
+        elif path == "/api/observations":
+            try:
+                image_id = int(query.get("image_id", ["0"])[0])
+            except ValueError:
+                self.send_json({"error": "image_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json(db.get_image_observations(image_id))
         elif path.startswith("/api/config/"):
             camera_id = safe_segment(unquote(path.removeprefix("/api/config/")))
             self.send_json({"camera_id": camera_id, "spaces": db.list_spaces(camera_id)})

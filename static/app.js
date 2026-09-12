@@ -5,9 +5,11 @@ const state = {
   cameraId: "camera_1",
   selectedImage: null,
   imageElement: null,
+  observations: { detections: [], occupancy: [] },
   mode: "idle",
   draftPoints: [],
   hoveredSpaceId: null,
+  hoveredDetectionId: null,
 };
 
 const cameraSelect = document.querySelector("#cameraSelect");
@@ -100,6 +102,7 @@ async function selectImage(image, options = {}) {
   state.selectedImage = image;
   state.draftPoints = [];
   state.hoveredSpaceId = null;
+  state.hoveredDetectionId = null;
   renderImages();
   updateDraftControls();
   if (options.scrollIntoView !== false) {
@@ -169,12 +172,15 @@ function renderSpaces() {
 async function loadSelectedImage() {
   if (!state.selectedImage) {
     state.imageElement = null;
+    state.observations = { detections: [], occupancy: [] };
+    state.hoveredDetectionId = null;
     canvas.style.display = "none";
     emptyState.style.display = "block";
     draw();
     return;
   }
 
+  state.observations = await fetchImageObservations(state.selectedImage.id);
   const img = new Image();
   img.onload = () => {
     state.imageElement = img;
@@ -183,9 +189,24 @@ async function loadSelectedImage() {
     canvas.style.display = "block";
     emptyState.style.display = "none";
     draw();
-    setStatus(`${state.spaces.length} spaces configured`);
+    const observedCount = state.observations.occupancy.length;
+    const occupiedCount = state.observations.occupancy.filter((item) => item.occupied).length;
+    setStatus(
+      observedCount > 0
+        ? `${occupiedCount}/${observedCount} observed occupied`
+        : `${state.spaces.length} spaces configured`,
+    );
   };
   img.src = state.selectedImage.url;
+}
+
+async function fetchImageObservations(imageId) {
+  try {
+    return await fetchJson(`/api/observations?image_id=${encodeURIComponent(imageId)}`);
+  } catch (error) {
+    console.warn(error);
+    return { detections: [], occupancy: [] };
+  }
 }
 
 function draw() {
@@ -198,6 +219,9 @@ function draw() {
   for (const space of state.spaces) {
     drawPolygon(space, space.id === state.hoveredSpaceId);
   }
+  for (const detection of state.observations.detections) {
+    drawDetection(detection, detection.id === state.hoveredDetectionId);
+  }
   if (state.draftPoints.length > 0) {
     drawDraft();
   }
@@ -205,6 +229,8 @@ function draw() {
 
 function drawPolygon(space, isHovered) {
   const points = space.polygon;
+  const observation = observationForSpace(space.id);
+  const occupied = observation?.occupied;
   ctx.beginPath();
   points.forEach((point, index) => {
     if (index === 0) {
@@ -214,10 +240,18 @@ function drawPolygon(space, isHovered) {
     }
   });
   ctx.closePath();
-  ctx.fillStyle = isHovered ? "rgba(38, 166, 154, 0.3)" : "rgba(38, 166, 154, 0.18)";
+  if (occupied === true) {
+    ctx.fillStyle = isHovered ? "rgba(220, 38, 38, 0.28)" : "rgba(220, 38, 38, 0.16)";
+    ctx.strokeStyle = "#dc2626";
+  } else if (occupied === false) {
+    ctx.fillStyle = isHovered ? "rgba(38, 166, 154, 0.28)" : "rgba(38, 166, 154, 0.14)";
+    ctx.strokeStyle = "#26a69a";
+  } else {
+    ctx.fillStyle = isHovered ? "rgba(38, 166, 154, 0.3)" : "rgba(38, 166, 154, 0.18)";
+    ctx.strokeStyle = "#26a69a";
+  }
   ctx.fill();
   ctx.lineWidth = isHovered ? 4 : 3;
-  ctx.strokeStyle = "#26a69a";
   ctx.stroke();
 
   if (!isHovered) {
@@ -232,6 +266,33 @@ function drawPolygon(space, isHovered) {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(space.label, center.x, center.y);
+}
+
+function drawDetection(detection, isHovered) {
+  const { x1, y1, x2, y2 } = detection.bbox;
+  const width = x2 - x1;
+  const height = y2 - y1;
+  ctx.lineWidth = isHovered ? 3 : 2;
+  ctx.strokeStyle = isHovered ? "rgba(14, 93, 86, 1)" : "rgba(14, 93, 86, 0.82)";
+  ctx.strokeRect(x1, y1, width, height);
+
+  if (!isHovered) {
+    return;
+  }
+
+  ctx.fillStyle = "rgba(14, 93, 86, 0.75)";
+  const label = `${detection.class_name} ${Math.round(detection.confidence * 100)}%`;
+  ctx.font = "12px system-ui, sans-serif";
+  const labelWidth = Math.max(72, ctx.measureText(label).width + 12);
+  ctx.fillRect(x1, Math.max(0, y1 - 22), labelWidth, 22);
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "left";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, x1 + 6, Math.max(11, y1 - 11));
+}
+
+function observationForSpace(spaceId) {
+  return state.observations.occupancy.find((item) => item.space_id === spaceId);
 }
 
 function drawDraft() {
@@ -286,6 +347,16 @@ function spaceAtPoint(point) {
     const space = state.spaces[index];
     if (pointInPolygon(point, space.polygon)) {
       return space;
+    }
+  }
+  return null;
+}
+
+function detectionAtPoint(point) {
+  for (const detection of state.observations.detections) {
+    const { x1, y1, x2, y2 } = detection.bbox;
+    if (point.x >= x1 && point.x <= x2 && point.y >= y1 && point.y <= y2) {
+      return detection;
     }
   }
   return null;
@@ -362,6 +433,7 @@ markSpaceButton.addEventListener("click", () => {
   }
   state.mode = state.mode === "marking" ? "idle" : "marking";
   state.draftPoints = [];
+  state.hoveredDetectionId = null;
   updateDraftControls();
   draw();
   setStatus(state.mode === "marking" ? "Click four corners of a space" : "");
@@ -401,18 +473,26 @@ canvas.addEventListener("mousemove", (event) => {
   if (!state.imageElement || state.mode === "marking") {
     return;
   }
-  const hoveredSpace = spaceAtPoint(canvasPoint(event));
+  const point = canvasPoint(event);
+  const hoveredSpace = spaceAtPoint(point);
+  const hoveredDetection = detectionAtPoint(point);
   const hoveredSpaceId = hoveredSpace?.id || null;
-  if (state.hoveredSpaceId !== hoveredSpaceId) {
+  const hoveredDetectionId = hoveredDetection?.id || null;
+  if (
+    state.hoveredSpaceId !== hoveredSpaceId ||
+    state.hoveredDetectionId !== hoveredDetectionId
+  ) {
     state.hoveredSpaceId = hoveredSpaceId;
+    state.hoveredDetectionId = hoveredDetectionId;
     draw();
   }
-  canvas.style.cursor = hoveredSpace ? "pointer" : "crosshair";
+  canvas.style.cursor = hoveredSpace || hoveredDetection ? "pointer" : "crosshair";
 });
 
 canvas.addEventListener("mouseleave", () => {
-  if (state.hoveredSpaceId !== null) {
+  if (state.hoveredSpaceId !== null || state.hoveredDetectionId !== null) {
     state.hoveredSpaceId = null;
+    state.hoveredDetectionId = null;
     draw();
   }
   canvas.style.cursor = "default";
@@ -438,6 +518,7 @@ cameraSelect.addEventListener("change", async () => {
   state.cameraId = cameraSelect.value;
   state.draftPoints = [];
   state.hoveredSpaceId = null;
+  state.hoveredDetectionId = null;
   state.mode = "idle";
   await loadCameraData();
   updateDraftControls();
