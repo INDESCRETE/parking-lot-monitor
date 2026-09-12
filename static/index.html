@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Lot Monitor POC</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Parking Lot Monitor</h1>
+        <p>Camera space annotation harness</p>
+      </div>
+      <form id="uploadForm" class="upload-form">
+        <input id="uploadInput" type="file" name="image" accept="image/*">
+        <button type="submit">Upload Image</button>
+      </form>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section>
+          <label for="cameraSelect">Camera</label>
+          <select id="cameraSelect"></select>
+        </section>
+
+        <section class="image-section">
+          <div class="section-title">Images</div>
+          <div id="imageList" class="image-list"></div>
+        </section>
+
+        <section>
+          <div class="section-title">Spaces</div>
+          <div id="spaceList" class="space-list"></div>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div class="toolbar">
+          <button id="markSpaceButton" type="button">Mark Space</button>
+          <button id="undoPointButton" type="button" disabled>Undo Point</button>
+          <button id="clearDraftButton" type="button" disabled>Clear</button>
+          <a id="configLink" href="/api/config/camera_1" target="_blank">View Config JSON</a>
+          <span id="status" role="status"></span>
+        </div>
+
+        <div class="canvas-wrap">
+          <canvas id="annotationCanvas"></canvas>
+          <div id="emptyState" class="empty-state">
+            Add images to <code>data/images/camera_1</code> or upload one to begin.
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="spaceDialog">
+      <form method="dialog" id="spaceForm">
+        <h2>Save Parking Space</h2>
+        <label for="spaceLabel">Space label</label>
+        <input id="spaceLabel" name="spaceLabel" autocomplete="off" required>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelSpaceButton">Cancel</button>
+          <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
