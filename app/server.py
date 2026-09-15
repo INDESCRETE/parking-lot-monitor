@@ -118,6 +118,27 @@ class Database:
                     FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
                     FOREIGN KEY(detection_id) REFERENCES detections(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS space_state_intervals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parking_space_id INTEGER NOT NULL,
+                    occupied INTEGER NOT NULL,
+                    start_image_id INTEGER NOT NULL,
+                    start_captured_at TEXT NOT NULL,
+                    end_image_id INTEGER NOT NULL,
+                    end_captured_at TEXT NOT NULL,
+                    duration_seconds REAL NOT NULL,
+                    is_current INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
+                    FOREIGN KEY(start_image_id) REFERENCES images(id),
+                    FOREIGN KEY(end_image_id) REFERENCES images(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_intervals_space_current
+                    ON space_state_intervals(parking_space_id, is_current);
+                CREATE INDEX IF NOT EXISTS idx_intervals_space_start
+                    ON space_state_intervals(parking_space_id, start_captured_at);
                 """
             )
             conn.execute(
@@ -190,10 +211,15 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, camera_id, label, polygon_json, created_at, updated_at
-                FROM parking_spaces
-                WHERE camera_id = ?
-                ORDER BY id
+                SELECT ps.id, ps.camera_id, ps.label, ps.polygon_json, ps.created_at, ps.updated_at,
+                       si.occupied AS current_occupied,
+                       si.start_captured_at AS current_since,
+                       si.duration_seconds AS current_duration_seconds
+                FROM parking_spaces ps
+                LEFT JOIN space_state_intervals si
+                    ON si.parking_space_id = ps.id AND si.is_current = 1
+                WHERE ps.camera_id = ?
+                ORDER BY ps.id
                 """,
                 (camera_id,),
             )
@@ -213,24 +239,70 @@ class Database:
                     (image_id,),
                 )
             ]
-            occupancy = [
-                {
-                    "space_id": row["parking_space_id"],
-                    "occupied": bool(row["occupied"]),
-                    "score": row["score"],
-                    "detection_id": row["detection_id"],
-                }
-                for row in conn.execute(
-                    """
-                    SELECT parking_space_id, occupied, score, detection_id
-                    FROM occupancy_observations
-                    WHERE image_id = ?
-                    ORDER BY parking_space_id
-                    """,
-                    (image_id,),
+            occupancy = []
+            for row in conn.execute(
+                """
+                SELECT oo.parking_space_id, oo.occupied, oo.score, oo.detection_id,
+                       im.captured_at AS image_captured_at,
+                       si.start_captured_at AS since
+                FROM occupancy_observations oo
+                JOIN images im ON im.id = oo.image_id
+                LEFT JOIN space_state_intervals si
+                    ON si.parking_space_id = oo.parking_space_id
+                   AND si.start_captured_at <= im.captured_at
+                   AND si.end_captured_at >= im.captured_at
+                WHERE oo.image_id = ?
+                ORDER BY oo.parking_space_id
+                """,
+                (image_id,),
+            ):
+                duration_seconds = None
+                if row["since"]:
+                    try:
+                        duration_seconds = max(
+                            0.0,
+                            (
+                                datetime.fromisoformat(row["image_captured_at"])
+                                - datetime.fromisoformat(row["since"])
+                            ).total_seconds(),
+                        )
+                    except ValueError:
+                        duration_seconds = None
+                occupancy.append(
+                    {
+                        "space_id": row["parking_space_id"],
+                        "occupied": bool(row["occupied"]),
+                        "score": row["score"],
+                        "detection_id": row["detection_id"],
+                        "since": row["since"],
+                        "duration_seconds": duration_seconds,
+                    }
                 )
-            ]
             return {"image_id": image_id, "detections": detections, "occupancy": occupancy}
+
+    def get_space_intervals(self, space_id: int, limit: int = 50) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, occupied, start_captured_at, end_captured_at, duration_seconds, is_current
+                FROM space_state_intervals
+                WHERE parking_space_id = ?
+                ORDER BY start_captured_at DESC, id DESC
+                LIMIT ?
+                """,
+                (space_id, max(1, min(limit, 500))),
+            )
+            return [
+                {
+                    "id": row["id"],
+                    "occupied": bool(row["occupied"]),
+                    "start_captured_at": row["start_captured_at"],
+                    "end_captured_at": row["end_captured_at"],
+                    "duration_seconds": row["duration_seconds"],
+                    "is_current": bool(row["is_current"]),
+                }
+                for row in rows
+            ]
 
     def create_space(self, camera_id: str, label: str, polygon: list[dict[str, float]]) -> dict[str, Any]:
         now = utc_now()
@@ -253,6 +325,25 @@ class Database:
         with self.connect() as conn:
             cursor = conn.execute("DELETE FROM parking_spaces WHERE id = ?", (space_id,))
             return cursor.rowcount > 0
+
+    def update_space_polygon(self, space_id: int, polygon: list[dict[str, float]]) -> dict[str, Any] | None:
+        now = utc_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE parking_spaces
+                SET polygon_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(polygon), now, space_id),
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute(
+                "SELECT * FROM parking_spaces WHERE id = ?",
+                (space_id,),
+            ).fetchone()
+            return space_from_row(row)
 
     def add_uploaded_image(self, camera_id: str, filename: str, source: Any) -> dict[str, Any]:
         camera_id = safe_segment(camera_id)
@@ -292,6 +383,9 @@ class Database:
 def space_from_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
     item["polygon"] = json.loads(item.pop("polygon_json"))
+    if "current_occupied" in item:
+        raw = item["current_occupied"]
+        item["current_occupied"] = bool(raw) if raw is not None else None
     return item
 
 
@@ -336,6 +430,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "image_id must be an integer"}, HTTPStatus.BAD_REQUEST)
                 return
             self.send_json(db.get_image_observations(image_id))
+        elif re.fullmatch(r"/api/spaces/(\d+)/intervals", path):
+            match = re.fullmatch(r"/api/spaces/(\d+)/intervals", path)
+            space_id = int(match.group(1))
+            try:
+                limit = int(query.get("limit", ["50"])[0])
+            except ValueError:
+                limit = 50
+            self.send_json({"space_id": space_id, "intervals": db.get_space_intervals(space_id, limit)})
         elif path.startswith("/api/config/"):
             camera_id = safe_segment(unquote(path.removeprefix("/api/config/")))
             self.send_json({"camera_id": camera_id, "spaces": db.list_spaces(camera_id)})
@@ -377,6 +479,26 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         self.send_json({"deleted": True})
+
+    def do_PATCH(self) -> None:
+        parsed = urlparse(self.path)
+        match = re.fullmatch(r"/api/spaces/(\d+)", parsed.path)
+        if not match:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        payload = self.read_json()
+        try:
+            polygon = payload["polygon"]
+            if len(polygon) != 4:
+                raise ValueError("A parking space needs exactly 4 points.")
+        except (KeyError, TypeError, ValueError) as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        space = db.update_space_polygon(int(match.group(1)), polygon)
+        if space is None:
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        self.send_json({"space": space})
 
     def handle_upload(self) -> None:
         form = cgi.FieldStorage(

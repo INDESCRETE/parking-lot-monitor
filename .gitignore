@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 .pip-cache/
 *.pt
+*.pth
+.cache/
 
 data/db/*.sqlite
 data/db/*.sqlite-*

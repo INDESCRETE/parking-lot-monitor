@@ -45,9 +45,9 @@ The uploaded source video itself is kept at `data/source_videos/<camera_id>/` (g
 
 Only use footage you own or otherwise have the rights to process — this feature works on a video file you already have, it does not fetch or download video from anywhere.
 
-## Run YOLO Occupancy Detection
+## Run Occupancy Detection
 
-Install dependencies in a local virtualenv, then run detection for a camera:
+Detection runs on [RF-DETR](https://github.com/roboflow/rf-detr) (Apache-2.0 licensed, so it's safe to ship in a paid product — see the licensing note below). Install dependencies in a local virtualenv, then run detection for a camera:
 
 ```bash
 python3 -m venv .venv
@@ -55,9 +55,15 @@ python3 -m venv .venv
 .venv/bin/python scripts/detect_occupancy.py --camera-id camera_1
 ```
 
-The detector writes raw YOLO vehicle boxes to `detections` and per-space occupied/empty decisions to `occupancy_observations`. The UI will show vehicle boxes and tint marked spaces after detection results exist for the selected image.
+Pass `--model-size {nano,small,medium,large}` to trade off speed vs. accuracy (default: `medium`). The first run downloads pretrained COCO weights, plus PyTorch/torchvision/transformers if they aren't already installed — expect a larger download than a typical pip install.
 
-Occupancy is assigned using a vehicle ground-anchor point near the bottom-center of each YOLO box. Each detection can occupy at most one marked space, which avoids marking a neighboring space occupied just because a car visually overlaps it in the 2D image.
+The detector writes raw vehicle boxes to `detections` and per-space occupied/empty decisions to `occupancy_observations`. The UI will show vehicle boxes and tint marked spaces after detection results exist for the selected image.
+
+Occupancy is assigned using a vehicle ground-anchor point near the bottom-center of each detection box. Each detection can occupy at most one marked space, which avoids marking a neighboring space occupied just because a car visually overlaps it in the 2D image.
+
+### Why RF-DETR and not YOLOv8
+
+`ultralytics` (YOLOv8/YOLO11/etc.) is licensed **AGPL-3.0**, which applies even to internal or SaaS use — not just redistribution. Selling this as a product, or running it as a service for a customer, would legally require either open-sourcing the whole application or paying Ultralytics for an Enterprise license. RF-DETR is **Apache-2.0**: free to use in a closed-source, paid product with no revenue threshold and no source-disclosure obligation. (This isn't legal advice — verify current license terms directly before shipping commercially.)
 
 ## Project Shape
 

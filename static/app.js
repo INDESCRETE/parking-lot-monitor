@@ -10,7 +10,13 @@ const state = {
   draftPoints: [],
   hoveredSpaceId: null,
   hoveredDetectionId: null,
+  selectedSpaceId: null,
+  draggingHandle: null,
+  suppressNextClick: false,
+  statusSort: "label",
 };
+
+const HANDLE_RADIUS = 9;
 
 const cameraSelect = document.querySelector("#cameraSelect");
 const imageList = document.querySelector("#imageList");
@@ -34,6 +40,12 @@ const dialog = document.querySelector("#spaceDialog");
 const spaceForm = document.querySelector("#spaceForm");
 const spaceLabel = document.querySelector("#spaceLabel");
 const cancelSpaceButton = document.querySelector("#cancelSpaceButton");
+const statusList = document.querySelector("#statusList");
+const statusSortSelect = document.querySelector("#statusSortSelect");
+const historyDialog = document.querySelector("#historyDialog");
+const historyTitle = document.querySelector("#historyTitle");
+const historyList = document.querySelector("#historyList");
+const closeHistoryButton = document.querySelector("#closeHistoryButton");
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -67,6 +79,7 @@ async function loadCameraData() {
   state.selectedImage = state.images[0] || null;
   renderImages();
   renderSpaces();
+  renderStatusList();
   await loadSelectedImage();
 }
 
@@ -108,6 +121,7 @@ async function selectImage(image, options = {}) {
   state.draftPoints = [];
   state.hoveredSpaceId = null;
   state.hoveredDetectionId = null;
+  state.selectedSpaceId = null;
   renderImages();
   updateDraftControls();
   if (options.scrollIntoView !== false) {
@@ -126,7 +140,7 @@ function selectedImageIndex() {
 }
 
 function shouldIgnoreImageNavigation(event) {
-  if (dialog.open) {
+  if (dialog.open || historyDialog.open) {
     return true;
   }
   if (event.target?.classList?.contains("image-row")) {
@@ -222,7 +236,11 @@ function draw() {
 
   ctx.drawImage(state.imageElement, 0, 0);
   for (const space of state.spaces) {
-    drawPolygon(space, space.id === state.hoveredSpaceId);
+    drawPolygon(space, space.id === state.hoveredSpaceId, space.id === state.selectedSpaceId);
+  }
+  const selectedSpace = state.spaces.find((space) => space.id === state.selectedSpaceId);
+  if (selectedSpace) {
+    drawSpaceHandles(selectedSpace);
   }
   for (const detection of state.observations.detections) {
     drawDetection(detection, detection.id === state.hoveredDetectionId);
@@ -232,7 +250,7 @@ function draw() {
   }
 }
 
-function drawPolygon(space, isHovered) {
+function drawPolygon(space, isHovered, isSelected) {
   const points = space.polygon;
   const observation = observationForSpace(space.id);
   const occupied = observation?.occupied;
@@ -259,7 +277,20 @@ function drawPolygon(space, isHovered) {
   ctx.lineWidth = isHovered ? 4 : 3;
   ctx.stroke();
 
-  if (!isHovered) {
+  if (isSelected) {
+    ctx.save();
+    ctx.setLineDash([8, 5]);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = "#f59e0b";
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  if (observation && observation.since) {
+    drawDurationBadge(points, observation);
+  }
+
+  if (!isHovered && !isSelected) {
     return;
   }
 
@@ -271,6 +302,39 @@ function drawPolygon(space, isHovered) {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   ctx.fillText(space.label, center.x, center.y);
+}
+
+function drawDurationBadge(points, observation) {
+  const label = `${observation.occupied ? "Occupied" : "Vacant"} ${formatDuration(observation.duration_seconds)}`;
+  const center = centroid(points);
+  const top = points.reduce((topmost, point) => (point.y < topmost.y ? point : topmost), points[0]);
+
+  ctx.font = "11px system-ui, sans-serif";
+  const paddingX = 6;
+  const textWidth = ctx.measureText(label).width;
+  const boxWidth = textWidth + paddingX * 2;
+  const boxHeight = 17;
+  const x = center.x - boxWidth / 2;
+  const y = Math.max(2, top.y - boxHeight - 4);
+
+  ctx.fillStyle = observation.occupied ? "rgba(220, 38, 38, 0.88)" : "rgba(14, 93, 86, 0.88)";
+  ctx.fillRect(x, y, boxWidth, boxHeight);
+  ctx.fillStyle = "#fff";
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillText(label, x + boxWidth / 2, y + boxHeight / 2);
+}
+
+function drawSpaceHandles(space) {
+  for (const point of space.polygon) {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, HANDLE_RADIUS, 0, Math.PI * 2);
+    ctx.fillStyle = "#f59e0b";
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = "#fff";
+    ctx.stroke();
+  }
 }
 
 function drawDetection(detection, isHovered) {
@@ -357,6 +421,21 @@ function spaceAtPoint(point) {
   return null;
 }
 
+function handleIndexAtPoint(space, point) {
+  if (!space) {
+    return -1;
+  }
+  for (let index = 0; index < space.polygon.length; index += 1) {
+    const handle = space.polygon[index];
+    const dx = handle.x - point.x;
+    const dy = handle.y - point.y;
+    if (Math.sqrt(dx * dx + dy * dy) <= HANDLE_RADIUS + 3) {
+      return index;
+    }
+  }
+  return -1;
+}
+
 function detectionAtPoint(point) {
   for (const detection of state.observations.detections) {
     const { x1, y1, x2, y2 } = detection.bbox;
@@ -391,6 +470,150 @@ function updateDraftControls() {
   clearDraftButton.disabled = state.draftPoints.length === 0;
 }
 
+function formatDuration(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds) || seconds < 0) {
+    return "—";
+  }
+  const total = Math.floor(seconds);
+  const days = Math.floor(total / 86400);
+  const hours = Math.floor((total % 86400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (days > 0) {
+    return `${days}d ${hours}h`;
+  }
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${secs}s`;
+  }
+  return `${secs}s`;
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return "—";
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return date.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function currentElapsedSeconds(space) {
+  if (!space.current_since) {
+    return null;
+  }
+  const started = Date.parse(space.current_since);
+  if (Number.isNaN(started)) {
+    return null;
+  }
+  return Math.max(0, (Date.now() - started) / 1000);
+}
+
+function renderStatusList() {
+  statusList.innerHTML = "";
+  if (state.spaces.length === 0) {
+    statusList.textContent = "No spaces marked yet.";
+    return;
+  }
+  const rows = [...state.spaces].sort((a, b) => {
+    if (state.statusSort === "duration") {
+      const bElapsed = currentElapsedSeconds(b);
+      const aElapsed = currentElapsedSeconds(a);
+      return (bElapsed ?? -1) - (aElapsed ?? -1);
+    }
+    return a.label.localeCompare(b.label, undefined, { numeric: true });
+  });
+  for (const space of rows) {
+    const known = space.current_occupied !== null && space.current_occupied !== undefined;
+    const occupied = space.current_occupied;
+    const badgeClass = !known ? "badge-unknown" : occupied ? "badge-occupied" : "badge-vacant";
+    const badgeText = !known ? "No data" : occupied ? "Occupied" : "Vacant";
+    const durationText = known ? formatDuration(currentElapsedSeconds(space)) : "—";
+
+    const metaText = known ? `${durationText} ${occupied ? "occupied" : "vacant"}` : "No data yet";
+    const row = document.createElement("div");
+    row.className = "status-row";
+    row.innerHTML = `
+      <div>
+        <div class="status-row-title">
+          <span class="status-badge ${badgeClass}">${badgeText}</span>
+          <span class="row-title">${escapeHtml(space.label)}</span>
+        </div>
+        <div class="row-meta">${escapeHtml(metaText)}</div>
+      </div>
+    `;
+    const historyButton = document.createElement("button");
+    historyButton.type = "button";
+    historyButton.className = "history-button";
+    historyButton.textContent = "History";
+    historyButton.addEventListener("click", () => openHistory(space));
+    row.append(historyButton);
+    statusList.append(row);
+  }
+}
+
+async function openHistory(space) {
+  historyTitle.textContent = `${space.label} — History`;
+  historyList.textContent = "Loading…";
+  historyDialog.showModal();
+  try {
+    const payload = await fetchJson(`/api/spaces/${space.id}/intervals?limit=50`);
+    renderHistoryList(payload.intervals);
+  } catch (error) {
+    historyList.textContent = error.message;
+  }
+}
+
+function renderHistoryList(intervals) {
+  historyList.innerHTML = "";
+  if (!intervals || intervals.length === 0) {
+    historyList.textContent = "No history yet — run detection to populate.";
+    return;
+  }
+  for (const interval of intervals) {
+    const badgeClass = interval.occupied ? "badge-occupied" : "badge-vacant";
+    const badgeText = interval.occupied ? "Occupied" : "Vacant";
+    const endText = interval.is_current ? "now" : formatTimestamp(interval.end_captured_at);
+    const durationSeconds = interval.is_current
+      ? Math.max(0, (Date.now() - Date.parse(interval.start_captured_at)) / 1000)
+      : interval.duration_seconds;
+    const currentTag = interval.is_current ? '<span class="current-tag">current</span>' : "";
+
+    const row = document.createElement("div");
+    row.className = "history-row";
+    row.innerHTML = `
+      <span class="status-badge ${badgeClass}">${badgeText}</span>
+      <span class="history-range">
+        ${escapeHtml(formatTimestamp(interval.start_captured_at))} → ${escapeHtml(endText)} ${currentTag}
+      </span>
+      <span class="row-meta">${formatDuration(durationSeconds)}</span>
+    `;
+    historyList.append(row);
+  }
+}
+
+closeHistoryButton.addEventListener("click", () => historyDialog.close());
+
+statusSortSelect.addEventListener("change", () => {
+  state.statusSort = statusSortSelect.value;
+  renderStatusList();
+});
+
+setInterval(() => {
+  if (!historyDialog.open) {
+    renderStatusList();
+  }
+}, 30000);
+
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (char) => ({
     "&": "&amp;",
@@ -415,6 +638,7 @@ async function saveDraftSpace(label) {
   state.draftPoints = [];
   state.mode = "idle";
   renderSpaces();
+  renderStatusList();
   updateDraftControls();
   draw();
   setStatus(`Saved ${payload.space.label}`);
@@ -426,9 +650,35 @@ async function deleteSpace(spaceId) {
   if (state.hoveredSpaceId === spaceId) {
     state.hoveredSpaceId = null;
   }
+  if (state.selectedSpaceId === spaceId) {
+    state.selectedSpaceId = null;
+  }
   renderSpaces();
+  renderStatusList();
   draw();
   setStatus("Space deleted");
+}
+
+async function saveSpacePolygon(spaceId, polygon) {
+  try {
+    const payload = await fetchJson(`/api/spaces/${spaceId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ polygon }),
+    });
+    const index = state.spaces.findIndex((space) => space.id === spaceId);
+    if (index !== -1) {
+      // Merge rather than replace: a polygon PATCH response doesn't carry
+      // current_* occupancy fields (those only come from list_spaces), so
+      // preserve whatever the Live Status panel already knew.
+      state.spaces[index] = { ...state.spaces[index], ...payload.space };
+    }
+    renderStatusList();
+    setStatus(`Updated ${payload.space.label}`);
+  } catch (error) {
+    setStatus(error.message);
+    await loadCameraData();
+  }
 }
 
 markSpaceButton.addEventListener("click", () => {
@@ -439,6 +689,7 @@ markSpaceButton.addEventListener("click", () => {
   state.mode = state.mode === "marking" ? "idle" : "marking";
   state.draftPoints = [];
   state.hoveredDetectionId = null;
+  state.selectedSpaceId = null;
   updateDraftControls();
   draw();
   setStatus(state.mode === "marking" ? "Click four corners of a space" : "");
@@ -457,25 +708,75 @@ clearDraftButton.addEventListener("click", () => {
 });
 
 canvas.addEventListener("click", (event) => {
-  if (state.mode !== "marking" || !state.imageElement) {
+  if (state.suppressNextClick) {
+    state.suppressNextClick = false;
     return;
   }
-  if (state.draftPoints.length >= 4) {
+  if (state.mode === "marking") {
+    if (!state.imageElement || state.draftPoints.length >= 4) {
+      return;
+    }
+    state.draftPoints.push(canvasPoint(event));
+    updateDraftControls();
+    draw();
+    if (state.draftPoints.length === 4) {
+      spaceLabel.value = `Space ${state.spaces.length + 1}`;
+      dialog.showModal();
+      spaceLabel.focus();
+      spaceLabel.select();
+    }
     return;
   }
-  state.draftPoints.push(canvasPoint(event));
-  updateDraftControls();
-  draw();
-  if (state.draftPoints.length === 4) {
-    spaceLabel.value = `Space ${state.spaces.length + 1}`;
-    dialog.showModal();
-    spaceLabel.focus();
-    spaceLabel.select();
+
+  if (!state.imageElement) {
+    return;
+  }
+  const point = canvasPoint(event);
+  const clickedSpace = spaceAtPoint(point);
+  const nextSelectedId = clickedSpace?.id || null;
+  if (state.selectedSpaceId !== nextSelectedId) {
+    state.selectedSpaceId = nextSelectedId;
+    draw();
   }
 });
 
+canvas.addEventListener("mousedown", (event) => {
+  if (!state.imageElement || state.mode === "marking" || !state.selectedSpaceId) {
+    return;
+  }
+  const space = state.spaces.find((item) => item.id === state.selectedSpaceId);
+  if (!space) {
+    return;
+  }
+  const point = canvasPoint(event);
+  const handleIndex = handleIndexAtPoint(space, point);
+  if (handleIndex === -1) {
+    return;
+  }
+  event.preventDefault();
+  state.draggingHandle = { spaceId: space.id, pointIndex: handleIndex };
+});
+
 canvas.addEventListener("mousemove", (event) => {
-  if (!state.imageElement || state.mode === "marking") {
+  if (!state.imageElement) {
+    return;
+  }
+  if (state.draggingHandle) {
+    const space = state.spaces.find((item) => item.id === state.draggingHandle.spaceId);
+    if (space) {
+      const point = canvasPoint(event);
+      const clampedPoint = {
+        x: Math.min(Math.max(point.x, 0), canvas.width),
+        y: Math.min(Math.max(point.y, 0), canvas.height),
+      };
+      space.polygon = space.polygon.map((existing, index) =>
+        index === state.draggingHandle.pointIndex ? clampedPoint : existing,
+      );
+      draw();
+    }
+    return;
+  }
+  if (state.mode === "marking") {
     return;
   }
   const point = canvasPoint(event);
@@ -491,7 +792,27 @@ canvas.addEventListener("mousemove", (event) => {
     state.hoveredDetectionId = hoveredDetectionId;
     draw();
   }
-  canvas.style.cursor = hoveredSpace || hoveredDetection ? "pointer" : "crosshair";
+  const selectedSpace = state.spaces.find((item) => item.id === state.selectedSpaceId);
+  const onHandle = handleIndexAtPoint(selectedSpace, point) !== -1;
+  canvas.style.cursor = onHandle
+    ? "grab"
+    : hoveredSpace || hoveredDetection
+      ? "pointer"
+      : "crosshair";
+});
+
+canvas.addEventListener("mouseup", async (event) => {
+  if (!state.draggingHandle) {
+    return;
+  }
+  const { spaceId } = state.draggingHandle;
+  state.draggingHandle = null;
+  state.suppressNextClick = true;
+  const space = state.spaces.find((item) => item.id === spaceId);
+  if (space) {
+    await saveSpacePolygon(spaceId, space.polygon);
+    draw();
+  }
 });
 
 canvas.addEventListener("mouseleave", () => {
@@ -524,6 +845,7 @@ cameraSelect.addEventListener("change", async () => {
   state.draftPoints = [];
   state.hoveredSpaceId = null;
   state.hoveredDetectionId = null;
+  state.selectedSpaceId = null;
   state.mode = "idle";
   await loadCameraData();
   updateDraftControls();
@@ -604,6 +926,10 @@ document.addEventListener("keydown", async (event) => {
   if (event.key === "ArrowUp") {
     event.preventDefault();
     await navigateImages(-1);
+  }
+  if (event.key.toLowerCase() === "m") {
+    event.preventDefault();
+    markSpaceButton.click();
   }
 });
 

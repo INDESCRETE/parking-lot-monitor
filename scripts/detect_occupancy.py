@@ -8,13 +8,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ultralytics import YOLO
+from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DB_PATH = ROOT / "data" / "db" / "parking_lot.sqlite"
 IMAGES_DIR = ROOT / "data" / "images"
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}
+
+# RF-DETR's pretrained-COCO checkpoints report raw COCO category IDs (1-90,
+# with gaps) as class_id, NOT the 0-indexed 0-79 scheme some other COCO
+# detectors use. car=3, motorcycle=4, bus=6, truck=8.
+VEHICLE_CLASS_IDS = {3, 4, 6, 8}
+
+MODEL_SIZES = {
+    "nano": RFDETRNano,
+    "small": RFDETRSmall,
+    "medium": RFDETRMedium,
+    "large": RFDETRLarge,
+}
 
 
 @dataclass
@@ -27,16 +38,21 @@ class Detection:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run YOLO vehicle detection and infer per-space occupancy."
+        description="Run RF-DETR vehicle detection and infer per-space occupancy."
     )
     parser.add_argument("--camera-id", default="camera_1")
-    parser.add_argument("--model", default="yolov8n.pt")
+    parser.add_argument(
+        "--model-size",
+        choices=sorted(MODEL_SIZES),
+        default="medium",
+        help="RF-DETR model size. Larger is more accurate but slower to run.",
+    )
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument(
         "--anchor-y-ratio",
         type=float,
         default=0.9,
-        help="Vertical position inside the YOLO box used as the vehicle ground anchor.",
+        help="Vertical position inside the detection box used as the vehicle ground anchor.",
     )
     parser.add_argument(
         "--fallback-overlap-threshold",
@@ -85,8 +101,97 @@ def init_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
             FOREIGN KEY(detection_id) REFERENCES detections(id)
         );
+
+        CREATE TABLE IF NOT EXISTS space_state_intervals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parking_space_id INTEGER NOT NULL,
+            occupied INTEGER NOT NULL,
+            start_image_id INTEGER NOT NULL,
+            start_captured_at TEXT NOT NULL,
+            end_image_id INTEGER NOT NULL,
+            end_captured_at TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
+            FOREIGN KEY(start_image_id) REFERENCES images(id),
+            FOREIGN KEY(end_image_id) REFERENCES images(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intervals_space_current
+            ON space_state_intervals(parking_space_id, is_current);
+        CREATE INDEX IF NOT EXISTS idx_intervals_space_start
+            ON space_state_intervals(parking_space_id, start_captured_at);
         """
     )
+
+
+def recompute_space_intervals(conn: sqlite3.Connection, space_id: int) -> None:
+    """Rebuild the occupied/vacant timeline for one space from scratch.
+
+    Walks every occupancy_observation for the space in chronological (captured_at)
+    order and collapses consecutive same-state observations into intervals. This
+    is a full rebuild rather than an incremental append so that reruns (which
+    redetect and overwrite observations for every image, not just new ones) stay
+    correct without risking duplicate or stale intervals.
+    """
+    conn.execute("DELETE FROM space_state_intervals WHERE parking_space_id = ?", (space_id,))
+    rows = conn.execute(
+        """
+        SELECT oo.occupied, oo.image_id, im.captured_at
+        FROM occupancy_observations oo
+        JOIN images im ON im.id = oo.image_id
+        WHERE oo.parking_space_id = ?
+        ORDER BY im.captured_at, im.id
+        """,
+        (space_id,),
+    ).fetchall()
+    if not rows:
+        return
+
+    runs: list[tuple[int, sqlite3.Row, sqlite3.Row]] = []
+    run_state = rows[0]["occupied"]
+    run_start = rows[0]
+    run_last = rows[0]
+    for row in rows[1:]:
+        if row["occupied"] == run_state:
+            run_last = row
+            continue
+        runs.append((run_state, run_start, run_last))
+        run_state = row["occupied"]
+        run_start = row
+        run_last = row
+    runs.append((run_state, run_start, run_last))
+
+    now = utc_now()
+    last_index = len(runs) - 1
+    for index, (occupied, start_row, end_row) in enumerate(runs):
+        duration = max(
+            0.0,
+            (
+                datetime.fromisoformat(end_row["captured_at"])
+                - datetime.fromisoformat(start_row["captured_at"])
+            ).total_seconds(),
+        )
+        conn.execute(
+            """
+            INSERT INTO space_state_intervals
+                (parking_space_id, occupied, start_image_id, start_captured_at,
+                 end_image_id, end_captured_at, duration_seconds, is_current, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                space_id,
+                occupied,
+                start_row["image_id"],
+                start_row["captured_at"],
+                end_row["image_id"],
+                end_row["captured_at"],
+                duration,
+                1 if index == last_index else 0,
+                now,
+            ),
+        )
 
 
 def load_images(conn: sqlite3.Connection, camera_id: str) -> list[sqlite3.Row]:
@@ -123,24 +228,24 @@ def load_spaces(conn: sqlite3.Connection, camera_id: str) -> list[dict[str, Any]
     ]
 
 
-def run_yolo(model: YOLO, image_path: Path, confidence: float) -> list[Detection]:
-    results = model.predict(str(image_path), conf=confidence, verbose=False)
+def run_detector(model: Any, image_path: Path, confidence: float) -> list[Detection]:
+    result = model.predict(str(image_path), threshold=confidence)
     detections: list[Detection] = []
-    names = model.names
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls.item())
-            if class_id not in VEHICLE_CLASS_IDS:
-                continue
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            detections.append(
-                Detection(
-                    class_id=class_id,
-                    class_name=str(names[class_id]),
-                    confidence=float(box.conf.item()),
-                    box=(x1, y1, x2, y2),
-                )
+    class_names = result.data.get("class_name") if result.data else None
+    for index in range(len(result.xyxy)):
+        class_id = int(result.class_id[index])
+        if class_id not in VEHICLE_CLASS_IDS:
+            continue
+        x1, y1, x2, y2 = [float(v) for v in result.xyxy[index]]
+        class_name = str(class_names[index]) if class_names is not None else str(class_id)
+        detections.append(
+            Detection(
+                class_id=class_id,
+                class_name=class_name,
+                confidence=float(result.confidence[index]),
+                box=(x1, y1, x2, y2),
             )
+        )
     return detections
 
 
@@ -386,8 +491,8 @@ def point_in_polygon(point: dict[str, float], polygon: list[dict[str, float]]) -
 
 def main() -> None:
     args = parse_args()
-    model = YOLO(args.model)
-    model_name = Path(args.model).name
+    model = MODEL_SIZES[args.model_size]()
+    model_name = f"rfdetr-{args.model_size}"
 
     with connect() as conn:
         init_tables(conn)
@@ -400,7 +505,7 @@ def main() -> None:
 
         for image in images:
             image_path = IMAGES_DIR / image["camera_id"] / image["filename"]
-            detections = run_yolo(model, image_path, args.confidence)
+            detections = run_detector(model, image_path, args.confidence)
             stored_detections = store_detections(conn, image["id"], model_name, detections)
             store_occupancy(
                 conn,
@@ -419,6 +524,10 @@ def main() -> None:
                 (image["id"],),
             ).fetchone()[0]
             print(f"{image['filename']}: {len(detections)} vehicles, {occupied_count}/{len(spaces)} occupied")
+
+        for space in spaces:
+            recompute_space_intervals(conn, space["id"])
+        print(f"Rebuilt occupancy timelines for {len(spaces)} space(s).")
 
 
 if __name__ == "__main__":

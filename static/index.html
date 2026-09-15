@@ -51,11 +51,22 @@
           <div class="section-title">Spaces</div>
           <div id="spaceList" class="space-list"></div>
         </section>
+
+        <section class="status-section">
+          <div class="section-title-row">
+            <div class="section-title">Live Status</div>
+            <select id="statusSortSelect" title="Sort spaces">
+              <option value="label">Sort: Space</option>
+              <option value="duration">Sort: Duration</option>
+            </select>
+          </div>
+          <div id="statusList" class="status-list"></div>
+        </section>
       </aside>
 
       <section class="workspace">
         <div class="toolbar">
-          <button id="markSpaceButton" type="button">Mark Space</button>
+          <button id="markSpaceButton" type="button" title="Shortcut: M">Mark Space (M)</button>
           <button id="undoPointButton" type="button" disabled>Undo Point</button>
           <button id="clearDraftButton" type="button" disabled>Clear</button>
           <a id="configLink" href="/api/config/camera_1" target="_blank">View Config JSON</a>
@@ -81,6 +92,16 @@
           <button value="save" type="submit">Save</button>
         </div>
       </form>
+    </dialog>
+
+    <dialog id="historyDialog">
+      <div class="history-panel">
+        <div class="history-header">
+          <h2 id="historyTitle">History</h2>
+          <button type="button" id="closeHistoryButton" aria-label="Close">&times;</button>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </div>
     </dialog>
 
     <script src="/static/app.js"></script>
