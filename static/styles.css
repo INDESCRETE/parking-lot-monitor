@@ -124,6 +124,43 @@ input[type="text"],
   gap: 8px;
 }
 
+.video-upload-form {
+  display: grid;
+  gap: 8px;
+}
+
+.video-upload-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+}
+
+.video-upload-row input[type="number"] {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 32px;
+  padding: 4px 8px;
+  width: 64px;
+}
+
+.video-upload-row input[type="text"] {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  flex: 1;
+  min-height: 32px;
+  padding: 4px 8px;
+}
+
+.inline-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.video-upload-form button {
+  min-height: 32px;
+}
+
 .image-section {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);

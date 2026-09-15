@@ -15,14 +15,19 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from app.video_extract import FfmpegUnavailable, extract_frames
+
 
 ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
 IMAGES_DIR = DATA_DIR / "images"
+SOURCE_VIDEOS_DIR = DATA_DIR / "source_videos"
 DB_PATH = DATA_DIR / "db" / "parking_lot.sqlite"
 DEFAULT_CAMERA_ID = "camera_1"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
+MAX_VIDEO_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap
 
 
 def utc_now() -> str:
@@ -356,6 +361,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"space": space}, HTTPStatus.CREATED)
         elif parsed.path == "/api/images":
             self.handle_upload()
+        elif parsed.path == "/api/videos":
+            self.handle_video_upload()
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -391,6 +398,96 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         self.send_json({"image": image}, HTTPStatus.CREATED)
+
+    def handle_video_upload(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length > MAX_VIDEO_UPLOAD_BYTES:
+            self.send_json(
+                {"error": "Video is larger than the 2 GiB upload limit."},
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+            )
+            return
+
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": self.headers.get("Content-Type", ""),
+            },
+        )
+        video_field = form["video"] if "video" in form else None
+        if video_field is None or not video_field.filename:
+            self.send_json({"error": "Upload requires a video field."}, HTTPStatus.BAD_REQUEST)
+            return
+
+        camera_id = safe_segment(form.getfirst("camera_id", DEFAULT_CAMERA_ID))
+
+        try:
+            interval = float(form.getfirst("interval_seconds", "5"))
+            if interval <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            self.send_json(
+                {"error": "interval_seconds must be a positive number."}, HTTPStatus.BAD_REQUEST
+            )
+            return
+
+        end_seconds: float | None = None
+        end_raw = (form.getfirst("end_seconds", "") or "").strip()
+        if end_raw:
+            try:
+                end_seconds = float(end_raw)
+                if end_seconds <= 0:
+                    raise ValueError
+            except ValueError:
+                self.send_json(
+                    {"error": "end_seconds must be a positive number."}, HTTPStatus.BAD_REQUEST
+                )
+                return
+
+        suffix = Path(video_field.filename).suffix.lower()
+        if suffix not in VIDEO_EXTENSIONS:
+            self.send_json(
+                {"error": f"Unsupported video type: {suffix or 'unknown'}"}, HTTPStatus.BAD_REQUEST
+            )
+            return
+
+        video_dir = SOURCE_VIDEOS_DIR / camera_id
+        video_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = safe_segment(Path(video_field.filename).stem) + suffix
+        video_path = video_dir / safe_name
+        counter = 1
+        while video_path.exists():
+            video_path = video_dir / f"{Path(safe_name).stem}_{counter}{suffix}"
+            counter += 1
+        with video_path.open("wb") as handle:
+            shutil.copyfileobj(video_field.file, handle)
+
+        try:
+            written = extract_frames(
+                video_path,
+                IMAGES_DIR / camera_id,
+                interval=interval,
+                start_time=datetime.now(timezone.utc),
+                end_seconds=end_seconds,
+            )
+        except FfmpegUnavailable as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        except (RuntimeError, ValueError) as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
+        db.sync_images()
+        self.send_json(
+            {
+                "camera_id": camera_id,
+                "video": video_path.name,
+                "frames_extracted": len(written),
+            },
+            HTTPStatus.CREATED,
+        )
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -430,6 +527,7 @@ def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     (DATA_DIR / "db").mkdir(parents=True, exist_ok=True)
     (IMAGES_DIR / DEFAULT_CAMERA_ID).mkdir(parents=True, exist_ok=True)
+    SOURCE_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     db.sync_images()
     host = "127.0.0.1"
     starting_port = int(os.environ.get("PORT", "8000"))

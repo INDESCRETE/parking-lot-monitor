@@ -25,6 +25,23 @@
           <select id="cameraSelect"></select>
         </section>
 
+        <section>
+          <div class="section-title">Import Video</div>
+          <form id="videoUploadForm" class="video-upload-form">
+            <input id="videoUploadInput" type="file" name="video" accept="video/*" required>
+            <div class="video-upload-row">
+              <label for="videoIntervalInput" class="inline-label">Every</label>
+              <input id="videoIntervalInput" type="number" min="1" step="1" value="5" title="Seconds between frames">
+              <span class="inline-label">sec</span>
+            </div>
+            <div class="video-upload-row">
+              <label for="videoEndInput" class="inline-label">Stop at</label>
+              <input id="videoEndInput" type="text" placeholder="mm:ss (optional)">
+            </div>
+            <button type="submit">Extract Frames</button>
+          </form>
+        </section>
+
         <section class="image-section">
           <div class="section-title">Images</div>
           <div id="imageList" class="image-list"></div>

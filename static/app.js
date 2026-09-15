@@ -25,6 +25,11 @@ const configLink = document.querySelector("#configLink");
 const statusEl = document.querySelector("#status");
 const uploadForm = document.querySelector("#uploadForm");
 const uploadInput = document.querySelector("#uploadInput");
+const videoUploadForm = document.querySelector("#videoUploadForm");
+const videoUploadInput = document.querySelector("#videoUploadInput");
+const videoIntervalInput = document.querySelector("#videoIntervalInput");
+const videoEndInput = document.querySelector("#videoEndInput");
+const videoSubmitButton = videoUploadForm.querySelector("button");
 const dialog = document.querySelector("#spaceDialog");
 const spaceForm = document.querySelector("#spaceForm");
 const spaceLabel = document.querySelector("#spaceLabel");
@@ -536,6 +541,56 @@ uploadForm.addEventListener("submit", async (event) => {
   state.images.push(payload.image);
   uploadInput.value = "";
   await selectImage(payload.image);
+});
+
+function parseTimeToSeconds(value) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const parts = trimmed.split(":").map((part) => Number(part));
+  if (parts.length === 0 || parts.some((part) => Number.isNaN(part) || part < 0)) {
+    throw new Error(`Couldn't understand "${value}" — use seconds or mm:ss.`);
+  }
+  return parts.reduce((total, part) => total * 60 + part, 0);
+}
+
+videoUploadForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!videoUploadInput.files[0]) {
+    return;
+  }
+
+  let endSeconds;
+  try {
+    endSeconds = parseTimeToSeconds(videoEndInput.value);
+  } catch (error) {
+    setStatus(error.message);
+    return;
+  }
+
+  const interval = Number(videoIntervalInput.value) || 5;
+  const body = new FormData();
+  body.append("camera_id", state.cameraId);
+  body.append("video", videoUploadInput.files[0]);
+  body.append("interval_seconds", String(interval));
+  if (endSeconds !== null) {
+    body.append("end_seconds", String(endSeconds));
+  }
+
+  videoSubmitButton.disabled = true;
+  setStatus("Extracting frames… this can take a while for longer clips.");
+  try {
+    const payload = await fetchJson("/api/videos", { method: "POST", body });
+    setStatus(`Extracted ${payload.frames_extracted} frame(s) from ${payload.video}`);
+    videoUploadInput.value = "";
+    videoEndInput.value = "";
+    await loadCameraData();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    videoSubmitButton.disabled = false;
+  }
 });
 
 document.addEventListener("keydown", async (event) => {

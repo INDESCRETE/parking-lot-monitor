@@ -16,13 +16,34 @@ http://127.0.0.1:8000
 
 ## First POC Flow
 
-1. Add images to `data/images/camera_1/`, or upload them from the UI.
+1. Add images to `data/images/camera_1/`, upload them from the UI, or import a video (below).
 2. Select an image in the browser.
 3. Click **Mark Space**.
 4. Click the four corners of one parking space.
 5. Name and save the space.
 
 Saved spaces are persisted in SQLite at `data/db/parking_lot.sqlite` and exported as JSON through `/api/config/camera_1`.
+
+## Import a Video
+
+The sidebar has an **Import Video** panel that turns a video clip into a set of still frames for the selected camera, right from the browser:
+
+1. Choose a video file (`.mp4`, `.mov`, `.m4v`, `.webm`, `.avi`, `.mkv`).
+2. Set **Every N sec** for how often to grab a frame.
+3. Optionally set **Stop at** (`mm:ss` or plain seconds) to only extract up to that point in the clip; leave it blank to use the whole video.
+4. Click **Extract Frames**. The server runs `ffmpeg` on the upload and adds the resulting frames straight into `data/images/<camera_id>/`.
+
+This needs `ffmpeg` available to the server process, via the `imageio-ffmpeg` package:
+
+```bash
+pip install imageio-ffmpeg
+```
+
+The core server still runs with zero dependencies otherwise — this is only needed if you want video import. If it's missing, the **Extract Frames** button returns a clear error instead of crashing the server.
+
+The uploaded source video itself is kept at `data/source_videos/<camera_id>/` (gitignored) in case you want to re-run extraction at a different interval later.
+
+Only use footage you own or otherwise have the rights to process — this feature works on a video file you already have, it does not fetch or download video from anywhere.
 
 ## Run YOLO Occupancy Detection
 
