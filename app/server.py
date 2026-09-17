@@ -46,6 +46,11 @@ def parse_range_bound(value: str, *, inclusive_end: bool) -> datetime:
     day's midnight, the exclusive upper bound); a full timestamp is used as-is."""
     value = value.strip()
     is_bare_date = len(value) == 10 and value.count("-") == 2 and "T" not in value
+    # datetime.fromisoformat() only accepts a trailing "Z" (as produced by
+    # JS's Date.toISOString(), which the dashboard sends) on Python 3.11+;
+    # normalize it to an explicit offset so this works on older Pythons too.
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
