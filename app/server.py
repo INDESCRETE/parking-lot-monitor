@@ -8,13 +8,14 @@ import os
 import re
 import shutil
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
+from app import analytics, reports
 from app.video_extract import FfmpegUnavailable, extract_frames
 
 
@@ -37,6 +38,32 @@ def utc_now() -> str:
 def safe_segment(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip())
     return cleaned.strip("._") or "item"
+
+
+def parse_range_bound(value: str, *, inclusive_end: bool) -> datetime:
+    """Parse a `start`/`end` query param. A bare date ("2026-01-07") used as
+    `end` is treated as inclusive of that whole day (i.e. bumped to the next
+    day's midnight, the exclusive upper bound); a full timestamp is used as-is."""
+    value = value.strip()
+    is_bare_date = len(value) == 10 and value.count("-") == 2 and "T" not in value
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if is_bare_date and inclusive_end:
+        dt = dt + timedelta(days=1)
+    return dt
+
+
+def parse_report_range(query: dict[str, list[str]]) -> tuple[datetime, datetime]:
+    """Defaults to the trailing 7 days ending now when start/end are omitted."""
+    now = datetime.now(timezone.utc)
+    end_raw = query.get("end", [None])[0]
+    start_raw = query.get("start", [None])[0]
+    end = parse_range_bound(end_raw, inclusive_end=True) if end_raw else now
+    start = parse_range_bound(start_raw, inclusive_end=False) if start_raw else end - timedelta(days=7)
+    if end <= start:
+        raise ValueError("end must be after start")
+    return start, end
 
 
 def parse_timestamp_from_filename(path: Path) -> str:
@@ -139,12 +166,76 @@ class Database:
                     ON space_state_intervals(parking_space_id, is_current);
                 CREATE INDEX IF NOT EXISTS idx_intervals_space_start
                     ON space_state_intervals(parking_space_id, start_captured_at);
+
+                CREATE TABLE IF NOT EXISTS clients (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS lots (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    client_id INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    address TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(client_id) REFERENCES clients(id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_lots_client ON lots(client_id);
                 """
             )
+            self._migrate_camera_lot_column(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
                 (DEFAULT_CAMERA_ID, "Camera 1", utc_now()),
             )
+            self._backfill_unassigned_lot(conn)
+
+    def _migrate_camera_lot_column(self, conn: sqlite3.Connection) -> None:
+        """Add cameras.lot_id if this DB predates the clients/lots feature.
+
+        SQLite's CREATE TABLE IF NOT EXISTS doesn't add columns to an
+        already-existing table, so an explicit, idempotent migration is
+        needed here for anyone upgrading an existing database in place.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
+        if "lot_id" not in columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN lot_id INTEGER REFERENCES lots(id)")
+
+    def _backfill_unassigned_lot(self, conn: sqlite3.Connection) -> None:
+        """Any camera with no lot yet (pre-existing data, or a brand-new camera
+        folder discovered by sync_images) gets parked under a well-known
+        "Unassigned" client/lot rather than left NULL, so every camera is
+        always reportable under some lot. Looked up by name, not "first row
+        in the table", so this never misattributes a camera to a real client
+        that happens to already exist.
+        """
+        if not conn.execute("SELECT 1 FROM cameras WHERE lot_id IS NULL").fetchone():
+            return
+        now = utc_now()
+        client_row = conn.execute(
+            "SELECT id FROM clients WHERE name = ?", ("Unassigned",)
+        ).fetchone()
+        if client_row is None:
+            client_id = conn.execute(
+                "INSERT INTO clients (name, created_at) VALUES (?, ?)",
+                ("Unassigned", now),
+            ).lastrowid
+        else:
+            client_id = client_row["id"]
+        lot_row = conn.execute(
+            "SELECT id FROM lots WHERE client_id = ? AND name = ?",
+            (client_id, "Unassigned Lot"),
+        ).fetchone()
+        if lot_row is None:
+            lot_id = conn.execute(
+                "INSERT INTO lots (client_id, name, created_at) VALUES (?, ?, ?)",
+                (client_id, "Unassigned Lot", now),
+            ).lastrowid
+        else:
+            lot_id = lot_row["id"]
+        conn.execute("UPDATE cameras SET lot_id = ? WHERE lot_id IS NULL", (lot_id,))
 
     def sync_images(self) -> None:
         with self.connect() as conn:
@@ -184,10 +275,27 @@ class Database:
                         """,
                         (camera_id, path.name, parse_timestamp_from_filename(path), utc_now()),
                     )
+            # Any camera folder discovered just now (or from before this
+            # feature existed) starts with lot_id NULL; park it under the
+            # "Unassigned" client/lot immediately rather than waiting for the
+            # next server restart.
+            self._backfill_unassigned_lot(conn)
 
     def list_cameras(self) -> list[dict[str, Any]]:
         with self.connect() as conn:
-            return [dict(row) for row in conn.execute("SELECT * FROM cameras ORDER BY id")]
+            return [
+                dict(row)
+                for row in conn.execute(
+                    """
+                    SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
+                           clients.name AS client_name
+                    FROM cameras
+                    LEFT JOIN lots ON lots.id = cameras.lot_id
+                    LEFT JOIN clients ON clients.id = lots.client_id
+                    ORDER BY cameras.id
+                    """
+                )
+            ]
 
     def list_images(self, camera_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -206,6 +314,96 @@ class Database:
                 item["url"] = f"/media/{camera_id}/{item['filename']}"
                 images.append(item)
             return images
+
+    def list_clients(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute("SELECT * FROM clients ORDER BY name")]
+
+    def create_client(self, name: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            cursor = conn.execute(
+                "INSERT INTO clients (name, created_at) VALUES (?, ?)", (name, now)
+            )
+            row = conn.execute(
+                "SELECT * FROM clients WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+            return dict(row)
+
+    def list_lots(self, client_id: int | None = None) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            if client_id is not None:
+                rows = conn.execute(
+                    """
+                    SELECT lots.*, clients.name AS client_name
+                    FROM lots JOIN clients ON clients.id = lots.client_id
+                    WHERE lots.client_id = ?
+                    ORDER BY lots.name
+                    """,
+                    (client_id,),
+                )
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT lots.*, clients.name AS client_name
+                    FROM lots JOIN clients ON clients.id = lots.client_id
+                    ORDER BY clients.name, lots.name
+                    """
+                )
+            return [dict(row) for row in rows]
+
+    def create_lot(self, client_id: int, name: str, address: str | None) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM clients WHERE id = ?", (client_id,)).fetchone():
+                raise ValueError(f"Client {client_id} does not exist.")
+            cursor = conn.execute(
+                "INSERT INTO lots (client_id, name, address, created_at) VALUES (?, ?, ?, ?)",
+                (client_id, name, address, now),
+            )
+            row = conn.execute(
+                """
+                SELECT lots.*, clients.name AS client_name
+                FROM lots JOIN clients ON clients.id = lots.client_id
+                WHERE lots.id = ?
+                """,
+                (cursor.lastrowid,),
+            ).fetchone()
+            return dict(row)
+
+    def update_camera_lot(self, camera_id: str, lot_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            if not conn.execute("SELECT 1 FROM lots WHERE id = ?", (lot_id,)).fetchone():
+                raise ValueError(f"Lot {lot_id} does not exist.")
+            cursor = conn.execute(
+                "UPDATE cameras SET lot_id = ? WHERE id = ?", (lot_id, camera_id)
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute(
+                """
+                SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
+                       clients.name AS client_name
+                FROM cameras
+                LEFT JOIN lots ON lots.id = cameras.lot_id
+                LEFT JOIN clients ON clients.id = lots.client_id
+                WHERE cameras.id = ?
+                """,
+                (camera_id,),
+            ).fetchone()
+            return dict(row)
+
+    def get_lot(self, lot_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT lots.*, clients.name AS client_name
+                FROM lots JOIN clients ON clients.id = lots.client_id
+                WHERE lots.id = ?
+                """,
+                (lot_id,),
+            ).fetchone()
+            return dict(row) if row else None
 
     def list_spaces(self, camera_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -409,6 +607,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/":
             self.serve_file(STATIC_DIR / "index.html")
+        elif path == "/dashboard":
+            self.serve_file(STATIC_DIR / "dashboard.html")
         elif path.startswith("/static/"):
             self.serve_file(STATIC_DIR / path.removeprefix("/static/"))
         elif path.startswith("/media/"):
@@ -417,6 +617,16 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True})
         elif path == "/api/cameras":
             self.send_json({"cameras": db.list_cameras()})
+        elif path == "/api/clients":
+            self.send_json({"clients": db.list_clients()})
+        elif path == "/api/lots":
+            client_id_raw = query.get("client_id", [None])[0]
+            try:
+                client_id = int(client_id_raw) if client_id_raw is not None else None
+            except ValueError:
+                self.send_json({"error": "client_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"lots": db.list_lots(client_id)})
         elif path == "/api/images":
             camera_id = query.get("camera_id", [DEFAULT_CAMERA_ID])[0]
             self.send_json({"images": db.list_images(camera_id)})
@@ -441,6 +651,10 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/config/"):
             camera_id = safe_segment(unquote(path.removeprefix("/api/config/")))
             self.send_json({"camera_id": camera_id, "spaces": db.list_spaces(camera_id)})
+        elif path == "/api/reports/metrics":
+            self.handle_report_metrics(query)
+        elif path == "/api/reports/export":
+            self.handle_report_export(query)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -465,6 +679,30 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_upload()
         elif parsed.path == "/api/videos":
             self.handle_video_upload()
+        elif parsed.path == "/api/clients":
+            payload = self.read_json()
+            name = (payload.get("name") or "").strip()
+            if not name:
+                self.send_json({"error": "name is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"client": db.create_client(name)}, HTTPStatus.CREATED)
+        elif parsed.path == "/api/lots":
+            payload = self.read_json()
+            name = (payload.get("name") or "").strip()
+            try:
+                client_id = int(payload["client_id"])
+            except (KeyError, TypeError, ValueError):
+                self.send_json({"error": "client_id is required and must be an integer"}, HTTPStatus.BAD_REQUEST)
+                return
+            if not name:
+                self.send_json({"error": "name is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                lot = db.create_lot(client_id, name, payload.get("address") or None)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"lot": lot}, HTTPStatus.CREATED)
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -482,23 +720,40 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
-        match = re.fullmatch(r"/api/spaces/(\d+)", parsed.path)
-        if not match:
+        space_match = re.fullmatch(r"/api/spaces/(\d+)", parsed.path)
+        camera_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)", parsed.path)
+        if space_match:
+            payload = self.read_json()
+            try:
+                polygon = payload["polygon"]
+                if len(polygon) != 4:
+                    raise ValueError("A parking space needs exactly 4 points.")
+            except (KeyError, TypeError, ValueError) as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            space = db.update_space_polygon(int(space_match.group(1)), polygon)
+            if space is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"space": space})
+        elif camera_match:
+            payload = self.read_json()
+            try:
+                lot_id = int(payload["lot_id"])
+            except (KeyError, TypeError, ValueError):
+                self.send_json({"error": "lot_id is required and must be an integer"}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                camera = db.update_camera_lot(camera_match.group(1), lot_id)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if camera is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"camera": camera})
+        else:
             self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        payload = self.read_json()
-        try:
-            polygon = payload["polygon"]
-            if len(polygon) != 4:
-                raise ValueError("A parking space needs exactly 4 points.")
-        except (KeyError, TypeError, ValueError) as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
-            return
-        space = db.update_space_polygon(int(match.group(1)), polygon)
-        if space is None:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        self.send_json({"space": space})
 
     def handle_upload(self) -> None:
         form = cgi.FieldStorage(
@@ -610,6 +865,54 @@ class Handler(BaseHTTPRequestHandler):
             },
             HTTPStatus.CREATED,
         )
+
+    def resolve_report_request(self, query: dict[str, list[str]]) -> tuple[int, datetime, datetime] | None:
+        """Parses lot_id/start/end from the query string; sends an error
+        response and returns None if anything is wrong, so callers can just
+        `if resolved is None: return`."""
+        lot_id_raw = query.get("lot_id", [None])[0]
+        if lot_id_raw is None:
+            self.send_json({"error": "lot_id is required"}, HTTPStatus.BAD_REQUEST)
+            return None
+        try:
+            lot_id = int(lot_id_raw)
+        except ValueError:
+            self.send_json({"error": "lot_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+            return None
+        if db.get_lot(lot_id) is None:
+            self.send_json({"error": f"Lot {lot_id} does not exist."}, HTTPStatus.NOT_FOUND)
+            return None
+        try:
+            start, end = parse_report_range(query)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return None
+        return lot_id, start, end
+
+    def handle_report_metrics(self, query: dict[str, list[str]]) -> None:
+        resolved = self.resolve_report_request(query)
+        if resolved is None:
+            return
+        lot_id, start, end = resolved
+        with db.connect() as conn:
+            report = analytics.compute_lot_report(conn, lot_id, start, end)
+        self.send_json(report)
+
+    def handle_report_export(self, query: dict[str, list[str]]) -> None:
+        resolved = self.resolve_report_request(query)
+        if resolved is None:
+            return
+        lot_id, start, end = resolved
+        lot = db.get_lot(lot_id)
+        with db.connect() as conn:
+            report = analytics.compute_lot_report(conn, lot_id, start, end)
+        html = reports.render_report_html(lot, report)
+        body = html.encode("utf-8")
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))

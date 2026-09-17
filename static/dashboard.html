@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Lot Monitor — Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+  </head>
+  <body class="dashboard-body">
+    <header class="topbar">
+      <div>
+        <h1>Dashboard</h1>
+        <p>Occupancy analytics across clients and lots</p>
+      </div>
+      <a class="nav-link" href="/">Annotation View</a>
+    </header>
+
+    <main class="dashboard-main">
+      <div class="controls-bar">
+        <label class="control">
+          <span class="control-label">Client</span>
+          <select id="clientSelect">
+            <option value="">Loading…</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Lot</span>
+          <select id="lotSelect" disabled>
+            <option value="">Select a client first</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Range</span>
+          <select id="rangeSelect">
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="custom">Custom range</option>
+          </select>
+        </label>
+        <label class="control custom-range" id="customStartWrap" hidden>
+          <span class="control-label">Start</span>
+          <input type="date" id="startDateInput">
+        </label>
+        <label class="control custom-range" id="customEndWrap" hidden>
+          <span class="control-label">End</span>
+          <input type="date" id="endDateInput">
+        </label>
+        <button type="button" id="downloadReportButton" disabled>Download Report</button>
+      </div>
+
+      <div id="dashboardStatus" class="dashboard-status">Loading clients…</div>
+
+      <div id="dashboardContent" class="dashboard-content" hidden>
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="label">Occupancy Rate</div>
+            <div class="value" id="statOccupancy">—</div>
+            <div class="sub">of monitored time</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Total Arrivals</div>
+            <div class="value" id="statArrivals">—</div>
+            <div class="sub">parking events</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Avg. Dwell Time</div>
+            <div class="value" id="statDwell">—</div>
+            <div class="sub">per parking event</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Peak / Quietest Hour</div>
+            <div class="value" id="statPeak">—</div>
+            <div class="sub" id="statPeakSub">—</div>
+          </div>
+        </div>
+
+        <section class="chart-panel">
+          <h2>Occupancy Rate Over Time</h2>
+          <p class="panel-sub">% of monitored time each day the lot was occupied, across all spaces.</p>
+          <div id="occupancyChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Turnover</h2>
+          <p class="panel-sub">Number of distinct parking events (arrivals) per day.</p>
+          <div id="turnoverChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Peak / Off-Peak Hours</h2>
+          <p class="panel-sub">Average occupancy rate by hour of day, across the full date range.</p>
+          <div id="hourChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Average Dwell Time by Space</h2>
+          <p class="panel-sub">How long a typical car stays in each space, busiest first.</p>
+          <div id="dwellChart" class="chart-svg-wrap"></div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

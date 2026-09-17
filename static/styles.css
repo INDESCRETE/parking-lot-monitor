@@ -78,6 +78,12 @@ button:disabled {
   gap: 10px;
 }
 
+.topbar-actions {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+}
+
 .layout {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);
@@ -443,7 +449,150 @@ dialog::backdrop {
   white-space: nowrap;
 }
 
+.nav-link {
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  display: inline-flex;
+  min-height: 36px;
+  padding: 0 12px;
+  text-decoration: none;
+}
+
+.nav-link:hover {
+  border-color: var(--accent);
+}
+
+body.dashboard-body {
+  overflow: auto;
+}
+
+.dashboard-main {
+  margin: 0 auto;
+  max-width: 900px;
+  padding: 24px 20px 64px;
+}
+
+.controls-bar {
+  align-items: end;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 20px;
+  padding: 16px 20px;
+}
+
+.control {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.control-label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.control select,
+.control input {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.controls-bar > button {
+  margin-left: auto;
+}
+
+.dashboard-status {
+  color: var(--muted);
+  padding: 24px 0;
+  text-align: center;
+}
+
+.dashboard-status-error {
+  color: var(--danger);
+}
+
+.stat-grid {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(4, 1fr);
+  margin-bottom: 20px;
+}
+
+.stat-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.stat-card .label {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+}
+
+.stat-card .value {
+  font-size: 22px;
+  font-weight: 700;
+  margin-top: 6px;
+}
+
+.stat-card .sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.chart-panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  margin-bottom: 18px;
+  padding: 20px 24px;
+}
+
+.chart-panel h2 {
+  font-size: 15px;
+  margin: 0 0 4px;
+}
+
+.panel-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0 0 14px;
+}
+
+.empty-note {
+  color: var(--muted);
+  font-size: 13px;
+}
+
 @media (max-width: 800px) {
+  .dashboard-main {
+    padding: 16px 14px 48px;
+  }
+
+  .stat-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .controls-bar > button {
+    margin-left: 0;
+  }
+
   .topbar,
   .layout {
     display: block;
