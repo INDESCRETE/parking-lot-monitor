@@ -298,10 +298,34 @@ input[type="text"],
 }
 
 
-.history-button {
+.history-button,
+.add-camera-button {
   font-size: 12px;
   min-height: 28px;
   padding: 0 8px;
+}
+
+.camera-setting-row {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.camera-setting-row .inline-label {
+  flex: 1;
+}
+
+.camera-setting-row input {
+  min-height: 30px;
+  width: 60px;
+}
+
+.setting-status {
+  color: var(--accent-strong);
+  font-size: 11px;
+  font-weight: 700;
+  min-width: 40px;
 }
 
 .current-tag {
@@ -344,6 +368,18 @@ input[type="text"],
   margin-left: auto;
 }
 
+.detection-status {
+  font-weight: 700;
+}
+
+.detection-status.detecting {
+  color: var(--accent-strong);
+}
+
+.detection-status.detection-error {
+  color: var(--danger);
+}
+
 .canvas-wrap {
   display: grid;
   min-height: 0;
@@ -378,15 +414,23 @@ dialog::backdrop {
   background: rgba(28, 33, 39, 0.35);
 }
 
-#spaceForm {
+#spaceForm,
+#cameraForm {
   display: grid;
   gap: 12px;
   padding: 18px;
 }
 
-#spaceForm h2 {
+#spaceForm h2,
+#cameraForm h2 {
   font-size: 18px;
   margin: 0 0 4px;
+}
+
+.dialog-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: -6px 0 0;
 }
 
 .dialog-actions {

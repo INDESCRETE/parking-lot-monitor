@@ -150,7 +150,9 @@ def _dwell_bars(dwell_by_space: list[dict[str, Any]], *, width: int = 760) -> st
     )
 
 
-def render_report_html(lot: dict[str, Any], report: dict[str, Any]) -> str:
+def render_report_html(
+    lot: dict[str, Any], report: dict[str, Any], camera: dict[str, Any] | None = None
+) -> str:
     summary = report["summary"]
     start = datetime.fromisoformat(report["start"])
     end = datetime.fromisoformat(report["end"])
@@ -184,12 +186,14 @@ def render_report_html(lot: dict[str, Any], report: dict[str, Any]) -> str:
     lot_name = escape(lot["name"]) if lot else "—"
     client_name = escape(lot["client_name"]) if lot else "—"
     address = escape(lot["address"]) if lot and lot.get("address") else None
+    camera_name = escape(camera["name"]) if camera else None
+    title_suffix = f" — {camera_name}" if camera_name else ""
 
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>{client_name} — {lot_name} — Parking Report</title>
+<title>{client_name} — {lot_name}{title_suffix} — Parking Report</title>
 <style>
   :root {{
     --bg: #f5f6f8; --panel: #ffffff; --text: #20242a; --muted: {MUTED};
@@ -214,6 +218,10 @@ def render_report_html(lot: dict[str, Any], report: dict[str, Any]) -> str:
   header.report-header .client {{ font-size: 13px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-weight: 700; }}
   header.report-header h1 {{ font-size: 26px; margin: 4px 0 6px; }}
   header.report-header .meta {{ color: var(--muted); font-size: 13px; }}
+  .camera-badge {{
+    display: inline-block; background: var(--accent); color: #fff; font-size: 12px;
+    font-weight: 700; border-radius: 999px; padding: 3px 10px; margin-left: 8px; vertical-align: middle;
+  }}
   .stat-grid {{
     display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px;
   }}
@@ -244,8 +252,8 @@ def render_report_html(lot: dict[str, Any], report: dict[str, Any]) -> str:
 
   <header class="report-header">
     <div class="client">{client_name}</div>
-    <h1>{lot_name}{f" &middot; {address}" if address else ""}</h1>
-    <div class="meta">{start.strftime("%b %-d, %Y")} – {(end - timedelta(seconds=1)).strftime("%b %-d, %Y")} &nbsp;·&nbsp; Generated {generated_at} &nbsp;·&nbsp; {summary["space_count"]} monitored spaces</div>
+    <h1>{lot_name}{f" &middot; {address}" if address else ""}{f'<span class="camera-badge">{camera_name}</span>' if camera_name else ""}</h1>
+    <div class="meta">{start.strftime("%b %-d, %Y")} – {(end - timedelta(seconds=1)).strftime("%b %-d, %Y")} &nbsp;·&nbsp; Generated {generated_at} &nbsp;·&nbsp; {summary["space_count"]} monitored spaces{" on this camera" if camera_name else ""}</div>
   </header>
 
   <div class="stat-grid">

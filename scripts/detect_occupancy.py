@@ -20,6 +20,15 @@ IMAGES_DIR = ROOT / "data" / "images"
 # detectors use. car=3, motorcycle=4, bus=6, truck=8.
 VEHICLE_CLASS_IDS = {3, 4, 6, 8}
 
+# A single frame (or a couple of frames, at fast sampling rates) reading a
+# space as occupied, flanked by vacant on both sides, is almost always a
+# vehicle briefly passing through the polygon rather than actually parking --
+# not a real arrival. recompute_space_intervals() below folds any occupied
+# run shorter than this back into vacant time by default. Tune per-camera
+# with detect_occupancy.py's --min-occupied-seconds if a lot's real traffic
+# pattern needs a different cutoff.
+DEFAULT_MIN_OCCUPIED_SECONDS = 10.0
+
 MODEL_SIZES = {
     "nano": RFDETRNano,
     "small": RFDETRSmall,
@@ -59,6 +68,17 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.7,
         help="Only use bbox overlap when no anchor lands inside a space and overlap is very strong.",
+    )
+    parser.add_argument(
+        "--min-occupied-seconds",
+        type=float,
+        default=DEFAULT_MIN_OCCUPIED_SECONDS,
+        help=(
+            "An occupied reading shorter than this (flanked by vacant frames on "
+            "both sides) is treated as a vehicle passing through, not parking, "
+            "and folded back into vacant time instead of counting as an arrival. "
+            "Set to 0 to disable and count every occupied reading as a session."
+        ),
     )
     return parser.parse_args()
 
@@ -126,7 +146,21 @@ def init_tables(conn: sqlite3.Connection) -> None:
     )
 
 
-def recompute_space_intervals(conn: sqlite3.Connection, space_id: int) -> None:
+def _run_duration_seconds(start_row: sqlite3.Row, end_row: sqlite3.Row) -> float:
+    return max(
+        0.0,
+        (
+            datetime.fromisoformat(end_row["captured_at"])
+            - datetime.fromisoformat(start_row["captured_at"])
+        ).total_seconds(),
+    )
+
+
+def recompute_space_intervals(
+    conn: sqlite3.Connection,
+    space_id: int,
+    min_occupied_seconds: float = DEFAULT_MIN_OCCUPIED_SECONDS,
+) -> None:
     """Rebuild the occupied/vacant timeline for one space from scratch.
 
     Walks every occupancy_observation for the space in chronological (captured_at)
@@ -134,6 +168,14 @@ def recompute_space_intervals(conn: sqlite3.Connection, space_id: int) -> None:
     is a full rebuild rather than an incremental append so that reruns (which
     redetect and overwrite observations for every image, not just new ones) stay
     correct without risking duplicate or stale intervals.
+
+    An occupied run shorter than `min_occupied_seconds` is treated as noise --
+    almost always a vehicle passing through the space rather than parking in
+    it -- and merged back into its surrounding vacant time instead of being
+    recorded as its own session. The still-open final run is never treated as
+    noise even if it's currently short, since it may simply have just started
+    and hasn't had a chance to prove itself real or noise yet; it gets
+    reconsidered the next time detection runs.
     """
     conn.execute("DELETE FROM space_state_intervals WHERE parking_space_id = ?", (space_id,))
     rows = conn.execute(
@@ -149,7 +191,7 @@ def recompute_space_intervals(conn: sqlite3.Connection, space_id: int) -> None:
     if not rows:
         return
 
-    runs: list[tuple[int, sqlite3.Row, sqlite3.Row]] = []
+    raw_runs: list[tuple[int, sqlite3.Row, sqlite3.Row]] = []
     run_state = rows[0]["occupied"]
     run_start = rows[0]
     run_last = rows[0]
@@ -157,22 +199,35 @@ def recompute_space_intervals(conn: sqlite3.Connection, space_id: int) -> None:
         if row["occupied"] == run_state:
             run_last = row
             continue
-        runs.append((run_state, run_start, run_last))
+        raw_runs.append((run_state, run_start, run_last))
         run_state = row["occupied"]
         run_start = row
         run_last = row
-    runs.append((run_state, run_start, run_last))
+    raw_runs.append((run_state, run_start, run_last))
+
+    # Fold short occupied blips into vacant time. This can leave two
+    # newly-adjacent runs of the same state (e.g. vacant, [noise blip removed],
+    # vacant) that need merging into one, so this pass builds `merged`
+    # incrementally rather than filtering `raw_runs` in place.
+    merged: list[tuple[int, sqlite3.Row, sqlite3.Row]] = []
+    last_raw_index = len(raw_runs) - 1
+    for index, (occupied, start_row, end_row) in enumerate(raw_runs):
+        is_noise = (
+            occupied
+            and index != last_raw_index
+            and _run_duration_seconds(start_row, end_row) < min_occupied_seconds
+        )
+        effective_state = False if is_noise else occupied
+        if merged and merged[-1][0] == effective_state:
+            prev_state, prev_start, _prev_end = merged[-1]
+            merged[-1] = (prev_state, prev_start, end_row)
+        else:
+            merged.append((effective_state, start_row, end_row))
 
     now = utc_now()
-    last_index = len(runs) - 1
-    for index, (occupied, start_row, end_row) in enumerate(runs):
-        duration = max(
-            0.0,
-            (
-                datetime.fromisoformat(end_row["captured_at"])
-                - datetime.fromisoformat(start_row["captured_at"])
-            ).total_seconds(),
-        )
+    last_index = len(merged) - 1
+    for index, (occupied, start_row, end_row) in enumerate(merged):
+        duration = _run_duration_seconds(start_row, end_row)
         conn.execute(
             """
             INSERT INTO space_state_intervals
@@ -503,7 +558,7 @@ def main() -> None:
         if not spaces:
             raise RuntimeError(f"No parking spaces found for {args.camera_id}")
 
-        for image in images:
+        for index, image in enumerate(images):
             image_path = IMAGES_DIR / image["camera_id"] / image["filename"]
             detections = run_detector(model, image_path, args.confidence)
             stored_detections = store_detections(conn, image["id"], model_name, detections)
@@ -524,10 +579,29 @@ def main() -> None:
                 (image["id"],),
             ).fetchone()[0]
             print(f"{image['filename']}: {len(detections)} vehicles, {occupied_count}/{len(spaces)} occupied")
+            # Machine-parseable progress marker, one per completed image, read
+            # live by app/server.py's detection worker (it runs this script as
+            # a subprocess and streams stdout) to drive a progress indicator in
+            # the UI. flush=True matters: without it, Python buffers stdout in
+            # full blocks when not attached to a terminal (i.e. when piped to a
+            # subprocess), so the parent wouldn't see this until the process
+            # exits -- defeating the point of a live progress marker.
+            print(f"PROGRESS {index + 1} {len(images)}", flush=True)
 
+        # Per-image detection is done, but there's a second step left --
+        # rebuilding every space's occupied/vacant timeline from the results
+        # -- that has no per-item progress of its own but can still take a
+        # real few seconds for a lot with many spaces. Without a distinct
+        # marker for it, the UI has nothing to show here except a stale
+        # "100%" for however long this takes, which reads as finished (or
+        # stuck) when it's actually still working.
+        print("PHASE finalizing", flush=True)
         for space in spaces:
-            recompute_space_intervals(conn, space["id"])
-        print(f"Rebuilt occupancy timelines for {len(spaces)} space(s).")
+            recompute_space_intervals(conn, space["id"], args.min_occupied_seconds)
+        print(
+            f"Rebuilt occupancy timelines for {len(spaces)} space(s) "
+            f"(min_occupied_seconds={args.min_occupied_seconds})."
+        )
 
 
 if __name__ == "__main__":

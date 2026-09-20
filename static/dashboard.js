@@ -15,13 +15,16 @@ const LINE = "#d8dde5";
 const state = {
   clients: [],
   lots: [],
+  cameras: [],
   clientId: null,
   lotId: null,
+  cameraId: "",
   rangeMode: "7",
 };
 
 const clientSelect = document.querySelector("#clientSelect");
 const lotSelect = document.querySelector("#lotSelect");
+const cameraFilterSelect = document.querySelector("#cameraFilterSelect");
 const rangeSelect = document.querySelector("#rangeSelect");
 const customStartWrap = document.querySelector("#customStartWrap");
 const customEndWrap = document.querySelector("#customEndWrap");
@@ -234,6 +237,9 @@ function reportExportUrl() {
     return null;
   }
   const params = new URLSearchParams({ lot_id: state.lotId, start: range.start, end: range.end });
+  if (state.cameraId) {
+    params.set("camera_id", state.cameraId);
+  }
   return `/api/reports/export?${params.toString()}`;
 }
 
@@ -276,6 +282,10 @@ async function loadLots() {
     if (state.lots.length === 0) {
       lotSelect.innerHTML = '<option value="">No lots for this client</option>';
       state.lotId = null;
+      state.cameras = [];
+      state.cameraId = "";
+      cameraFilterSelect.innerHTML = '<option value="">All cameras</option>';
+      cameraFilterSelect.disabled = true;
       dashboardContent.hidden = true;
       updateDownloadButton();
       setStatus("This client has no lots yet.");
@@ -290,9 +300,39 @@ async function loadLots() {
     lotSelect.disabled = false;
     state.lotId = state.lots[0].id;
     lotSelect.value = state.lotId;
-    await loadReport();
+    await loadCameras();
   } catch (err) {
     setStatus(`Couldn't load lots: ${err.message}`, { error: true });
+  }
+}
+
+/** Populates the Camera filter with the cameras assigned to the selected
+ * lot. A lot can be covered by several camera angles that all combine into
+ * one report by default ("All cameras"); picking one here narrows every
+ * chart and the downloaded report down to just that camera's spaces. */
+async function loadCameras() {
+  cameraFilterSelect.disabled = true;
+  cameraFilterSelect.innerHTML = '<option value="">Loading…</option>';
+  try {
+    const payload = await fetchJson(`/api/cameras?lot_id=${encodeURIComponent(state.lotId)}`);
+    state.cameras = payload.cameras;
+    cameraFilterSelect.innerHTML = "";
+    const allOption = document.createElement("option");
+    allOption.value = "";
+    allOption.textContent = "All cameras";
+    cameraFilterSelect.append(allOption);
+    for (const camera of state.cameras) {
+      const option = document.createElement("option");
+      option.value = camera.id;
+      option.textContent = camera.name;
+      cameraFilterSelect.append(option);
+    }
+    state.cameraId = "";
+    cameraFilterSelect.value = "";
+    cameraFilterSelect.disabled = state.cameras.length === 0;
+    await loadReport();
+  } catch (err) {
+    setStatus(`Couldn't load cameras: ${err.message}`, { error: true });
   }
 }
 
@@ -307,6 +347,9 @@ async function loadReport() {
   dashboardContent.hidden = true;
   try {
     const params = new URLSearchParams({ lot_id: state.lotId, start: range.start, end: range.end });
+    if (state.cameraId) {
+      params.set("camera_id", state.cameraId);
+    }
     const report = await fetchJson(`/api/reports/metrics?${params.toString()}`);
     renderReport(report);
     setStatus("");
@@ -365,6 +408,11 @@ clientSelect.addEventListener("change", async () => {
 
 lotSelect.addEventListener("change", async () => {
   state.lotId = lotSelect.value;
+  await loadCameras();
+});
+
+cameraFilterSelect.addEventListener("change", async () => {
+  state.cameraId = cameraFilterSelect.value;
   await loadReport();
 });
 

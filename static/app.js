@@ -14,6 +14,7 @@ const state = {
   draggingHandle: null,
   suppressNextClick: false,
   statusSort: "label",
+  detectionPollTimer: null,
 };
 
 const HANDLE_RADIUS = 9;
@@ -24,6 +25,7 @@ const spaceList = document.querySelector("#spaceList");
 const canvas = document.querySelector("#annotationCanvas");
 const ctx = canvas.getContext("2d");
 const emptyState = document.querySelector("#emptyState");
+const emptyStatePath = document.querySelector("#emptyStatePath");
 const markSpaceButton = document.querySelector("#markSpaceButton");
 const undoPointButton = document.querySelector("#undoPointButton");
 const clearDraftButton = document.querySelector("#clearDraftButton");
@@ -46,6 +48,15 @@ const historyDialog = document.querySelector("#historyDialog");
 const historyTitle = document.querySelector("#historyTitle");
 const historyList = document.querySelector("#historyList");
 const closeHistoryButton = document.querySelector("#closeHistoryButton");
+const addCameraButton = document.querySelector("#addCameraButton");
+const cameraDialog = document.querySelector("#cameraDialog");
+const cameraForm = document.querySelector("#cameraForm");
+const cameraNameInput = document.querySelector("#cameraNameInput");
+const cancelCameraButton = document.querySelector("#cancelCameraButton");
+const runDetectionButton = document.querySelector("#runDetectionButton");
+const detectionStatus = document.querySelector("#detectionStatus");
+const minOccupiedInput = document.querySelector("#minOccupiedInput");
+const minOccupiedStatus = document.querySelector("#minOccupiedStatus");
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -66,10 +77,12 @@ async function loadInitialData() {
   state.cameraId = state.cameras[0]?.id || "camera_1";
   renderCameras();
   await loadCameraData();
+  checkDetectionStatusOnce(state.cameraId);
 }
 
 async function loadCameraData() {
   configLink.href = `/api/config/${state.cameraId}`;
+  renderMinOccupiedInput();
   const [imagesPayload, spacesPayload] = await Promise.all([
     fetchJson(`/api/images?camera_id=${encodeURIComponent(state.cameraId)}`),
     fetchJson(`/api/spaces?camera_id=${encodeURIComponent(state.cameraId)}`),
@@ -83,6 +96,110 @@ async function loadCameraData() {
   await loadSelectedImage();
 }
 
+// Shows the currently-selected camera's own minimum-parked-time override (or
+// blank, meaning "use the script's own default" -- the placeholder shows
+// what that default is so it's never a mystery why the box looks empty).
+function renderMinOccupiedInput() {
+  minOccupiedStatus.textContent = "";
+  const camera = state.cameras.find((c) => c.id === state.cameraId);
+  const value = camera ? camera.min_occupied_seconds : null;
+  minOccupiedInput.value = value === null || value === undefined ? "" : value;
+}
+
+function renderDetectionStatus(status) {
+  detectionStatus.classList.remove("detecting", "detection-error");
+  if (!status || status.status === "idle") {
+    detectionStatus.textContent = "";
+    return;
+  }
+  if (status.status === "running") {
+    const progress = status.progress;
+    if (status.phase === "finalizing") {
+      // All images are detected (progress would just be sitting at a stale
+      // 100% here); the script is now rebuilding each space's occupied/
+      // vacant timeline from the results, which has no per-item progress of
+      // its own but can still take a few real seconds for a lot with many
+      // spaces. Said explicitly so this doesn't read as finished or stuck.
+      detectionStatus.textContent = "Finalizing (rebuilding occupancy timelines)…";
+    } else if (progress && progress.total > 0) {
+      const pct = Math.round((progress.done / progress.total) * 100);
+      detectionStatus.textContent = `Detecting vehicles… ${pct}% (${progress.done}/${progress.total})`;
+    } else {
+      // No progress line seen yet -- e.g. the model is still loading, or
+      // the very first image hasn't finished. Falls back to a plain
+      // spinner-style message rather than showing "0%" and looking stuck.
+      detectionStatus.textContent = "Detecting vehicles…";
+    }
+    detectionStatus.classList.add("detecting");
+    return;
+  }
+  detectionStatus.textContent = `Detection failed: ${status.error || "unknown error"}`;
+  detectionStatus.classList.add("detection-error");
+}
+
+function stopDetectionPolling() {
+  if (state.detectionPollTimer) {
+    clearTimeout(state.detectionPollTimer);
+    state.detectionPollTimer = null;
+  }
+}
+
+// Polls a camera's background detection run to completion, then reloads its
+// spaces/images/observations automatically -- the whole point being that
+// nobody has to manually refresh the page (or run anything themselves) to
+// see results once a video/image upload or the Run Detection button has
+// kicked a run off server-side.
+// 1s rather than a slower interval so a short run's progress (or the
+// finalizing phase) actually has a chance to show up at least once before
+// the run finishes, instead of jumping straight from "no data yet" to done.
+const DETECTION_POLL_INTERVAL_MS = 1000;
+
+async function pollDetectionUntilDone(cameraId) {
+  stopDetectionPolling();
+  const tick = async () => {
+    let status;
+    try {
+      status = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/detection-status`);
+    } catch (error) {
+      state.detectionPollTimer = setTimeout(tick, DETECTION_POLL_INTERVAL_MS);
+      return;
+    }
+    const viewingThisCamera = state.cameraId === cameraId;
+    if (viewingThisCamera) {
+      renderDetectionStatus(status);
+    }
+    if (status.status === "running") {
+      state.detectionPollTimer = setTimeout(tick, DETECTION_POLL_INTERVAL_MS);
+      return;
+    }
+    state.detectionPollTimer = null;
+    if (viewingThisCamera) {
+      await loadCameraData();
+      renderDetectionStatus(status);
+    }
+  };
+  await tick();
+}
+
+// Used on page load and whenever the camera picker changes: shows whatever
+// is already true for that camera (e.g. a run kicked off before the page
+// was last refreshed) without assuming a run just started.
+async function checkDetectionStatusOnce(cameraId) {
+  let status;
+  try {
+    status = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/detection-status`);
+  } catch (error) {
+    return;
+  }
+  if (state.cameraId !== cameraId) {
+    return;
+  }
+  renderDetectionStatus(status);
+  if (status.status === "running") {
+    await pollDetectionUntilDone(cameraId);
+  }
+}
+
 function renderCameras() {
   cameraSelect.innerHTML = "";
   for (const camera of state.cameras) {
@@ -92,6 +209,21 @@ function renderCameras() {
     cameraSelect.append(option);
   }
   cameraSelect.value = state.cameraId;
+}
+
+async function createCamera(name) {
+  const payload = await fetchJson("/api/cameras", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name }),
+  });
+  const camerasPayload = await fetchJson("/api/cameras");
+  state.cameras = camerasPayload.cameras;
+  state.cameraId = payload.camera.id;
+  renderCameras();
+  await loadCameraData();
+  renderDetectionStatus(null);
+  setStatus(`Created camera "${payload.camera.name}" — its own separate images and spaces.`);
 }
 
 function renderImages() {
@@ -140,7 +272,7 @@ function selectedImageIndex() {
 }
 
 function shouldIgnoreImageNavigation(event) {
-  if (dialog.open || historyDialog.open) {
+  if (dialog.open || historyDialog.open || cameraDialog.open) {
     return true;
   }
   if (event.target?.classList?.contains("image-row")) {
@@ -194,6 +326,7 @@ async function loadSelectedImage() {
     state.observations = { detections: [], occupancy: [] };
     state.hoveredDetectionId = null;
     canvas.style.display = "none";
+    emptyStatePath.textContent = `data/images/${state.cameraId}`;
     emptyState.style.display = "block";
     draw();
     return;
@@ -840,7 +973,32 @@ cancelSpaceButton.addEventListener("click", () => {
   dialog.close();
 });
 
+addCameraButton.addEventListener("click", () => {
+  cameraNameInput.value = "";
+  cameraDialog.showModal();
+  cameraNameInput.focus();
+});
+
+cameraForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const name = cameraNameInput.value.trim();
+  cameraDialog.close();
+  if (!name) {
+    return;
+  }
+  try {
+    await createCamera(name);
+  } catch (error) {
+    setStatus(error.message);
+  }
+});
+
+cancelCameraButton.addEventListener("click", () => {
+  cameraDialog.close();
+});
+
 cameraSelect.addEventListener("change", async () => {
+  stopDetectionPolling();
   state.cameraId = cameraSelect.value;
   state.draftPoints = [];
   state.hoveredSpaceId = null;
@@ -849,6 +1007,56 @@ cameraSelect.addEventListener("change", async () => {
   state.mode = "idle";
   await loadCameraData();
   updateDraftControls();
+  checkDetectionStatusOnce(state.cameraId);
+});
+
+minOccupiedInput.addEventListener("change", async () => {
+  const raw = minOccupiedInput.value.trim();
+  let minOccupiedSeconds = null; // blank -> clear override, fall back to script default
+  if (raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isNaN(parsed) || parsed < 0) {
+      minOccupiedStatus.textContent = "Invalid";
+      renderMinOccupiedInput();
+      return;
+    }
+    minOccupiedSeconds = parsed;
+  }
+  try {
+    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(state.cameraId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ min_occupied_seconds: minOccupiedSeconds }),
+    });
+    const index = state.cameras.findIndex((c) => c.id === state.cameraId);
+    if (index !== -1) {
+      state.cameras[index] = payload.camera;
+    }
+    minOccupiedStatus.textContent = "Saved";
+    setTimeout(() => {
+      if (minOccupiedStatus.textContent === "Saved") {
+        minOccupiedStatus.textContent = "";
+      }
+    }, 2000);
+  } catch (error) {
+    minOccupiedStatus.textContent = "";
+    setStatus(error.message);
+  }
+});
+
+runDetectionButton.addEventListener("click", async () => {
+  runDetectionButton.disabled = true;
+  try {
+    const status = await fetchJson(`/api/cameras/${encodeURIComponent(state.cameraId)}/detect`, {
+      method: "POST",
+    });
+    renderDetectionStatus(status);
+    await pollDetectionUntilDone(state.cameraId);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    runDetectionButton.disabled = false;
+  }
 });
 
 uploadForm.addEventListener("submit", async (event) => {
@@ -863,6 +1071,9 @@ uploadForm.addEventListener("submit", async (event) => {
   state.images.push(payload.image);
   uploadInput.value = "";
   await selectImage(payload.image);
+  if (payload.detection_triggered) {
+    pollDetectionUntilDone(payload.image.camera_id);
+  }
 });
 
 function parseTimeToSeconds(value) {
@@ -908,6 +1119,9 @@ videoUploadForm.addEventListener("submit", async (event) => {
     videoUploadInput.value = "";
     videoEndInput.value = "";
     await loadCameraData();
+    if (payload.detection_triggered) {
+      pollDetectionUntilDone(payload.camera_id);
+    }
   } catch (error) {
     setStatus(error.message);
   } finally {

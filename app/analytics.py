@@ -57,17 +57,25 @@ def _hour_slices(start: datetime, end: datetime):
         cursor = slice_end
 
 
-def _lot_spaces(conn: sqlite3.Connection, lot_id: int) -> list[dict[str, Any]]:
-    rows = conn.execute(
-        """
+def _lot_spaces(
+    conn: sqlite3.Connection, lot_id: int, camera_id: str | None = None
+) -> list[dict[str, Any]]:
+    """Every space belonging to this lot, or -- when camera_id is given --
+    only the spaces on that one camera within the lot. A lot can be covered
+    by several camera angles that all count toward the same lot's numbers
+    by default; camera_id narrows a report down to just one of them."""
+    query = """
         SELECT parking_spaces.id AS space_id, parking_spaces.label AS label
         FROM parking_spaces
         JOIN cameras ON cameras.id = parking_spaces.camera_id
         WHERE cameras.lot_id = ?
-        ORDER BY parking_spaces.label
-        """,
-        (lot_id,),
-    ).fetchall()
+    """
+    params: list[Any] = [lot_id]
+    if camera_id is not None:
+        query += " AND cameras.id = ?"
+        params.append(camera_id)
+    query += " ORDER BY parking_spaces.label"
+    rows = conn.execute(query, params).fetchall()
     return [{"space_id": row["space_id"], "label": row["label"]} for row in rows]
 
 
@@ -158,14 +166,24 @@ def _occupancy_by_day_and_hour(intervals: list[dict[str, Any]]):
 
 
 def compute_lot_report(
-    conn: sqlite3.Connection, lot_id: int, start: datetime, end: datetime
+    conn: sqlite3.Connection,
+    lot_id: int,
+    start: datetime,
+    end: datetime,
+    camera_id: str | None = None,
 ) -> dict[str, Any]:
     """The full metric bundle for one lot over [start, end): occupancy rate
     by day, average dwell time by space, turnover by day, and a peak/
     off-peak hour-of-day breakdown, plus a rolled-up summary. This is the
     one entry point the dashboard and the report export both call, so they
-    can never show different numbers for the same question."""
-    spaces = _lot_spaces(conn, lot_id)
+    can never show different numbers for the same question.
+
+    By default this combines every camera assigned to the lot (the normal
+    case: several camera angles covering one physical lot). Passing
+    camera_id narrows everything below to just that one camera's spaces,
+    for telling cameras apart within a lot rather than a full lot rollup.
+    """
+    spaces = _lot_spaces(conn, lot_id, camera_id)
     space_ids = [s["space_id"] for s in spaces]
 
     clipped = _clipped_intervals(conn, space_ids, start, end)
@@ -239,6 +257,7 @@ def compute_lot_report(
 
     return {
         "lot_id": lot_id,
+        "camera_id": camera_id,
         "start": start.isoformat(),
         "end": end.isoformat(),
         "spaces": spaces,

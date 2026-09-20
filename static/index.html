@@ -24,8 +24,16 @@
     <main class="layout">
       <aside class="sidebar">
         <section>
-          <label for="cameraSelect">Camera</label>
+          <div class="section-title-row">
+            <label for="cameraSelect" class="section-title">Camera</label>
+            <button type="button" id="addCameraButton" class="add-camera-button">+ Add Camera</button>
+          </div>
           <select id="cameraSelect"></select>
+          <div class="camera-setting-row">
+            <label for="minOccupiedInput" class="inline-label">Min. parked time to count (sec)</label>
+            <input id="minOccupiedInput" type="number" min="0" step="1" placeholder="10">
+            <span id="minOccupiedStatus" class="setting-status" role="status"></span>
+          </div>
         </section>
 
         <section>
@@ -72,14 +80,16 @@
           <button id="markSpaceButton" type="button" title="Shortcut: M">Mark Space (M)</button>
           <button id="undoPointButton" type="button" disabled>Undo Point</button>
           <button id="clearDraftButton" type="button" disabled>Clear</button>
+          <button id="runDetectionButton" type="button">Run Detection</button>
           <a id="configLink" href="/api/config/camera_1" target="_blank">View Config JSON</a>
+          <span id="detectionStatus" class="detection-status" role="status"></span>
           <span id="status" role="status"></span>
         </div>
 
         <div class="canvas-wrap">
           <canvas id="annotationCanvas"></canvas>
           <div id="emptyState" class="empty-state">
-            Add images to <code>data/images/camera_1</code> or upload one to begin.
+            Add images to <code id="emptyStatePath">data/images/camera_1</code> or upload/import a video to begin.
           </div>
         </div>
       </section>
@@ -93,6 +103,19 @@
         <div class="dialog-actions">
           <button value="cancel" type="button" id="cancelSpaceButton">Cancel</button>
           <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="cameraDialog">
+      <form method="dialog" id="cameraForm">
+        <h2>Add Camera</h2>
+        <label for="cameraNameInput">Camera name</label>
+        <input id="cameraNameInput" name="cameraName" autocomplete="off" placeholder="e.g. North Entrance" required>
+        <p class="dialog-hint">Its own separate set of images and marked spaces — nothing on your other cameras is affected.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCameraButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
         </div>
       </form>
     </dialog>

@@ -8,6 +8,9 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
+import sys
+import threading
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +32,14 @@ DEFAULT_CAMERA_ID = "camera_1"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 MAX_VIDEO_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap
+# Sentinel distinguishing "this optional argument wasn't passed at all" from
+# an explicit `None`, used where `None` is itself a meaningful value (e.g.
+# Database.update_camera's min_occupied_seconds, where None means "clear the
+# per-camera override").
+_UNSET = object()
+
+DETECT_SCRIPT_PATH = ROOT / "scripts" / "detect_occupancy.py"
+DETECTION_TIMEOUT_SECONDS = 30 * 60  # generous ceiling for a large batch on CPU
 
 
 def utc_now() -> str:
@@ -71,6 +82,172 @@ def parse_report_range(query: dict[str, list[str]]) -> tuple[datetime, datetime]
     return start, end
 
 
+# --- Background detection ---
+#
+# scripts/detect_occupancy.py is a slow, synchronous batch job (it loads an
+# RF-DETR model and runs inference over every image for one camera), so it
+# can't run inline inside an HTTP request handler without blocking uploads
+# for minutes. Instead, a video/image upload kicks it off on a background
+# thread and returns immediately; the frontend polls a status endpoint and
+# refreshes itself once the run finishes. `_detection_state` is in-memory
+# only (not persisted) — it describes "is a job running right now", which
+# is inherently about this process's lifetime, not durable data.
+_detection_lock = threading.Lock()
+_detection_state: dict[str, dict[str, Any]] = {}
+# Matches the "PROGRESS <done> <total>" line scripts/detect_occupancy.py
+# prints (flushed) after each image, so this worker can turn it into a live
+# progress indicator instead of only knowing "running" vs "not running".
+_PROGRESS_RE = re.compile(r"^PROGRESS (\d+) (\d+)$")
+# Matches the "PHASE <name>" line the script prints once it moves from
+# per-image detection (where PROGRESS applies) into rebuilding occupancy
+# timelines from the results -- a step with no per-item progress of its own,
+# but one that can take a real few seconds for a lot with many spaces. Without
+# this, the UI has nothing to show once PROGRESS hits done==total except a
+# stale "100%" for however long that rebuild takes, which looks stuck/finished
+# when it isn't -- this is what Rob saw and asked about.
+_PHASE_RE = re.compile(r"^PHASE (\w+)$")
+
+
+def trigger_detection(camera_id: str) -> None:
+    """Starts a background detection run for one camera, or — if a run for
+    that camera is already in progress — marks that it needs to run again
+    once the current pass finishes, rather than starting a second
+    overlapping pass. Two RF-DETR runs for the same camera at once would
+    both rebuild the same space_state_intervals rows from scratch and race
+    each other, so this coalesces bursts (e.g. importing several videos back
+    to back) into one rerun instead of many concurrent ones.
+    """
+    with _detection_lock:
+        state = _detection_state.setdefault(camera_id, {"status": "idle"})
+        if state.get("status") == "running":
+            state["pending_rerun"] = True
+            return
+        state.update(
+            {
+                "status": "running",
+                "started_at": utc_now(),
+                "finished_at": None,
+                "error": None,
+                "pending_rerun": False,
+                "progress": None,
+                "phase": None,
+            }
+        )
+    thread = threading.Thread(target=_run_detection_worker, args=(camera_id,), daemon=True)
+    thread.start()
+
+
+def _set_detection_progress(camera_id: str, done: int, total: int) -> None:
+    with _detection_lock:
+        state = _detection_state.setdefault(camera_id, {})
+        # A rerun coalesced while this line was in flight (see
+        # trigger_detection) has already reset status away from "running";
+        # don't resurrect a progress reading from the run that's finishing.
+        if state.get("status") == "running":
+            state["progress"] = {"done": done, "total": total}
+
+
+def _set_detection_phase(camera_id: str, phase: str) -> None:
+    with _detection_lock:
+        state = _detection_state.setdefault(camera_id, {})
+        if state.get("status") == "running":
+            state["phase"] = phase
+
+
+def _run_detection_worker(camera_id: str) -> None:
+    while True:
+        error: str | None = None
+        try:
+            # sys.executable: the exact interpreter already running this
+            # server, so this automatically uses whatever venv (with
+            # RF-DETR installed) the server itself was started with —
+            # no separate environment to keep in sync.
+            command = [sys.executable, str(DETECT_SCRIPT_PATH), "--camera-id", camera_id]
+            # Re-read the camera's own noise-filter override fresh on every
+            # run (rather than once outside the loop) so a value Rob just
+            # saved from the UI takes effect on the very next run, including
+            # an immediate coalesced rerun. None means "no override" -- the
+            # script falls back to its own DEFAULT_MIN_OCCUPIED_SECONDS.
+            camera = db.get_camera(camera_id)
+            if camera is not None and camera.get("min_occupied_seconds") is not None:
+                command += ["--min-occupied-seconds", str(camera["min_occupied_seconds"])]
+
+            # Popen + a streamed read loop (rather than subprocess.run's
+            # capture_output, which only hands back output once the process
+            # has already exited) so progress lines can update the UI while
+            # detection is still running, not just after it finishes.
+            env = dict(os.environ, PYTHONUNBUFFERED="1")
+            proc = subprocess.Popen(
+                command,
+                cwd=ROOT,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=env,
+            )
+            timed_out = False
+
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                proc.kill()
+
+            timer = threading.Timer(DETECTION_TIMEOUT_SECONDS, _on_timeout)
+            timer.start()
+            output_lines: list[str] = []
+            try:
+                assert proc.stdout is not None
+                for line in proc.stdout:
+                    line = line.rstrip("\n")
+                    output_lines.append(line)
+                    stripped = line.strip()
+                    progress_match = _PROGRESS_RE.match(stripped)
+                    phase_match = _PHASE_RE.match(stripped)
+                    if progress_match:
+                        _set_detection_progress(camera_id, int(progress_match.group(1)), int(progress_match.group(2)))
+                    elif phase_match:
+                        _set_detection_phase(camera_id, phase_match.group(1))
+            finally:
+                proc.stdout.close()
+                returncode = proc.wait()
+                timer.cancel()
+
+            if timed_out:
+                error = f"Detection timed out after {DETECTION_TIMEOUT_SECONDS // 60} minutes."
+            elif returncode != 0:
+                error = "\n".join(output_lines).strip()[-2000:] or "Detection failed."
+        except OSError as exc:
+            error = str(exc)
+
+        with _detection_lock:
+            state = _detection_state.setdefault(camera_id, {})
+            state["status"] = "error" if error else "idle"
+            state["error"] = error
+            state["finished_at"] = utc_now()
+            state["progress"] = None
+            state["phase"] = None
+            rerun = state.pop("pending_rerun", False)
+            if rerun:
+                state.update(
+                    {
+                        "status": "running",
+                        "started_at": utc_now(),
+                        "finished_at": None,
+                        "progress": None,
+                        "phase": None,
+                    }
+                )
+        if not rerun:
+            return
+
+
+def get_detection_status(camera_id: str) -> dict[str, Any]:
+    with _detection_lock:
+        state = _detection_state.get(camera_id, {"status": "idle"})
+        return {"camera_id": camera_id, **state}
+
+
 def parse_timestamp_from_filename(path: Path) -> str:
     match = re.search(
         r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[T _-]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})",
@@ -100,6 +277,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS cameras (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
+                    min_occupied_seconds REAL,
                     created_at TEXT NOT NULL
                 );
 
@@ -191,6 +369,7 @@ class Database:
                 """
             )
             self._migrate_camera_lot_column(conn)
+            self._migrate_camera_min_occupied_seconds_column(conn)
             conn.execute(
                 "INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
                 (DEFAULT_CAMERA_ID, "Camera 1", utc_now()),
@@ -208,16 +387,25 @@ class Database:
         if "lot_id" not in columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN lot_id INTEGER REFERENCES lots(id)")
 
-    def _backfill_unassigned_lot(self, conn: sqlite3.Connection) -> None:
-        """Any camera with no lot yet (pre-existing data, or a brand-new camera
-        folder discovered by sync_images) gets parked under a well-known
-        "Unassigned" client/lot rather than left NULL, so every camera is
-        always reportable under some lot. Looked up by name, not "first row
-        in the table", so this never misattributes a camera to a real client
-        that happens to already exist.
+    def _migrate_camera_min_occupied_seconds_column(self, conn: sqlite3.Connection) -> None:
+        """Add cameras.min_occupied_seconds if this DB predates the
+        pass-through/noise-filtering feature. NULL means "use
+        scripts/detect_occupancy.py's own default (DEFAULT_MIN_OCCUPIED_SECONDS)"
+        rather than a fixed number, so existing cameras aren't forced onto a
+        stored value that then drifts out of sync with the script's default."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
+        if "min_occupied_seconds" not in columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN min_occupied_seconds REAL")
+
+    def _ensure_unassigned_lot(self, conn: sqlite3.Connection) -> int:
+        """Returns the id of the well-known "Unassigned" client/lot,
+        creating it on first use. Looked up by name, not "first row in the
+        table", so this never misattributes a camera to a real client that
+        happens to already exist. Shared by the startup backfill,
+        sync_images, and any camera created without an explicit lot, so
+        every camera always has a lot to report under from the moment it
+        exists rather than only after the next server restart.
         """
-        if not conn.execute("SELECT 1 FROM cameras WHERE lot_id IS NULL").fetchone():
-            return
         now = utc_now()
         client_row = conn.execute(
             "SELECT id FROM clients WHERE name = ?", ("Unassigned",)
@@ -240,6 +428,17 @@ class Database:
             ).lastrowid
         else:
             lot_id = lot_row["id"]
+        return lot_id
+
+    def _backfill_unassigned_lot(self, conn: sqlite3.Connection) -> None:
+        """Any camera with no lot yet (pre-existing data, or a brand-new camera
+        folder discovered by sync_images) gets parked under the "Unassigned"
+        client/lot rather than left NULL, so every camera is always
+        reportable under some lot.
+        """
+        if not conn.execute("SELECT 1 FROM cameras WHERE lot_id IS NULL").fetchone():
+            return
+        lot_id = self._ensure_unassigned_lot(conn)
         conn.execute("UPDATE cameras SET lot_id = ? WHERE lot_id IS NULL", (lot_id,))
 
     def sync_images(self) -> None:
@@ -286,21 +485,21 @@ class Database:
             # next server restart.
             self._backfill_unassigned_lot(conn)
 
-    def list_cameras(self) -> list[dict[str, Any]]:
+    def list_cameras(self, lot_id: int | None = None) -> list[dict[str, Any]]:
+        query = """
+            SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
+                   clients.name AS client_name
+            FROM cameras
+            LEFT JOIN lots ON lots.id = cameras.lot_id
+            LEFT JOIN clients ON clients.id = lots.client_id
+        """
+        params: list[Any] = []
+        if lot_id is not None:
+            query += " WHERE cameras.lot_id = ?"
+            params.append(lot_id)
+        query += " ORDER BY cameras.id"
         with self.connect() as conn:
-            return [
-                dict(row)
-                for row in conn.execute(
-                    """
-                    SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
-                           clients.name AS client_name
-                    FROM cameras
-                    LEFT JOIN lots ON lots.id = cameras.lot_id
-                    LEFT JOIN clients ON clients.id = lots.client_id
-                    ORDER BY cameras.id
-                    """
-                )
-            ]
+            return [dict(row) for row in conn.execute(query, params)]
 
     def list_images(self, camera_id: str) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -376,15 +575,37 @@ class Database:
             ).fetchone()
             return dict(row)
 
-    def update_camera_lot(self, camera_id: str, lot_id: int) -> dict[str, Any] | None:
+    def update_camera(
+        self,
+        camera_id: str,
+        *,
+        lot_id: int | None = None,
+        min_occupied_seconds: Any = _UNSET,
+    ) -> dict[str, Any] | None:
+        """Updates whichever of a camera's settings were actually passed.
+
+        `lot_id`, if given, reassigns the camera to a different lot (must
+        exist). `min_occupied_seconds` is tri-state via the `_UNSET`
+        sentinel so a caller can distinguish "don't touch this setting"
+        (omitted) from "clear it back to the script's own default"
+        (explicit `None`) from "set an override" (a number) -- a plain
+        default of `None` couldn't tell the second and third cases apart.
+        Returns None if the camera doesn't exist.
+        """
         with self.connect() as conn:
-            if not conn.execute("SELECT 1 FROM lots WHERE id = ?", (lot_id,)).fetchone():
-                raise ValueError(f"Lot {lot_id} does not exist.")
-            cursor = conn.execute(
-                "UPDATE cameras SET lot_id = ? WHERE id = ?", (lot_id, camera_id)
-            )
-            if cursor.rowcount == 0:
+            if not conn.execute("SELECT 1 FROM cameras WHERE id = ?", (camera_id,)).fetchone():
                 return None
+            if lot_id is not None:
+                if not conn.execute("SELECT 1 FROM lots WHERE id = ?", (lot_id,)).fetchone():
+                    raise ValueError(f"Lot {lot_id} does not exist.")
+                conn.execute("UPDATE cameras SET lot_id = ? WHERE id = ?", (lot_id, camera_id))
+            if min_occupied_seconds is not _UNSET:
+                if min_occupied_seconds is not None and min_occupied_seconds < 0:
+                    raise ValueError("min_occupied_seconds cannot be negative.")
+                conn.execute(
+                    "UPDATE cameras SET min_occupied_seconds = ? WHERE id = ?",
+                    (min_occupied_seconds, camera_id),
+                )
             row = conn.execute(
                 """
                 SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
@@ -408,6 +629,11 @@ class Database:
                 """,
                 (lot_id,),
             ).fetchone()
+            return dict(row) if row else None
+
+    def get_camera(self, camera_id: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM cameras WHERE id = ?", (camera_id,)).fetchone()
             return dict(row) if row else None
 
     def list_spaces(self, camera_id: str) -> list[dict[str, Any]]:
@@ -566,9 +792,15 @@ class Database:
             shutil.copyfileobj(source, handle)
 
         with self.connect() as conn:
+            # INSERT OR IGNORE: if this camera already exists, this is a
+            # no-op and its existing lot_id is left untouched. If it's
+            # brand new, it needs a lot_id immediately (not just at the
+            # next restart's backfill) or it would be silently invisible
+            # to every report until then.
+            lot_id = self._ensure_unassigned_lot(conn)
             conn.execute(
-                "INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
-                (camera_id, camera_id.replace("_", " ").title(), utc_now()),
+                "INSERT OR IGNORE INTO cameras (id, name, lot_id, created_at) VALUES (?, ?, ?, ?)",
+                (camera_id, camera_id.replace("_", " ").title(), lot_id, utc_now()),
             )
             cursor = conn.execute(
                 """
@@ -581,6 +813,70 @@ class Database:
             item = dict(row)
             item["url"] = f"/media/{camera_id}/{item['filename']}"
             return item
+
+    def create_camera(
+        self, name: str, camera_id: str | None = None, lot_id: int | None = None
+    ) -> dict[str, Any]:
+        """Creates a new, independent camera. Its images, marked spaces, and
+        detection history are scoped entirely by camera_id (see list_images/
+        list_spaces/etc.), so this never touches or overwrites any other
+        camera's data — that isolation is the whole point of this method
+        existing as a first-class action instead of the old implicit
+        "type a new folder name and hope" flow.
+        """
+        name = name.strip()
+        if not name:
+            raise ValueError("name is required")
+        with self.connect() as conn:
+            # Reject a duplicate display name outright (case-insensitive):
+            # two cameras that both show up as "Camera 2" in the picker are
+            # indistinguishable to look at, even once their underlying ids
+            # are made safely unique below.
+            existing = conn.execute(
+                "SELECT id FROM cameras WHERE LOWER(name) = ?", (name.lower(),)
+            ).fetchone()
+            if existing is not None:
+                raise ValueError(
+                    f'A camera named "{name}" already exists (id "{existing["id"]}"). '
+                    "Pick a different name, or select that camera from the dropdown instead."
+                )
+            # Lowercased and checked case-insensitively: without this, typing
+            # "Camera 2" when a lowercase "camera_2" already exists would
+            # silently create a second, visually-identical camera ("Camera_2")
+            # instead of either reusing it or clearly disambiguating it.
+            base_slug = (safe_segment(camera_id) if camera_id else safe_segment(name)).lower()
+            candidate = base_slug
+            counter = 2
+            while conn.execute(
+                "SELECT 1 FROM cameras WHERE LOWER(id) = ?", (candidate,)
+            ).fetchone():
+                candidate = f"{base_slug}_{counter}"
+                counter += 1
+            resolved_camera_id = candidate
+
+            if lot_id is not None:
+                if not conn.execute("SELECT 1 FROM lots WHERE id = ?", (lot_id,)).fetchone():
+                    raise ValueError(f"Lot {lot_id} does not exist.")
+            else:
+                lot_id = self._ensure_unassigned_lot(conn)
+
+            conn.execute(
+                "INSERT INTO cameras (id, name, lot_id, created_at) VALUES (?, ?, ?, ?)",
+                (resolved_camera_id, name, lot_id, utc_now()),
+            )
+            row = conn.execute(
+                """
+                SELECT cameras.*, lots.name AS lot_name, lots.client_id AS client_id,
+                       clients.name AS client_name
+                FROM cameras
+                LEFT JOIN lots ON lots.id = cameras.lot_id
+                LEFT JOIN clients ON clients.id = lots.client_id
+                WHERE cameras.id = ?
+                """,
+                (resolved_camera_id,),
+            ).fetchone()
+        (IMAGES_DIR / resolved_camera_id).mkdir(parents=True, exist_ok=True)
+        return dict(row)
 
 
 def space_from_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -621,7 +917,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             self.send_json({"ok": True})
         elif path == "/api/cameras":
-            self.send_json({"cameras": db.list_cameras()})
+            lot_id_raw = query.get("lot_id", [None])[0]
+            if lot_id_raw is None:
+                self.send_json({"cameras": db.list_cameras()})
+            else:
+                try:
+                    lot_id = int(lot_id_raw)
+                except ValueError:
+                    self.send_json({"error": "lot_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+                    return
+                self.send_json({"cameras": db.list_cameras(lot_id)})
         elif path == "/api/clients":
             self.send_json({"clients": db.list_clients()})
         elif path == "/api/lots":
@@ -656,6 +961,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/api/config/"):
             camera_id = safe_segment(unquote(path.removeprefix("/api/config/")))
             self.send_json({"camera_id": camera_id, "spaces": db.list_spaces(camera_id)})
+        elif re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/detection-status", path):
+            match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/detection-status", path)
+            self.send_json(get_detection_status(match.group(1)))
         elif path == "/api/reports/metrics":
             self.handle_report_metrics(query)
         elif path == "/api/reports/export":
@@ -665,7 +973,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/spaces":
+        detect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/detect", parsed.path)
+        if detect_match:
+            camera_id = detect_match.group(1)
+            if db.get_camera(camera_id) is None:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            trigger_detection(camera_id)
+            self.send_json(get_detection_status(camera_id), HTTPStatus.ACCEPTED)
+        elif parsed.path == "/api/spaces":
             payload = self.read_json()
             try:
                 polygon = payload["polygon"]
@@ -684,6 +1000,26 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_upload()
         elif parsed.path == "/api/videos":
             self.handle_video_upload()
+        elif parsed.path == "/api/cameras":
+            payload = self.read_json()
+            name = (payload.get("name") or "").strip()
+            if not name:
+                self.send_json({"error": "name is required"}, HTTPStatus.BAD_REQUEST)
+                return
+            lot_id_raw = payload.get("lot_id")
+            lot_id = None
+            if lot_id_raw is not None:
+                try:
+                    lot_id = int(lot_id_raw)
+                except (TypeError, ValueError):
+                    self.send_json({"error": "lot_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+                    return
+            try:
+                camera = db.create_camera(name, camera_id=payload.get("camera_id"), lot_id=lot_id)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"camera": camera}, HTTPStatus.CREATED)
         elif parsed.path == "/api/clients":
             payload = self.read_json()
             name = (payload.get("name") or "").strip()
@@ -743,13 +1079,37 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"space": space})
         elif camera_match:
             payload = self.read_json()
-            try:
-                lot_id = int(payload["lot_id"])
-            except (KeyError, TypeError, ValueError):
-                self.send_json({"error": "lot_id is required and must be an integer"}, HTTPStatus.BAD_REQUEST)
+            lot_id: int | None = None
+            if "lot_id" in payload:
+                try:
+                    lot_id = int(payload["lot_id"])
+                except (TypeError, ValueError):
+                    self.send_json({"error": "lot_id must be an integer"}, HTTPStatus.BAD_REQUEST)
+                    return
+            min_occupied_seconds: Any = _UNSET
+            if "min_occupied_seconds" in payload:
+                raw = payload["min_occupied_seconds"]
+                if raw is None:
+                    min_occupied_seconds = None  # explicit clear -> use script default
+                else:
+                    try:
+                        min_occupied_seconds = float(raw)
+                    except (TypeError, ValueError):
+                        self.send_json(
+                            {"error": "min_occupied_seconds must be a number or null"},
+                            HTTPStatus.BAD_REQUEST,
+                        )
+                        return
+            if lot_id is None and min_occupied_seconds is _UNSET:
+                self.send_json(
+                    {"error": "Provide lot_id and/or min_occupied_seconds to update."},
+                    HTTPStatus.BAD_REQUEST,
+                )
                 return
             try:
-                camera = db.update_camera_lot(camera_match.group(1), lot_id)
+                camera = db.update_camera(
+                    camera_match.group(1), lot_id=lot_id, min_occupied_seconds=min_occupied_seconds
+                )
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
@@ -779,7 +1139,8 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
-        self.send_json({"image": image}, HTTPStatus.CREATED)
+        trigger_detection(image["camera_id"])
+        self.send_json({"image": image, "detection_triggered": True}, HTTPStatus.CREATED)
 
     def handle_video_upload(self) -> None:
         content_length = int(self.headers.get("Content-Length", "0"))
@@ -862,19 +1223,28 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         db.sync_images()
+        detection_triggered = False
+        if written:
+            trigger_detection(camera_id)
+            detection_triggered = True
         self.send_json(
             {
                 "camera_id": camera_id,
                 "video": video_path.name,
                 "frames_extracted": len(written),
+                "detection_triggered": detection_triggered,
             },
             HTTPStatus.CREATED,
         )
 
-    def resolve_report_request(self, query: dict[str, list[str]]) -> tuple[int, datetime, datetime] | None:
-        """Parses lot_id/start/end from the query string; sends an error
-        response and returns None if anything is wrong, so callers can just
-        `if resolved is None: return`."""
+    def resolve_report_request(
+        self, query: dict[str, list[str]]
+    ) -> tuple[int, datetime, datetime, str | None] | None:
+        """Parses lot_id/camera_id/start/end from the query string; sends an
+        error response and returns None if anything is wrong, so callers can
+        just `if resolved is None: return`. camera_id is optional -- when
+        given it must exist and belong to the requested lot, narrowing the
+        report down to that one camera instead of the whole lot."""
         lot_id_raw = query.get("lot_id", [None])[0]
         if lot_id_raw is None:
             self.send_json({"error": "lot_id is required"}, HTTPStatus.BAD_REQUEST)
@@ -887,31 +1257,44 @@ class Handler(BaseHTTPRequestHandler):
         if db.get_lot(lot_id) is None:
             self.send_json({"error": f"Lot {lot_id} does not exist."}, HTTPStatus.NOT_FOUND)
             return None
+        camera_id = query.get("camera_id", [None])[0] or None
+        if camera_id is not None:
+            camera = db.get_camera(camera_id)
+            if camera is None:
+                self.send_json({"error": f'Camera "{camera_id}" does not exist.'}, HTTPStatus.NOT_FOUND)
+                return None
+            if camera.get("lot_id") != lot_id:
+                self.send_json(
+                    {"error": f'Camera "{camera_id}" is not part of lot {lot_id}.'},
+                    HTTPStatus.BAD_REQUEST,
+                )
+                return None
         try:
             start, end = parse_report_range(query)
         except ValueError as exc:
             self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return None
-        return lot_id, start, end
+        return lot_id, start, end, camera_id
 
     def handle_report_metrics(self, query: dict[str, list[str]]) -> None:
         resolved = self.resolve_report_request(query)
         if resolved is None:
             return
-        lot_id, start, end = resolved
+        lot_id, start, end, camera_id = resolved
         with db.connect() as conn:
-            report = analytics.compute_lot_report(conn, lot_id, start, end)
+            report = analytics.compute_lot_report(conn, lot_id, start, end, camera_id)
         self.send_json(report)
 
     def handle_report_export(self, query: dict[str, list[str]]) -> None:
         resolved = self.resolve_report_request(query)
         if resolved is None:
             return
-        lot_id, start, end = resolved
+        lot_id, start, end, camera_id = resolved
         lot = db.get_lot(lot_id)
+        camera = db.get_camera(camera_id) if camera_id else None
         with db.connect() as conn:
-            report = analytics.compute_lot_report(conn, lot_id, start, end)
-        html = reports.render_report_html(lot, report)
+            report = analytics.compute_lot_report(conn, lot_id, start, end, camera_id)
+        html = reports.render_report_html(lot, report, camera=camera)
         body = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
