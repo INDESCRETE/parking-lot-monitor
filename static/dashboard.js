@@ -543,4 +543,17 @@ window.addEventListener("themechange", () => {
   }
 });
 
+// The Peak/Off-Peak Hours chart's "now" line is computed at draw time from
+// the browser's own clock (see renderReport's hourChart block), but nothing
+// else here re-draws on a timer -- loadReport() only re-runs when a filter
+// changes. Left alone, a tab open for a while would show that line frozen
+// at whatever time it happened to load, silently going stale and pointing
+// at the wrong hour. Redrawing from the already-loaded report every minute
+// keeps it honest without hitting the server again.
+setInterval(() => {
+  if (state.lastReport) {
+    renderReport(state.lastReport);
+  }
+}, 60000);
+
 loadClients();
