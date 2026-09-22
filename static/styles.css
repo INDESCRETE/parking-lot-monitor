@@ -537,6 +537,14 @@ dialog::backdrop {
   white-space: nowrap;
 }
 
+.history-gap {
+  color: var(--muted);
+  font-size: 11px;
+  font-style: italic;
+  padding: 0 4px;
+  text-align: center;
+}
+
 .theme-toggle-button {
   font-size: 16px;
   line-height: 1;

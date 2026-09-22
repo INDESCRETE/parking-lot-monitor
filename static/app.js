@@ -927,7 +927,15 @@ function renderHistoryList(intervals) {
     historyList.textContent = "No history yet — run detection to populate.";
     return;
   }
-  for (const interval of intervals) {
+  // intervals arrives newest-first. A gap between one interval's start and
+  // the next-older interval's end means nothing was actually observed in
+  // between (server restart, camera/network hiccup, etc.) -- the live
+  // detector deliberately doesn't bridge that time (see app/live_detection.py),
+  // so it shows up as two back-to-back records that can have the *same*
+  // status, looking like a change that never really happened. Flag it
+  // explicitly instead of leaving it looking like an unexplained status flip.
+  for (let i = 0; i < intervals.length; i++) {
+    const interval = intervals[i];
     const badgeClass = interval.occupied ? "badge-occupied" : "badge-vacant";
     const badgeText = interval.occupied ? "Occupied" : "Vacant";
     const endText = interval.is_current ? "now" : formatTimestamp(interval.end_captured_at);
@@ -946,6 +954,17 @@ function renderHistoryList(intervals) {
       <span class="row-meta">${formatDuration(durationSeconds)}</span>
     `;
     historyList.append(row);
+
+    const older = intervals[i + 1];
+    if (older) {
+      const gapSeconds = (Date.parse(interval.start_captured_at) - Date.parse(older.end_captured_at)) / 1000;
+      if (gapSeconds > 1) {
+        const gapRow = document.createElement("div");
+        gapRow.className = "history-gap";
+        gapRow.textContent = `no data for ${formatDuration(gapSeconds)} — monitoring was interrupted`;
+        historyList.append(gapRow);
+      }
+    }
   }
 }
 
