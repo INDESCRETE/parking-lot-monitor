@@ -110,6 +110,7 @@ def _bar_chart(
     color: str,
     value_formatter,
     axis_formatter=None,
+    now_index: int | None = None,
     width: int = 760,
     height: int = 220,
 ) -> str:
@@ -161,6 +162,17 @@ def _bar_chart(
             f'<text x="{padding_left - 6:.1f}" y="{y:.1f}" font-size="10" fill="{MUTED}" '
             f'text-anchor="end" dominant-baseline="middle">{escape(format_axis_value(tick))}</text>'
         )
+    # A "now" reference line -- mirrors static/dashboard.js's barChartSvg,
+    # see there for the rationale. Dashed (never solid, so it never reads
+    # as a gridline) and drawn on top of the bars.
+    now_marker = ""
+    if now_index is not None and 0 <= now_index < n:
+        now_x = padding_left + now_index * gap + gap / 2
+        now_marker = (
+            f'<line x1="{now_x:.1f}" y1="{padding_top}" x2="{now_x:.1f}" y2="{padding_top + plot_height:.1f}" '
+            f'stroke="{MUTED}" stroke-width="1" stroke-dasharray="3,3"/>'
+            f'<text x="{now_x + 4:.1f}" y="{padding_top + 8:.1f}" font-size="9" fill="{MUTED}">now</text>'
+        )
     return (
         f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
         f'xmlns="http://www.w3.org/2000/svg" role="img">'
@@ -168,6 +180,7 @@ def _bar_chart(
         + "".join(y_labels)
         + "".join(bars)
         + "".join(ticks)
+        + now_marker
         + "</svg>"
     )
 
@@ -243,12 +256,19 @@ def render_report_html(
 
     hour_labels = [_format_hour_label(h["hour"]) for h in report["peak_hours"]]
     hour_values = [h["rate"] for h in report["peak_hours"]]
+    # Only draw the "now" line when the range's end is today -- otherwise
+    # (a fully historical range) every hour should already have a complete
+    # day's worth of data behind it, and the marker would be noise. Mirrors
+    # static/dashboard.js's same check.
+    now_local = datetime.now().astimezone()
+    range_ends_today = end.date() == now_local.date()
     hour_chart = _bar_chart(
         hour_labels,
         hour_values,
         color=OCCUPIED,
         value_formatter=_format_pct,
         axis_formatter=lambda v: f"{round(v * 100)}%",
+        now_index=now_local.hour if range_ends_today else None,
     )
 
     dwell_chart = _dwell_bars(report["dwell_by_space"])

@@ -169,7 +169,7 @@ function niceTicks(maxValue, targetCount = 4) {
   return { niceMax, ticks };
 }
 
-function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, width = 760, height = 220 }) {
+function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, nowIndex = null, width = 760, height = 220 }) {
   if (labels.length === 0) {
     return '<p class="empty-note">No data in this range.</p>';
   }
@@ -225,12 +225,27 @@ function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, wid
       `<text x="${(paddingLeft - 6).toFixed(1)}" y="${y.toFixed(1)}" font-size="10" fill="${mutedColor}" text-anchor="end" dominant-baseline="middle">${escapeHtml(formatAxisValue(tick))}</text>`
     );
   }
+  // A "now" reference line -- shown only when the caller knows the current
+  // moment falls within this chart's x-axis (e.g. the peak/off-peak-hours
+  // chart when today is part of the selected range) -- marks where "so
+  // far today" ends, so hours after it reading empty is self-explanatory
+  // instead of looking like missing data. Dashed (never solid, so it never
+  // reads as a gridline) and drawn on top of the bars.
+  let nowMarker = "";
+  if (nowIndex !== null && nowIndex >= 0 && nowIndex < n) {
+    const nowX = paddingLeft + nowIndex * gap + gap / 2;
+    nowMarker =
+      `<line x1="${nowX.toFixed(1)}" y1="${paddingTop}" x2="${nowX.toFixed(1)}" y2="${(paddingTop + plotHeight).toFixed(1)}" ` +
+      `stroke="${mutedColor}" stroke-width="1" stroke-dasharray="3,3"/>` +
+      `<text x="${(nowX + 4).toFixed(1)}" y="${(paddingTop + 8).toFixed(1)}" font-size="9" fill="${mutedColor}">now</text>`;
+  }
   return (
     `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" xmlns="http://www.w3.org/2000/svg" role="img">` +
     yGridlines.join("") +
     yLabels.join("") +
     bars.join("") +
     ticks.join("") +
+    nowMarker +
     "</svg>"
   );
 }
@@ -464,10 +479,15 @@ function renderReport(report) {
 
   const hourLabels = report.peak_hours.map((h) => formatHourLabel(h.hour));
   const hourValues = report.peak_hours.map((h) => h.rate);
+  // Only draw the "now" line when the selected range's end is today --
+  // otherwise (a fully historical range) every hour should already have a
+  // complete day's worth of data behind it, and the marker would be noise.
+  const rangeEndsToday = new Date(report.end).toDateString() === new Date().toDateString();
   hourChart.innerHTML = barChartSvg(hourLabels, hourValues, {
     color: cssVar("--occupied", OCCUPIED),
     valueFormatter: formatPct,
     axisFormatter: (v) => `${Math.round(v * 100)}%`,
+    nowIndex: rangeEndsToday ? new Date().getHours() : null,
   });
 
   dwellChart.innerHTML = dwellBarsSvg(report.dwell_by_space);
