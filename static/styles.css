@@ -2,6 +2,9 @@
   color-scheme: light;
   --bg: #f5f6f8;
   --panel: #ffffff;
+  --panel-alt: #fbfcfd;
+  --canvas-bg: #e7eaef;
+  --chart-empty: #c7ccd3;
   --text: #20242a;
   --muted: #6f7782;
   --line: #d8dde5;
@@ -12,6 +15,40 @@
   --draft: #f59e0b;
   --occupied: #dc2626;
   --vacant: #26a69a;
+}
+
+/* Same names, dark values -- everything below already paints itself with
+   var(--...), so this one block is the whole theme switch. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14171b;
+  --panel: #1c2026;
+  --panel-alt: #21252c;
+  --canvas-bg: #21252c;
+  --chart-empty: #3a4048;
+  --text: #e7eaee;
+  --muted: #97a1ad;
+  --line: #333941;
+  --accent: #2fb3a4;
+  --accent-strong: #57d4c4;
+  --danger: #f0685a;
+  --space: #2fb3a4;
+  --draft: #f5a623;
+  --occupied: #ef5a4c;
+  --vacant: #2fb3a4;
+}
+
+/* A short fade instead of an instant snap when the toggle is clicked. */
+body,
+.sidebar,
+.topbar,
+.toolbar,
+dialog,
+.controls-bar,
+.stat-card,
+.chart-panel,
+#annotationCanvas {
+  transition: background-color 0.15s ease, color 0.15s ease, border-color 0.15s ease;
 }
 
 * {
@@ -34,7 +71,7 @@ input {
 
 button {
   border: 1px solid var(--line);
-  background: #fff;
+  background: var(--panel);
   border-radius: 6px;
   color: var(--text);
   cursor: pointer;
@@ -343,7 +380,7 @@ input[type="text"],
 
 .toolbar {
   align-items: center;
-  background: #fbfcfd;
+  background: var(--panel-alt);
   border-bottom: 1px solid var(--line);
   display: flex;
   flex-wrap: wrap;
@@ -380,6 +417,11 @@ input[type="text"],
   color: var(--danger);
 }
 
+.live-feed-indicator {
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
 .canvas-wrap {
   display: grid;
   min-height: 0;
@@ -390,7 +432,7 @@ input[type="text"],
 }
 
 #annotationCanvas {
-  background: #e7eaef;
+  background: var(--canvas-bg);
   border: 1px solid var(--line);
   display: none;
   max-width: 100%;
@@ -403,9 +445,11 @@ input[type="text"],
 }
 
 dialog {
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 8px;
   box-shadow: 0 16px 42px rgba(20, 24, 30, 0.18);
+  color: var(--text);
   padding: 0;
   width: min(360px, calc(100vw - 32px));
 }
@@ -491,6 +535,13 @@ dialog::backdrop {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.theme-toggle-button {
+  font-size: 16px;
+  line-height: 1;
+  min-height: 36px;
+  padding: 0 10px;
 }
 
 .nav-link {
@@ -661,4 +712,137 @@ body.dashboard-body {
   .status-list {
     max-height: 22vh;
   }
+}
+
+/* ---- Live camera view ---- */
+[hidden] {
+  display: none !important;
+}
+
+#liveDialog {
+  width: min(960px, calc(100vw - 32px));
+}
+
+.live-panel {
+  display: grid;
+  gap: 10px;
+  padding: 16px;
+}
+
+#closeLiveButton {
+  border: none;
+  background: transparent;
+  font-size: 20px;
+  line-height: 1;
+  min-height: auto;
+  padding: 4px 8px;
+}
+
+.live-frame-wrap {
+  align-items: center;
+  background: #14181d;
+  border-radius: 6px;
+  display: grid;
+  justify-items: center;
+  min-height: 220px;
+  overflow: hidden;
+}
+
+#liveImage {
+  display: block;
+  max-height: 70vh;
+  max-width: 100%;
+}
+
+.live-message {
+  color: #e6eaf0;
+  font-size: 13px;
+  padding: 16px;
+  text-align: center;
+}
+
+.live-message-detail {
+  color: #9aa4b2;
+  font-size: 12px;
+  margin-top: 6px;
+  overflow-wrap: anywhere;
+}
+
+.live-status-line {
+  color: var(--muted);
+  font-size: 13px;
+  min-height: 18px;
+}
+
+.live-status-line.live-error {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+/* ---- Deleting cameras / images ---- */
+.camera-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.delete-camera-button {
+  color: var(--danger);
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.delete-camera-button:disabled {
+  color: #a2a9b3;
+}
+
+.image-item {
+  align-items: stretch;
+  display: grid;
+  gap: 6px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.image-item .image-row {
+  text-align: left;
+}
+
+.delete-image {
+  color: var(--danger);
+  font-size: 16px;
+  line-height: 1;
+  min-height: 0;
+  padding: 0 10px;
+}
+
+.confirm-panel {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+}
+
+.confirm-panel h2 {
+  font-size: 18px;
+  margin: 0;
+}
+
+.confirm-message {
+  font-weight: 700;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.confirm-panel .dialog-hint {
+  margin: 0;
+}
+
+.danger-button {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}
+
+.danger-button:hover:not(:disabled) {
+  border-color: var(--danger);
+  filter: brightness(0.92);
 }

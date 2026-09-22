@@ -6,11 +6,23 @@
  * visual language (same colors, same math) so the two feel like one
  * product. */
 
+// Fallback values only -- these match the light theme in styles.css, but
+// the charts read the CURRENT theme's colors at draw time via cssVar()
+// below, so they redraw correctly after a dark-mode toggle too.
 const ACCENT = "#147c72";
 const ACCENT_STRONG = "#0e5d56";
 const OCCUPIED = "#dc2626";
 const MUTED = "#6f7782";
 const LINE = "#d8dde5";
+
+function cssVar(name, fallback) {
+  try {
+    const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+    return value || fallback;
+  } catch (error) {
+    return fallback;
+  }
+}
 
 const state = {
   clients: [],
@@ -120,6 +132,8 @@ function barChartSvg(labels, values, { color, valueFormatter, width = 760, heigh
   if (labels.length === 0) {
     return '<p class="empty-note">No data in this range.</p>';
   }
+  const mutedColor = cssVar("--muted", MUTED);
+  const lineColor = cssVar("--line", LINE);
   const paddingLeft = 36;
   const paddingBottom = 28;
   const paddingTop = 12;
@@ -150,14 +164,14 @@ function barChartSvg(labels, values, { color, valueFormatter, width = 760, heigh
     if (i % labelStride === 0 || i === n - 1) {
       const tickX = x + barWidth / 2;
       ticks.push(
-        `<text x="${tickX.toFixed(1)}" y="${height - 8}" font-size="10" fill="${MUTED}" text-anchor="middle">${escapeHtml(label)}</text>`
+        `<text x="${tickX.toFixed(1)}" y="${height - 8}" font-size="10" fill="${mutedColor}" text-anchor="middle">${escapeHtml(label)}</text>`
       );
     }
   });
   const axisY = paddingTop + plotHeight;
   return (
     `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" xmlns="http://www.w3.org/2000/svg" role="img">` +
-    `<line x1="${paddingLeft}" y1="${axisY}" x2="${width - 10}" y2="${axisY}" stroke="${LINE}" stroke-width="1"/>` +
+    `<line x1="${paddingLeft}" y1="${axisY}" x2="${width - 10}" y2="${axisY}" stroke="${lineColor}" stroke-width="1"/>` +
     bars.join("") +
     ticks.join("") +
     "</svg>"
@@ -170,6 +184,10 @@ function dwellBarsSvg(dwellBySpace, { width = 760 } = {}) {
   if (dwellBySpace.length === 0) {
     return '<p class="empty-note">No spaces marked for this lot.</p>';
   }
+  const mutedColor = cssVar("--muted", MUTED);
+  const textColor = cssVar("--text", "#20242a");
+  const emptyBarColor = cssVar("--chart-empty", "#c7ccd3");
+  const accentColor = cssVar("--accent", ACCENT);
   const rows = [...dwellBySpace].sort((a, b) => {
     const aNull = a.average_seconds === null;
     const bNull = b.average_seconds === null;
@@ -187,12 +205,12 @@ function dwellBarsSvg(dwellBySpace, { width = 760 } = {}) {
     const y = 8 + i * rowHeight;
     const value = row.average_seconds;
     const barW = value ? (value / maxValue) * barArea : 0;
-    const color = value ? ACCENT : "#c7ccd3";
+    const color = value ? accentColor : emptyBarColor;
     const valueText = value !== null && value !== undefined ? formatDuration(value) : "no activity";
     bars.push(
-      `<text x="${labelWidth - 8}" y="${y + 13}" font-size="11" fill="#20242a" text-anchor="end">${escapeHtml(row.label)}</text>` +
+      `<text x="${labelWidth - 8}" y="${y + 13}" font-size="11" fill="${textColor}" text-anchor="end">${escapeHtml(row.label)}</text>` +
         `<rect x="${labelWidth}" y="${y + 3}" width="${Math.max(barW, 1.5).toFixed(1)}" height="14" fill="${color}" rx="2"/>` +
-        `<text x="${(labelWidth + barW + 6).toFixed(1)}" y="${y + 13}" font-size="10" fill="${MUTED}">${escapeHtml(valueText)}</text>`
+        `<text x="${(labelWidth + barW + 6).toFixed(1)}" y="${y + 13}" font-size="10" fill="${mutedColor}">${escapeHtml(valueText)}</text>`
     );
   });
   return (
@@ -360,6 +378,7 @@ async function loadReport() {
 }
 
 function renderReport(report) {
+  state.lastReport = report; // so a dark-mode toggle can redraw with the new colors
   const summary = report.summary;
 
   statOccupancy.textContent = formatPct(summary.overall_occupancy_rate);
@@ -373,21 +392,21 @@ function renderReport(report) {
   const occupancyLabels = report.occupancy_by_day.map((d) => formatDateLabel(d.date));
   const occupancyValues = report.occupancy_by_day.map((d) => d.rate);
   occupancyChart.innerHTML = barChartSvg(occupancyLabels, occupancyValues, {
-    color: ACCENT,
+    color: cssVar("--accent", ACCENT),
     valueFormatter: formatPct,
   });
 
   const turnoverLabels = report.turnover_by_day.map((d) => formatDateLabel(d.date));
   const turnoverValues = report.turnover_by_day.map((d) => d.arrivals);
   turnoverChart.innerHTML = barChartSvg(turnoverLabels, turnoverValues, {
-    color: ACCENT_STRONG,
+    color: cssVar("--accent-strong", ACCENT_STRONG),
     valueFormatter: (v) => `${Math.round(v)} arrivals`,
   });
 
   const hourLabels = report.peak_hours.map((h) => formatHourLabel(h.hour));
   const hourValues = report.peak_hours.map((h) => h.rate);
   hourChart.innerHTML = barChartSvg(hourLabels, hourValues, {
-    color: OCCUPIED,
+    color: cssVar("--occupied", OCCUPIED),
     valueFormatter: formatPct,
   });
 
@@ -434,6 +453,13 @@ downloadReportButton.addEventListener("click", () => {
   const url = reportExportUrl();
   if (url) {
     window.open(url, "_blank");
+  }
+});
+
+window.addEventListener("themechange", () => {
+  // Redraw with whatever's already loaded -- no need to hit the server again.
+  if (state.lastReport) {
+    renderReport(state.lastReport);
   }
 });
 

@@ -15,6 +15,17 @@ const state = {
   suppressNextClick: false,
   statusSort: "label",
   detectionPollTimer: null,
+  liveCameraId: null,
+  liveMode: "stream",
+  liveStatusTimer: null,
+  liveSnapshotTimer: null,
+  statusPollTimer: null,
+  liveFeedActive: false,
+  liveFeedTimer: null,
+  liveFeedIntervalSeconds: 3,
+  liveFeedConfigured: false,
+  notice: null,
+  noCamera: false,
 };
 
 const HANDLE_RADIUS = 9;
@@ -57,6 +68,35 @@ const runDetectionButton = document.querySelector("#runDetectionButton");
 const detectionStatus = document.querySelector("#detectionStatus");
 const minOccupiedInput = document.querySelector("#minOccupiedInput");
 const minOccupiedStatus = document.querySelector("#minOccupiedStatus");
+const liveViewButton = document.querySelector("#liveViewButton");
+const liveFeedButton = document.querySelector("#liveFeedButton");
+const liveFeedIndicator = document.querySelector("#liveFeedIndicator");
+const liveDialog = document.querySelector("#liveDialog");
+const liveTitle = document.querySelector("#liveTitle");
+const liveImage = document.querySelector("#liveImage");
+const liveMessage = document.querySelector("#liveMessage");
+const liveStatusLine = document.querySelector("#liveStatusLine");
+const closeLiveButton = document.querySelector("#closeLiveButton");
+const deleteCameraButton = document.querySelector("#deleteCameraButton");
+const emptyStateDefault = document.querySelector("#emptyStateDefault");
+const emptyStateNoCamera = document.querySelector("#emptyStateNoCamera");
+const confirmDialog = document.querySelector("#confirmDialog");
+const confirmTitle = document.querySelector("#confirmTitle");
+const confirmMessage = document.querySelector("#confirmMessage");
+const confirmDetail = document.querySelector("#confirmDetail");
+const confirmOkButton = document.querySelector("#confirmOkButton");
+const confirmCancelButton = document.querySelector("#confirmCancelButton");
+
+const LIVE_STATUS_POLL_MS = 1000;
+const LIVE_SNAPSHOT_POLL_MS = 3000;
+// How often the Live Status list re-checks the server for occupied/vacant
+// changes while a camera is selected -- mainly for the continuous live
+// detector, which updates a space's status in the background on its own
+// schedule with nobody clicking anything.
+const STATUS_POLL_MS = 5000;
+// 1x1 transparent GIF. Pointing the <img> at this reliably cancels an open
+// live video stream (which is what tells the server to stop ffmpeg).
+const BLANK_IMAGE = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 
 function setStatus(message) {
   statusEl.textContent = message;
@@ -66,21 +106,98 @@ async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const payload = await response.json();
   if (!response.ok) {
-    throw new Error(payload.error || `Request failed: ${response.status}`);
+    const error = new Error(payload.error || `Request failed: ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
+}
+
+const LAST_CAMERA_STORAGE_KEY = "parkingLotMonitor.lastCameraId";
+
+// Remembers the selected camera across page reloads. Wrapped in try/catch:
+// private browsing or a locked-down browser can make localStorage throw,
+// and losing the remembered camera is a minor inconvenience, not worth
+// breaking the page over.
+function rememberCameraId(cameraId) {
+  try {
+    if (cameraId) {
+      localStorage.setItem(LAST_CAMERA_STORAGE_KEY, cameraId);
+    } else {
+      localStorage.removeItem(LAST_CAMERA_STORAGE_KEY);
+    }
+  } catch (error) {
+    console.warn("Couldn't remember the selected camera:", error);
+  }
+}
+
+function getRememberedCameraId() {
+  try {
+    return localStorage.getItem(LAST_CAMERA_STORAGE_KEY);
+  } catch (error) {
+    return null;
+  }
 }
 
 async function loadInitialData() {
   const payload = await fetchJson("/api/cameras");
   state.cameras = payload.cameras;
-  state.cameraId = state.cameras[0]?.id || "camera_1";
+  const remembered = getRememberedCameraId();
+  state.cameraId = state.cameras.some((camera) => camera.id === remembered)
+    ? remembered
+    : state.cameras[0]?.id || null;
+  rememberCameraId(state.cameraId); // keep storage in sync if the remembered one was gone
   renderCameras();
   await loadCameraData();
-  checkDetectionStatusOnce(state.cameraId);
+  if (state.cameraId) {
+    checkDetectionStatusOnce(state.cameraId);
+  }
+  refreshLiveAvailability();
+}
+
+// With no camera selected (e.g. the last one was just deleted) the page turns
+// off everything that needs a camera instead of talking to one that isn't there.
+function setCameraControlsEnabled(hasCamera) {
+  // Only act when this actually changes, so ordinary reloads never re-enable a
+  // button that something else (a running detection or import) turned off.
+  if (hasCamera === !state.noCamera) {
+    return;
+  }
+  state.noCamera = !hasCamera;
+  for (const control of [
+    deleteCameraButton,
+    uploadInput,
+    uploadForm.querySelector("button"),
+    videoUploadInput,
+    videoIntervalInput,
+    videoEndInput,
+    videoSubmitButton,
+    runDetectionButton,
+    markSpaceButton,
+    minOccupiedInput,
+  ]) {
+    control.disabled = !hasCamera;
+  }
+  cameraSelect.disabled = !hasCamera;
 }
 
 async function loadCameraData() {
+  if (!state.cameraId) {
+    stopStatusPolling();
+    stopLiveFeed();
+    setCameraControlsEnabled(false);
+    configLink.removeAttribute("href");
+    renderMinOccupiedInput();
+    state.images = [];
+    state.spaces = [];
+    state.selectedImage = null;
+    renderImages();
+    renderSpaces();
+    renderStatusList();
+    await loadSelectedImage();
+    return;
+  }
+  setCameraControlsEnabled(true);
   configLink.href = `/api/config/${state.cameraId}`;
   renderMinOccupiedInput();
   const [imagesPayload, spacesPayload] = await Promise.all([
@@ -94,6 +211,7 @@ async function loadCameraData() {
   renderSpaces();
   renderStatusList();
   await loadSelectedImage();
+  startStatusPolling();
 }
 
 // Shows the currently-selected camera's own minimum-parked-time override (or
@@ -144,6 +262,50 @@ function stopDetectionPolling() {
   }
 }
 
+function stopStatusPolling() {
+  if (state.statusPollTimer) {
+    clearInterval(state.statusPollTimer);
+    state.statusPollTimer = null;
+  }
+}
+
+// Keeps the Live Status list (and the space list) in sync with the database
+// without a manual page reload. Mainly for the continuous live detector,
+// which changes a space's status in the background on its own schedule --
+// but harmless (just a no-op re-render) for a camera that's only ever
+// updated by a manual Run Detection.
+function startStatusPolling() {
+  stopStatusPolling();
+  const cameraId = state.cameraId;
+  if (!cameraId) {
+    return;
+  }
+  state.statusPollTimer = setInterval(async () => {
+    // Don't fetch while the user is mid-edit (drawing a new space or
+    // dragging a handle) or looking at a space's history dialog -- a
+    // fetch landing right then would either yank a polygon out from
+    // under an active drag, or just be wasted work while the dialog
+    // covers the list anyway.
+    if (state.mode !== "idle" || state.draggingHandle || historyDialog.open) {
+      return;
+    }
+    try {
+      const payload = await fetchJson(`/api/spaces?camera_id=${encodeURIComponent(cameraId)}`);
+      if (state.cameraId !== cameraId) {
+        return; // switched cameras while the request was in flight
+      }
+      state.spaces = payload.spaces;
+      renderSpaces();
+      renderStatusList();
+      if (state.liveFeedActive) {
+        draw(); // refresh space colors/duration badges even between frame refreshes
+      }
+    } catch (error) {
+      console.warn(error);
+    }
+  }, STATUS_POLL_MS);
+}
+
 // Polls a camera's background detection run to completion, then reloads its
 // spaces/images/observations automatically -- the whole point being that
 // nobody has to manually refresh the page (or run anything themselves) to
@@ -185,6 +347,9 @@ async function pollDetectionUntilDone(cameraId) {
 // is already true for that camera (e.g. a run kicked off before the page
 // was last refreshed) without assuming a run just started.
 async function checkDetectionStatusOnce(cameraId) {
+  if (!cameraId) {
+    return;
+  }
   let status;
   try {
     status = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/detection-status`);
@@ -202,6 +367,13 @@ async function checkDetectionStatusOnce(cameraId) {
 
 function renderCameras() {
   cameraSelect.innerHTML = "";
+  if (state.cameras.length === 0) {
+    const option = document.createElement("option");
+    option.value = "";
+    option.textContent = "No cameras yet";
+    cameraSelect.append(option);
+    return;
+  }
   for (const camera of state.cameras) {
     const option = document.createElement("option");
     option.value = camera.id;
@@ -220,6 +392,7 @@ async function createCamera(name) {
   const camerasPayload = await fetchJson("/api/cameras");
   state.cameras = camerasPayload.cameras;
   state.cameraId = payload.camera.id;
+  rememberCameraId(state.cameraId);
   renderCameras();
   await loadCameraData();
   renderDetectionStatus(null);
@@ -233,6 +406,8 @@ function renderImages() {
     return;
   }
   for (const image of state.images) {
+    const item = document.createElement("div");
+    item.className = "image-item";
     const row = document.createElement("button");
     row.type = "button";
     row.className = `image-row ${state.selectedImage?.id === image.id ? "active" : ""}`;
@@ -241,7 +416,15 @@ function renderImages() {
       <span class="row-meta">${escapeHtml(image.captured_at)}</span>
     `;
     row.addEventListener("click", () => selectImage(image));
-    imageList.append(row);
+    const deleteButton = document.createElement("button");
+    deleteButton.type = "button";
+    deleteButton.className = "delete-image";
+    deleteButton.textContent = "\u00d7";
+    deleteButton.title = `Delete ${image.filename}`;
+    deleteButton.setAttribute("aria-label", `Delete ${image.filename}`);
+    deleteButton.addEventListener("click", () => deleteImage(image));
+    item.append(row, deleteButton);
+    imageList.append(item);
   }
 }
 
@@ -249,6 +432,7 @@ async function selectImage(image, options = {}) {
   if (!image || state.selectedImage?.id === image.id) {
     return;
   }
+  stopLiveFeed(); // picking a specific photo means editing it, not watching the live feed
   state.selectedImage = image;
   state.draftPoints = [];
   state.hoveredSpaceId = null;
@@ -272,7 +456,7 @@ function selectedImageIndex() {
 }
 
 function shouldIgnoreImageNavigation(event) {
-  if (dialog.open || historyDialog.open || cameraDialog.open) {
+  if (dialog.open || historyDialog.open || cameraDialog.open || confirmDialog.open) {
     return true;
   }
   if (event.target?.classList?.contains("image-row")) {
@@ -327,6 +511,8 @@ async function loadSelectedImage() {
     state.hoveredDetectionId = null;
     canvas.style.display = "none";
     emptyStatePath.textContent = `data/images/${state.cameraId}`;
+    emptyStateDefault.hidden = !state.cameraId;
+    emptyStateNoCamera.hidden = Boolean(state.cameraId);
     emptyState.style.display = "block";
     draw();
     return;
@@ -343,11 +529,14 @@ async function loadSelectedImage() {
     draw();
     const observedCount = state.observations.occupancy.length;
     const occupiedCount = state.observations.occupancy.filter((item) => item.occupied).length;
+    // A one-time "Deleted ..." message wins over the usual summary, once.
     setStatus(
-      observedCount > 0
-        ? `${occupiedCount}/${observedCount} observed occupied`
-        : `${state.spaces.length} spaces configured`,
+      state.notice ||
+        (observedCount > 0
+          ? `${occupiedCount}/${observedCount} observed occupied`
+          : `${state.spaces.length} spaces configured`),
     );
+    state.notice = null;
   };
   img.src = state.selectedImage.url;
 }
@@ -494,6 +683,21 @@ function drawDetection(detection, isHovered) {
 }
 
 function observationForSpace(spaceId) {
+  // While the main canvas is showing the live camera feed, colour spaces by
+  // their live current_occupied/current_since fields (kept fresh by
+  // startStatusPolling) instead of the batch detection results tied to a
+  // specific stored image -- there is no "selected image" in live mode.
+  if (state.liveFeedActive) {
+    const space = state.spaces.find((item) => item.id === spaceId);
+    if (!space || space.current_occupied === null || space.current_occupied === undefined) {
+      return null;
+    }
+    return {
+      occupied: space.current_occupied,
+      since: space.current_since,
+      duration_seconds: currentElapsedSeconds(space),
+    };
+  }
   return state.observations.occupancy.find((item) => item.space_id === spaceId);
 }
 
@@ -765,6 +969,12 @@ async function saveDraftSpace(label) {
       camera_id: state.cameraId,
       label,
       polygon: state.draftPoints,
+      // The actual pixel size of the photo these points were drawn on --
+      // lets the server correctly rescale this space if it's ever checked
+      // against a differently-sized photo later (e.g. the live camera's
+      // full-resolution snapshots vs. a smaller reference photo).
+      reference_width: state.imageElement?.naturalWidth,
+      reference_height: state.imageElement?.naturalHeight,
     }),
   });
   state.spaces.push(payload.space);
@@ -797,7 +1007,11 @@ async function saveSpacePolygon(spaceId, polygon) {
     const payload = await fetchJson(`/api/spaces/${spaceId}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ polygon }),
+      body: JSON.stringify({
+        polygon,
+        reference_width: state.imageElement?.naturalWidth,
+        reference_height: state.imageElement?.naturalHeight,
+      }),
     });
     const index = state.spaces.findIndex((space) => space.id === spaceId);
     if (index !== -1) {
@@ -815,9 +1029,14 @@ async function saveSpacePolygon(spaceId, polygon) {
 }
 
 markSpaceButton.addEventListener("click", () => {
-  if (!state.selectedImage) {
+  if (!state.imageElement) {
     setStatus("Select or upload an image first");
     return;
+  }
+  if (state.mode !== "marking" && state.liveFeedActive) {
+    // Freeze on the current live frame so it doesn't refresh out from under
+    // the four corner-clicks -- "Back to Live Feed" resumes it afterward.
+    stopLiveFeed();
   }
   state.mode = state.mode === "marking" ? "idle" : "marking";
   state.draftPoints = [];
@@ -887,6 +1106,11 @@ canvas.addEventListener("mousedown", (event) => {
     return;
   }
   event.preventDefault();
+  if (state.liveFeedActive) {
+    // Same reasoning as Mark Space above -- don't let the photo shift under
+    // a corner mid-drag.
+    stopLiveFeed();
+  }
   state.draggingHandle = { spaceId: space.id, pointIndex: handleIndex };
 });
 
@@ -999,7 +1223,9 @@ cancelCameraButton.addEventListener("click", () => {
 
 cameraSelect.addEventListener("change", async () => {
   stopDetectionPolling();
+  stopLiveFeed();
   state.cameraId = cameraSelect.value;
+  rememberCameraId(state.cameraId);
   state.draftPoints = [];
   state.hoveredSpaceId = null;
   state.hoveredDetectionId = null;
@@ -1008,6 +1234,7 @@ cameraSelect.addEventListener("change", async () => {
   await loadCameraData();
   updateDraftControls();
   checkDetectionStatusOnce(state.cameraId);
+  refreshLiveAvailability();
 });
 
 minOccupiedInput.addEventListener("change", async () => {
@@ -1042,6 +1269,231 @@ minOccupiedInput.addEventListener("change", async () => {
     minOccupiedStatus.textContent = "";
     setStatus(error.message);
   }
+});
+
+// ---- Live view -----------------------------------------------------------
+// Shows the camera's live video (a ~2 fps stream relayed by the server, which
+// only runs while this window is open) with a status line about the photo
+// grabber that feeds detection. If the stream can't start, it falls back to
+// the newest grabbed photo, refreshed every few seconds.
+
+// The button shows when this camera has live view set up -- or when the
+// camera settings file is broken, so the problem is visible instead of the
+// button silently missing.
+// --- Main-canvas live feed -------------------------------------------------
+// For a camera with live view set up, the main workspace shows the newest
+// live photo (refreshed at the same interval the live detector checks
+// frames) with spaces colored by their current occupied/vacant status,
+// instead of requiring a stored image to be selected. Picking an image from
+// the Images list (selectImage) exits this mode to edit that photo; the
+// "Back to Live Feed" button re-enters it.
+
+function updateLiveFeedControls() {
+  liveFeedButton.hidden = !state.liveFeedConfigured || state.liveFeedActive;
+  liveFeedIndicator.hidden = !state.liveFeedActive;
+}
+
+function stopLiveFeed() {
+  if (state.liveFeedTimer) {
+    clearInterval(state.liveFeedTimer);
+    state.liveFeedTimer = null;
+  }
+  if (state.liveFeedActive) {
+    state.liveFeedActive = false;
+    updateLiveFeedControls();
+  }
+}
+
+function refreshLiveFeedImage() {
+  if (!state.liveFeedActive) {
+    return;
+  }
+  const cameraId = state.cameraId;
+  const img = new Image();
+  img.onload = () => {
+    if (!state.liveFeedActive || state.cameraId !== cameraId) {
+      return; // stopped or switched cameras while this photo was loading
+    }
+    state.imageElement = img;
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    canvas.style.display = "block";
+    emptyState.style.display = "none";
+    draw();
+  };
+  // On a load failure (e.g. no frame grabbed yet) just leave the last good
+  // frame on screen -- the next tick tries again.
+  img.src = `/api/cameras/${encodeURIComponent(cameraId)}/latest.jpg?t=${Date.now()}`;
+}
+
+function enterLiveFeed() {
+  const cameraId = state.cameraId;
+  if (!cameraId || !state.liveFeedConfigured) {
+    return;
+  }
+  stopLiveFeed();
+  state.liveFeedActive = true;
+  state.selectedImage = null;
+  state.mode = "idle";
+  state.draftPoints = [];
+  state.hoveredSpaceId = null;
+  state.hoveredDetectionId = null;
+  state.selectedSpaceId = null;
+  state.observations = { detections: [], occupancy: [] };
+  renderImages();
+  updateDraftControls();
+  updateLiveFeedControls();
+  refreshLiveFeedImage();
+  const intervalMs = Math.max(1, state.liveFeedIntervalSeconds) * 1000;
+  state.liveFeedTimer = setInterval(refreshLiveFeedImage, intervalMs);
+  setStatus("Showing the live camera feed");
+}
+
+async function refreshLiveAvailability() {
+  const cameraId = state.cameraId;
+  if (!cameraId) {
+    liveViewButton.hidden = true;
+    state.liveFeedConfigured = false;
+    stopLiveFeed();
+    updateLiveFeedControls();
+    return;
+  }
+  try {
+    const status = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/live-status`);
+    if (cameraId !== state.cameraId) return; // switched cameras mid-request
+    liveViewButton.hidden = !(status.configured || status.config_error);
+    state.liveFeedConfigured = Boolean(status.configured);
+    state.liveFeedIntervalSeconds = status.interval_seconds || 3;
+    if (state.liveFeedConfigured) {
+      enterLiveFeed();
+    } else {
+      stopLiveFeed();
+      updateLiveFeedControls();
+    }
+  } catch (error) {
+    liveViewButton.hidden = true;
+    state.liveFeedConfigured = false;
+    stopLiveFeed();
+    updateLiveFeedControls();
+  }
+}
+
+liveFeedButton.addEventListener("click", enterLiveFeed);
+
+function secondsSince(isoString) {
+  const then = Date.parse(isoString);
+  return Number.isNaN(then) ? null : Math.max(0, Math.round((Date.now() - then) / 1000));
+}
+
+function renderLiveStatus(status) {
+  liveStatusLine.classList.remove("live-error");
+  if (!status.configured) {
+    liveStatusLine.textContent = status.config_error
+      ? `Camera setup problem: ${status.config_error}`
+      : "Live view isn't set up for this camera yet.";
+    liveStatusLine.classList.add("live-error");
+    return;
+  }
+  if (status.last_error) {
+    liveStatusLine.textContent = `Can't get a photo from the camera: ${status.last_error}`;
+    liveStatusLine.classList.add("live-error");
+  } else if (status.last_frame_at) {
+    const ago = secondsSince(status.last_frame_at);
+    liveStatusLine.textContent =
+      `Camera connected · newest photo ${ago === null ? "just now" : `${ago}s ago`}` +
+      ` · a new one every ${status.interval_seconds}s`;
+  } else {
+    liveStatusLine.textContent = "Connecting to the camera…";
+  }
+  if (state.liveMode === "snapshot") {
+    liveMessage.replaceChildren();
+    const headline = document.createElement("div");
+    headline.textContent = "Live video isn't available right now, so this shows the newest photo instead (it updates every few seconds).";
+    liveMessage.append(headline);
+    if (status.stream_error) {
+      const detail = document.createElement("div");
+      detail.className = "live-message-detail";
+      detail.textContent = status.stream_error;
+      liveMessage.append(detail);
+    }
+    liveMessage.hidden = false;
+  }
+}
+
+async function pollLiveStatus() {
+  const cameraId = state.liveCameraId;
+  try {
+    const status = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/live-status`);
+    if (!liveDialog.open || cameraId !== state.liveCameraId) return;
+    renderLiveStatus(status);
+    if (!status.configured) {
+      stopLiveMedia();
+      liveImage.hidden = true;
+    }
+  } catch (error) {
+    if (liveDialog.open) {
+      liveStatusLine.textContent = "Can't reach the app server.";
+      liveStatusLine.classList.add("live-error");
+    }
+  }
+}
+
+function stopLiveMedia() {
+  clearInterval(state.liveSnapshotTimer);
+  state.liveSnapshotTimer = null;
+  liveImage.onerror = null;
+  liveImage.src = BLANK_IMAGE; // drops the video connection so the server stops ffmpeg
+}
+
+function stopLive() {
+  clearInterval(state.liveStatusTimer);
+  state.liveStatusTimer = null;
+  stopLiveMedia();
+  liveImage.removeAttribute("src");
+  state.liveCameraId = null;
+}
+
+function startSnapshotFallback(cameraId) {
+  state.liveMode = "snapshot";
+  const refresh = () => {
+    if (!liveDialog.open || cameraId !== state.liveCameraId) return;
+    liveImage.hidden = false;
+    liveImage.src = `/api/cameras/${encodeURIComponent(cameraId)}/latest.jpg?t=${Date.now()}`;
+  };
+  liveImage.onerror = () => {
+    liveImage.hidden = true; // no photo grabbed yet; the status line explains why
+  };
+  refresh();
+  state.liveSnapshotTimer = setInterval(refresh, LIVE_SNAPSHOT_POLL_MS);
+  pollLiveStatus();
+}
+
+function openLive() {
+  const cameraId = state.cameraId;
+  const camera = state.cameras.find((c) => c.id === cameraId);
+  state.liveCameraId = cameraId;
+  state.liveMode = "stream";
+  liveTitle.textContent = `Live View · ${camera ? camera.name : cameraId}`;
+  liveMessage.hidden = true;
+  liveStatusLine.textContent = "Connecting to the camera…";
+  liveStatusLine.classList.remove("live-error");
+  liveImage.hidden = false;
+  liveDialog.showModal();
+  liveImage.onerror = () => {
+    if (state.liveCameraId !== cameraId) return;
+    startSnapshotFallback(cameraId);
+  };
+  liveImage.src = `/api/cameras/${encodeURIComponent(cameraId)}/live.mjpg?t=${Date.now()}`;
+  pollLiveStatus();
+  state.liveStatusTimer = setInterval(pollLiveStatus, LIVE_STATUS_POLL_MS);
+}
+
+liveViewButton.addEventListener("click", openLive);
+closeLiveButton.addEventListener("click", () => liveDialog.close());
+liveDialog.addEventListener("close", stopLive);
+window.addEventListener("pagehide", () => {
+  stopLive();
+  stopLiveFeed();
 });
 
 runDetectionButton.addEventListener("click", async () => {
@@ -1145,6 +1597,176 @@ document.addEventListener("keydown", async (event) => {
     event.preventDefault();
     markSpaceButton.click();
   }
+});
+
+// ---- Deleting images and cameras ----
+
+// Shows a Cancel / Delete box and resolves true only if Delete is clicked.
+// Cancel, Esc, or clicking away all mean "no".
+let confirmResolve = null;
+
+function confirmAction({ title, message, detail = "", confirmLabel = "Delete" }) {
+  if (confirmResolve) {
+    finishConfirm(false);
+  }
+  return new Promise((resolve) => {
+    confirmTitle.textContent = title;
+    confirmMessage.textContent = message;
+    confirmDetail.textContent = detail;
+    confirmDetail.hidden = !detail;
+    confirmOkButton.textContent = confirmLabel;
+    confirmResolve = resolve;
+    confirmDialog.showModal();
+    confirmCancelButton.focus(); // so a stray Enter cancels rather than deletes
+  });
+}
+
+function finishConfirm(answer) {
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  if (confirmDialog.open) {
+    confirmDialog.close();
+  }
+  if (resolve) {
+    resolve(answer);
+  }
+}
+
+confirmOkButton.addEventListener("click", () => finishConfirm(true));
+confirmCancelButton.addEventListener("click", () => finishConfirm(false));
+confirmDialog.addEventListener("close", () => finishConfirm(false));
+confirmDialog.addEventListener("click", (event) => {
+  if (event.target === confirmDialog) {
+    finishConfirm(false);
+  }
+});
+
+// A message that should survive the "N/M observed occupied" line the next
+// image load would otherwise write over it. Only kept if an image is about
+// to load; otherwise it would show up stale on some later image.
+function setNotice(message) {
+  setStatus(message);
+  state.notice = state.selectedImage ? message : null;
+}
+
+function plural(count, word) {
+  return `${count} ${word}${count === 1 ? "" : "s"}`;
+}
+
+async function deleteImage(image) {
+  const confirmed = await confirmAction({
+    title: "Delete this image?",
+    message: image.filename,
+    detail:
+      "The photo and its detection results will be removed, and the parking history will be recalculated without it. This can't be undone.",
+  });
+  if (!confirmed) {
+    return;
+  }
+  const cameraId = state.cameraId;
+  try {
+    await fetchJson(`/api/images/${encodeURIComponent(image.id)}`, { method: "DELETE" });
+  } catch (error) {
+    setStatus(error.message);
+    if (error.status === 404) {
+      await loadCameraData(); // already gone -- just show what's really there
+    }
+    return;
+  }
+  if (state.cameraId !== cameraId) {
+    return; // switched cameras while the request ran
+  }
+  const index = state.images.findIndex((item) => item.id === image.id);
+  const wasSelected = state.selectedImage?.id === image.id;
+  state.images = state.images.filter((item) => item.id !== image.id);
+  if (wasSelected) {
+    state.selectedImage = state.images[Math.min(Math.max(index, 0), state.images.length - 1)] || null;
+    state.draftPoints = [];
+    state.hoveredSpaceId = null;
+    state.hoveredDetectionId = null;
+    state.selectedSpaceId = null;
+  }
+  try {
+    // Removing a photo can change what each space's history says.
+    const spacesPayload = await fetchJson(`/api/spaces?camera_id=${encodeURIComponent(cameraId)}`);
+    state.spaces = spacesPayload.spaces;
+  } catch (error) {
+    console.warn(error);
+  }
+  renderImages();
+  renderSpaces();
+  renderStatusList();
+  updateDraftControls();
+  if (wasSelected) {
+    scrollSelectedImageIntoView();
+    await loadSelectedImage();
+  } else {
+    draw();
+  }
+  setNotice(`Deleted ${image.filename}`);
+}
+
+async function deleteCurrentCamera() {
+  const camera = state.cameras.find((item) => item.id === state.cameraId);
+  if (!camera) {
+    return;
+  }
+  const confirmed = await confirmAction({
+    title: "Delete this camera?",
+    message: camera.name,
+    detail:
+      `This permanently removes the camera, its ${plural(state.images.length, "image")}, ` +
+      `its ${plural(state.spaces.length, "marked space")}, and all their detection history. ` +
+      "Your other cameras are not affected. This can't be undone.",
+    confirmLabel: "Delete camera",
+  });
+  if (!confirmed) {
+    return;
+  }
+  stopDetectionPolling();
+  let result;
+  try {
+    result = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, { method: "DELETE" });
+  } catch (error) {
+    setStatus(error.message);
+    if (error.status === 404) {
+      // Already gone (deleted somewhere else): fall through and refresh.
+      result = { images_deleted: 0, spaces_deleted: 0, warnings: [] };
+    } else {
+      // Detection may still be running for it; keep watching.
+      checkDetectionStatusOnce(state.cameraId);
+      return;
+    }
+  }
+  const camerasPayload = await fetchJson("/api/cameras");
+  state.cameras = camerasPayload.cameras;
+  state.cameraId = state.cameras[0]?.id || null;
+  rememberCameraId(state.cameraId);
+  state.draftPoints = [];
+  state.hoveredSpaceId = null;
+  state.hoveredDetectionId = null;
+  state.selectedSpaceId = null;
+  state.mode = "idle";
+  stopLiveFeed();
+  renderCameras();
+  await loadCameraData();
+  renderDetectionStatus(null);
+  updateDraftControls();
+  if (state.cameraId) {
+    checkDetectionStatusOnce(state.cameraId);
+  }
+  refreshLiveAvailability();
+  let message =
+    `Deleted "${camera.name}" (${plural(result.images_deleted, "image")}, ` +
+    `${plural(result.spaces_deleted, "space")} removed).`;
+  if (result.warnings && result.warnings.length > 0) {
+    message += ` Heads up: ${result.warnings.join(" ")}`;
+  }
+  setNotice(message);
+}
+
+deleteCameraButton.addEventListener("click", () => {
+  deleteCurrentCamera().catch((error) => setStatus(error.message));
 });
 
 loadInitialData().catch((error) => {

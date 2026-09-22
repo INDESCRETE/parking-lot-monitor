@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import analytics, reports
+from app import analytics, live, live_detection, reports
+from app.intervals import DEFAULT_MIN_OCCUPIED_SECONDS, recompute_space_intervals
 from app.video_extract import FfmpegUnavailable, extract_frames
 
 
@@ -248,6 +249,28 @@ def get_detection_status(camera_id: str) -> dict[str, Any]:
         return {"camera_id": camera_id, **state}
 
 
+def parse_reference_size(payload: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Reads the optional reference_width/reference_height fields a space's
+    create/update request can include -- the pixel size of the photo that
+    was on screen when the polygon was drawn, used later to correctly scale
+    the polygon if detection ever runs against a differently-sized photo of
+    the same camera (see app/detection_core.py's scale_polygon). Both are
+    optional and independent of each other; an older/simpler client that
+    omits them just gets None, which means "don't scale" (today's
+    behavior, unchanged) rather than an error.
+    """
+    result = []
+    for key in ("reference_width", "reference_height"):
+        value = payload.get(key)
+        if value is None:
+            result.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ValueError(f'"{key}" must be a positive number.')
+        result.append(float(value))
+    return result[0], result[1]
+
+
 def parse_timestamp_from_filename(path: Path) -> str:
     match = re.search(
         r"(\d{4})[-_]?(\d{2})[-_]?(\d{2})[T _-]?(\d{2})[-_]?(\d{2})[-_]?(\d{2})",
@@ -298,6 +321,8 @@ class Database:
                     camera_id TEXT NOT NULL,
                     label TEXT NOT NULL,
                     polygon_json TEXT NOT NULL,
+                    reference_width REAL,
+                    reference_height REAL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     FOREIGN KEY(camera_id) REFERENCES cameras(id)
@@ -333,9 +358,9 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     parking_space_id INTEGER NOT NULL,
                     occupied INTEGER NOT NULL,
-                    start_image_id INTEGER NOT NULL,
+                    start_image_id INTEGER,
                     start_captured_at TEXT NOT NULL,
-                    end_image_id INTEGER NOT NULL,
+                    end_image_id INTEGER,
                     end_captured_at TEXT NOT NULL,
                     duration_seconds REAL NOT NULL,
                     is_current INTEGER NOT NULL DEFAULT 0,
@@ -370,10 +395,16 @@ class Database:
             )
             self._migrate_camera_lot_column(conn)
             self._migrate_camera_min_occupied_seconds_column(conn)
-            conn.execute(
-                "INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
-                (DEFAULT_CAMERA_ID, "Camera 1", utc_now()),
-            )
+            self._migrate_space_intervals_nullable_image_ids(conn)
+            self._migrate_parking_spaces_reference_size_columns(conn)
+            # Seed the default "Camera 1" only into a genuinely empty install.
+            # Doing it on every start would silently bring it back after the user
+            # deliberately deleted it.
+            if conn.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 0:
+                conn.execute(
+                    "INSERT INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
+                    (DEFAULT_CAMERA_ID, "Camera 1", utc_now()),
+                )
             self._backfill_unassigned_lot(conn)
 
     def _migrate_camera_lot_column(self, conn: sqlite3.Connection) -> None:
@@ -396,6 +427,77 @@ class Database:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
         if "min_occupied_seconds" not in columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN min_occupied_seconds REAL")
+
+    def _migrate_space_intervals_nullable_image_ids(self, conn: sqlite3.Connection) -> None:
+        """Loosens space_state_intervals.start_image_id/end_image_id from NOT
+        NULL to nullable.
+
+        The live continuous detector (app/live_detection.py) writes directly
+        into this same table so the rest of the app (current-status display,
+        analytics, exported reports) sees live data the same way it already
+        sees uploaded-video data -- but a live-derived interval has no stored
+        image to point to, unlike a batch-derived one. SQLite can't relax a
+        NOT NULL constraint in place, so this rebuilds the table (copy, drop,
+        rename) the one time it's needed and is a no-op on every run after
+        that, same idempotent pattern as the other migrations here.
+        """
+        columns = {row["name"]: row for row in conn.execute("PRAGMA table_info(space_state_intervals)")}
+        start_column = columns.get("start_image_id")
+        if start_column is None or not start_column["notnull"]:
+            return  # already nullable
+        conn.executescript(
+            """
+            DROP TABLE IF EXISTS space_state_intervals_new;
+
+            CREATE TABLE space_state_intervals_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                parking_space_id INTEGER NOT NULL,
+                occupied INTEGER NOT NULL,
+                start_image_id INTEGER,
+                start_captured_at TEXT NOT NULL,
+                end_image_id INTEGER,
+                end_captured_at TEXT NOT NULL,
+                duration_seconds REAL NOT NULL,
+                is_current INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
+                FOREIGN KEY(start_image_id) REFERENCES images(id),
+                FOREIGN KEY(end_image_id) REFERENCES images(id)
+            );
+
+            INSERT INTO space_state_intervals_new
+                SELECT id, parking_space_id, occupied, start_image_id, start_captured_at,
+                       end_image_id, end_captured_at, duration_seconds, is_current, created_at
+                FROM space_state_intervals;
+
+            DROP TABLE space_state_intervals;
+            ALTER TABLE space_state_intervals_new RENAME TO space_state_intervals;
+
+            CREATE INDEX IF NOT EXISTS idx_intervals_space_current
+                ON space_state_intervals(parking_space_id, is_current);
+            CREATE INDEX IF NOT EXISTS idx_intervals_space_start
+                ON space_state_intervals(parking_space_id, start_captured_at);
+            """
+        )
+
+    def _migrate_parking_spaces_reference_size_columns(self, conn: sqlite3.Connection) -> None:
+        """Adds parking_spaces.reference_width/reference_height if this DB
+        predates the fix for the mismatched-photo-size bug (a space marked on
+        one photo reading permanently vacant when checked against a
+        differently-sized photo, e.g. a small screenshot used to mark spaces
+        vs. the live camera's full-resolution snapshots). NULL means "no
+        recorded reference size" -- an older space, or one that predates this
+        column -- and app/detection_core.py's scale_polygon() treats that as
+        "nothing to scale, use the polygon as-is," so this is purely additive
+        and changes nothing for spaces that already work correctly today.
+        Simple ADD COLUMN, not a table rebuild -- SQLite allows adding a
+        nullable column in place.
+        """
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(parking_spaces)")}
+        if "reference_width" not in columns:
+            conn.execute("ALTER TABLE parking_spaces ADD COLUMN reference_width REAL")
+        if "reference_height" not in columns:
+            conn.execute("ALTER TABLE parking_spaces ADD COLUMN reference_height REAL")
 
     def _ensure_unassigned_lot(self, conn: sqlite3.Connection) -> int:
         """Returns the id of the well-known "Unassigned" client/lot,
@@ -456,18 +558,17 @@ class Database:
                     "INSERT OR IGNORE INTO cameras (id, name, created_at) VALUES (?, ?, ?)",
                     (camera_id, camera_id.replace("_", " ").title(), utc_now()),
                 )
-                if filenames:
-                    placeholders = ",".join("?" for _ in filenames)
-                    conn.execute(
-                        f"""
-                        DELETE FROM images
-                        WHERE camera_id = ?
-                          AND filename NOT IN ({placeholders})
-                        """,
-                        (camera_id, *filenames),
+                # Rows whose picture file has vanished (e.g. deleted in Finder):
+                # remove them AND everything that pointed at them, and rebuild the
+                # affected timelines, so nothing is left dangling.
+                stale_ids = [
+                    row["id"]
+                    for row in conn.execute(
+                        "SELECT id, filename FROM images WHERE camera_id = ?", (camera_id,)
                     )
-                else:
-                    conn.execute("DELETE FROM images WHERE camera_id = ?", (camera_id,))
+                    if row["filename"] not in filenames
+                ]
+                self._purge_images(conn, camera_id, stale_ids)
                 for path in sorted(camera_dir.iterdir()):
                     if path.suffix.lower() not in IMAGE_EXTENSIONS:
                         continue
@@ -484,6 +585,156 @@ class Database:
             # "Unassigned" client/lot immediately rather than waiting for the
             # next server restart.
             self._backfill_unassigned_lot(conn)
+
+    # ---- deletion ---------------------------------------------------------
+
+    @staticmethod
+    def _chunks(items: list, size: int = 400):
+        for start in range(0, len(items), size):
+            yield items[start : start + size]
+
+    def _purge_images(self, conn: sqlite3.Connection, camera_id: str, image_ids: list[int]) -> int:
+        """Deletes image rows plus everything that points at them (detections,
+        occupancy observations, timeline intervals), then rebuilds the timelines
+        of the spaces that were affected so the history stays consistent.
+
+        Only touches the database, never files. Returns how many spaces had
+        their timeline recalculated.
+        """
+        if not image_ids:
+            return 0
+        affected: set[int] = set()
+        for chunk in self._chunks(image_ids):
+            marks = ",".join("?" for _ in chunk)
+            affected.update(
+                row[0]
+                for row in conn.execute(
+                    f"SELECT parking_space_id FROM occupancy_observations WHERE image_id IN ({marks})",
+                    chunk,
+                )
+            )
+            affected.update(
+                row[0]
+                for row in conn.execute(
+                    f"""SELECT parking_space_id FROM space_state_intervals
+                        WHERE start_image_id IN ({marks}) OR end_image_id IN ({marks})""",
+                    chunk + chunk,
+                )
+            )
+            conn.execute(f"DELETE FROM occupancy_observations WHERE image_id IN ({marks})", chunk)
+            conn.execute(f"DELETE FROM detections WHERE image_id IN ({marks})", chunk)
+            conn.execute(
+                f"DELETE FROM space_state_intervals WHERE start_image_id IN ({marks}) OR end_image_id IN ({marks})",
+                chunk + chunk,
+            )
+            conn.execute(f"DELETE FROM images WHERE id IN ({marks})", chunk)
+        camera = conn.execute(
+            "SELECT min_occupied_seconds FROM cameras WHERE id = ?", (camera_id,)
+        ).fetchone()
+        min_occupied = (
+            camera["min_occupied_seconds"]
+            if camera is not None and camera["min_occupied_seconds"] is not None
+            else DEFAULT_MIN_OCCUPIED_SECONDS
+        )
+        for space_id in sorted(affected):
+            recompute_space_intervals(conn, space_id, min_occupied)
+        return len(affected)
+
+    def get_image(self, image_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            return dict(row) if row else None
+
+    def delete_image(self, image_id: int) -> dict[str, Any] | None:
+        """Permanently deletes one image: its file, its detections and
+        observations, and recalculates the history of the spaces it touched.
+        Returns None if there is no such image."""
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+            if row is None:
+                return None
+            rebuilt = self._purge_images(conn, row["camera_id"], [image_id])
+            # The file goes inside the transaction: if it can't be removed, the
+            # database changes are rolled back instead of leaving a half-deleted image.
+            self._remove_image_file(row["camera_id"], row["filename"])
+            return {
+                "deleted": True,
+                "image_id": image_id,
+                "camera_id": row["camera_id"],
+                "filename": row["filename"],
+                "spaces_recalculated": rebuilt,
+            }
+
+    @staticmethod
+    def _remove_image_file(camera_id: str, filename: str) -> None:
+        camera_dir = (IMAGES_DIR / camera_id).resolve()
+        if camera_dir.parent != IMAGES_DIR.resolve() or Path(filename).name != filename:
+            raise ValueError("Refusing to delete a file outside the camera's image folder.")
+        try:
+            (camera_dir / filename).unlink()
+        except FileNotFoundError:
+            pass  # already gone -- the goal is met
+
+    @staticmethod
+    def _remove_camera_folder(base: Path, camera_id: str) -> None:
+        target = base / camera_id
+        if not target.exists() and not target.is_symlink():
+            return
+        if target.is_symlink() or target.resolve().parent != base.resolve():
+            raise ValueError(f"Refusing to delete {target}: it is not a plain folder inside {base.name}/.")
+        shutil.rmtree(target)
+
+    def delete_camera(self, camera_id: str) -> dict[str, Any] | None:
+        """Permanently deletes a camera and everything that belongs to it: its
+        pictures (files and records), marked spaces, detections, occupancy
+        history, uploaded source videos, and live-feed leftovers. Nothing that
+        belongs to any other camera is touched. Returns None if it doesn't exist."""
+        with self.connect() as conn:
+            camera = conn.execute("SELECT id, name FROM cameras WHERE id = ?", (camera_id,)).fetchone()
+            if camera is None:
+                return None
+            image_ids = [r[0] for r in conn.execute("SELECT id FROM images WHERE camera_id = ?", (camera_id,))]
+            space_ids = [r[0] for r in conn.execute("SELECT id FROM parking_spaces WHERE camera_id = ?", (camera_id,))]
+            for chunk in self._chunks(image_ids):
+                marks = ",".join("?" for _ in chunk)
+                conn.execute(f"DELETE FROM occupancy_observations WHERE image_id IN ({marks})", chunk)
+                conn.execute(f"DELETE FROM detections WHERE image_id IN ({marks})", chunk)
+                conn.execute(
+                    f"DELETE FROM space_state_intervals WHERE start_image_id IN ({marks}) OR end_image_id IN ({marks})",
+                    chunk + chunk,
+                )
+            for chunk in self._chunks(space_ids):
+                marks = ",".join("?" for _ in chunk)
+                conn.execute(f"DELETE FROM occupancy_observations WHERE parking_space_id IN ({marks})", chunk)
+                conn.execute(f"DELETE FROM space_state_intervals WHERE parking_space_id IN ({marks})", chunk)
+            conn.execute("DELETE FROM images WHERE camera_id = ?", (camera_id,))
+            conn.execute("DELETE FROM parking_spaces WHERE camera_id = ?", (camera_id,))
+            conn.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
+            # The images folder must go before we commit: sync_images() re-creates a
+            # camera from any folder it finds, so a leftover folder would bring the
+            # camera straight back. If it can't be removed, everything rolls back.
+            self._remove_camera_folder(IMAGES_DIR, camera_id)
+
+        warnings: list[str] = []
+        for base in (SOURCE_VIDEOS_DIR, live.LIVE_DIR):
+            try:
+                self._remove_camera_folder(base, camera_id)
+            except (OSError, ValueError) as exc:
+                warnings.append(f"Could not remove leftover files in {base.name}/: {exc}")
+        live_stopped = live.stop_camera(camera_id)
+        # Forgets this camera's in-memory live-detection state (confirmed/
+        # candidate space states) so a camera recreated with the same id
+        # later doesn't inherit stale state from before the delete.
+        live_detector.forget_camera(camera_id)
+        return {
+            "deleted": True,
+            "camera_id": camera_id,
+            "name": camera["name"],
+            "images_deleted": len(image_ids),
+            "spaces_deleted": len(space_ids),
+            "live_stopped": live_stopped,
+            "warnings": warnings,
+        }
 
     def list_cameras(self, lot_id: int | None = None) -> list[dict[str, Any]]:
         query = """
@@ -640,7 +891,8 @@ class Database:
         with self.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ps.id, ps.camera_id, ps.label, ps.polygon_json, ps.created_at, ps.updated_at,
+                SELECT ps.id, ps.camera_id, ps.label, ps.polygon_json,
+                       ps.reference_width, ps.reference_height, ps.created_at, ps.updated_at,
                        si.occupied AS current_occupied,
                        si.start_captured_at AS current_since,
                        si.duration_seconds AS current_duration_seconds
@@ -733,16 +985,23 @@ class Database:
                 for row in rows
             ]
 
-    def create_space(self, camera_id: str, label: str, polygon: list[dict[str, float]]) -> dict[str, Any]:
+    def create_space(
+        self,
+        camera_id: str,
+        label: str,
+        polygon: list[dict[str, float]],
+        reference_width: float | None = None,
+        reference_height: float | None = None,
+    ) -> dict[str, Any]:
         now = utc_now()
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO parking_spaces
-                    (camera_id, label, polygon_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                    (camera_id, label, polygon_json, reference_width, reference_height, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (camera_id, label, json.dumps(polygon), now, now),
+                (camera_id, label, json.dumps(polygon), reference_width, reference_height, now, now),
             )
             row = conn.execute(
                 "SELECT * FROM parking_spaces WHERE id = ?",
@@ -755,16 +1014,22 @@ class Database:
             cursor = conn.execute("DELETE FROM parking_spaces WHERE id = ?", (space_id,))
             return cursor.rowcount > 0
 
-    def update_space_polygon(self, space_id: int, polygon: list[dict[str, float]]) -> dict[str, Any] | None:
+    def update_space_polygon(
+        self,
+        space_id: int,
+        polygon: list[dict[str, float]],
+        reference_width: float | None = None,
+        reference_height: float | None = None,
+    ) -> dict[str, Any] | None:
         now = utc_now()
         with self.connect() as conn:
             cursor = conn.execute(
                 """
                 UPDATE parking_spaces
-                SET polygon_json = ?, updated_at = ?
+                SET polygon_json = ?, reference_width = ?, reference_height = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (json.dumps(polygon), now, space_id),
+                (json.dumps(polygon), reference_width, reference_height, now, space_id),
             )
             if cursor.rowcount == 0:
                 return None
@@ -895,12 +1160,18 @@ def detection_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 
 db = Database(DB_PATH)
+live_detector = live_detection.LiveDetector(db)
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ParkingLotPOC/0.1"
 
     def do_GET(self) -> None:
+        # Live-camera routes are polled every second or two (or held open as a
+        # video stream), and never touch the database, so they are handled
+        # before the per-request db.sync_images() below.
+        if self.handle_live_get():
+            return
         db.sync_images()
         parsed = urlparse(self.path)
         path = parsed.path
@@ -987,10 +1258,13 @@ class Handler(BaseHTTPRequestHandler):
                 polygon = payload["polygon"]
                 if len(polygon) != 4:
                     raise ValueError("A parking space needs exactly 4 points.")
+                reference_width, reference_height = parse_reference_size(payload)
                 space = db.create_space(
                     safe_segment(payload.get("camera_id", DEFAULT_CAMERA_ID)),
                     payload.get("label") or "Space",
                     polygon,
+                    reference_width,
+                    reference_height,
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -1048,16 +1322,68 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_DELETE(self) -> None:
-        parsed = urlparse(self.path)
-        match = re.fullmatch(r"/api/spaces/(\d+)", parsed.path)
-        if not match:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        deleted = db.delete_space(int(match.group(1)))
-        if not deleted:
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        self.send_json({"deleted": True})
+        # NOTE: this used to be two separate do_DELETE methods defined back
+        # to back in this class -- Python silently keeps only the LAST
+        # definition of a repeated method name, so the space-delete route
+        # below was completely dead code (every DELETE /api/spaces/<id>
+        # 404'd) from whenever the image/camera delete feature was added
+        # until this was noticed and merged into one method (2026-09-22).
+        path = urlparse(self.path).path
+        space_match = re.fullmatch(r"/api/spaces/(\d+)", path)
+        image_match = re.fullmatch(r"/api/images/(\d+)", path)
+        camera_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)", path)
+        if space_match:
+            deleted = db.delete_space(int(space_match.group(1)))
+            if not deleted:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"deleted": True})
+        elif image_match:
+            image = db.get_image(int(image_match.group(1)))
+            if image is None:
+                self.send_json({"error": "That image no longer exists."}, HTTPStatus.NOT_FOUND)
+                return
+            # Holding the detection lock stops a detection run from starting
+            # mid-delete; a run already in flight is refused (it would fail on
+            # the missing file, or write results for an image that is gone).
+            with _detection_lock:
+                if _detection_state.get(image["camera_id"], {}).get("status") == "running":
+                    self.send_json(
+                        {"error": "Detection is running for this camera. Wait for it to finish, then try again."},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    result = db.delete_image(image["id"])
+                except (OSError, ValueError) as exc:
+                    self.send_json({"error": f"Could not delete the image: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+            if result is None:
+                self.send_json({"error": "That image no longer exists."}, HTTPStatus.NOT_FOUND)
+                return
+            self.send_json(result)
+        elif camera_match:
+            camera_id = camera_match.group(1)
+            with _detection_lock:
+                if _detection_state.get(camera_id, {}).get("status") == "running":
+                    self.send_json(
+                        {"error": "Detection is running for this camera. Wait for it to finish, then try again."},
+                        HTTPStatus.CONFLICT,
+                    )
+                    return
+                try:
+                    result = db.delete_camera(camera_id)
+                except (OSError, ValueError) as exc:
+                    self.send_json({"error": f"Could not delete the camera: {exc}"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+                    return
+                if result is not None:
+                    _detection_state.pop(camera_id, None)
+            if result is None:
+                self.send_json({"error": "That camera no longer exists."}, HTTPStatus.NOT_FOUND)
+                return
+            self.send_json(result)
+        else:
+            self.send_json({"error": "Not found."}, HTTPStatus.NOT_FOUND)
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
@@ -1069,10 +1395,11 @@ class Handler(BaseHTTPRequestHandler):
                 polygon = payload["polygon"]
                 if len(polygon) != 4:
                     raise ValueError("A parking space needs exactly 4 points.")
+                reference_width, reference_height = parse_reference_size(payload)
             except (KeyError, TypeError, ValueError) as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
-            space = db.update_space_polygon(int(space_match.group(1)), polygon)
+            space = db.update_space_polygon(int(space_match.group(1)), polygon, reference_width, reference_height)
             if space is None:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
@@ -1302,6 +1629,70 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def handle_live_get(self) -> bool:
+        """Serves the live-camera routes. Returns False if the path isn't one."""
+        path = urlparse(self.path).path
+        match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|latest\.jpg|live\.mjpg)", path)
+        if not match:
+            return False
+        camera_id, action = match.groups()
+        if action == "live-status":
+            status = live.get_status(camera_id)
+            status["detection"] = live_detector.status(camera_id)
+            self.send_json(status)
+        elif action == "latest.jpg":
+            self.serve_latest_frame(camera_id)
+        else:
+            self.stream_live(camera_id)
+        return True
+
+    def serve_latest_frame(self, camera_id: str) -> None:
+        try:
+            body = live.latest_frame_path(camera_id).read_bytes()
+        except OSError:
+            self.send_json({"error": "No frame captured yet."}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "image/jpeg")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def stream_live(self, camera_id: str) -> None:
+        """Relays the camera's video to the browser as MJPEG. ffmpeg only runs
+        while this connection is open, and is killed as soon as it closes."""
+        source = live.get_source(camera_id)
+        if source is None:
+            self.send_json({"error": "Live view is not set up for this camera."}, HTTPStatus.NOT_FOUND)
+            return
+        relay = live.MjpegRelay(source)
+        try:
+            try:
+                first = relay.start()
+            except live.RelayBusy as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            except live.RelayFailed as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", live.MJPEG_CONTENT_TYPE)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(first)
+            self.wfile.flush()
+            for chunk in relay.chunks():
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the browser closed the live view
+        finally:
+            relay.close()
+
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
@@ -1336,12 +1727,30 @@ class Handler(BaseHTTPRequestHandler):
         self.serve_file(IMAGES_DIR / camera_id / filename)
 
 
+def seed_default_camera_folder() -> None:
+    """Creates the default camera's picture folder on a fresh install (the default
+    camera exists but no camera has a folder yet). If the user deleted the default
+    camera, nothing is created, so it can't reappear."""
+    IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+    has_any_folder = any(path.is_dir() for path in IMAGES_DIR.iterdir())
+    default_exists = any(camera["id"] == DEFAULT_CAMERA_ID for camera in db.list_cameras())
+    if default_exists and not has_any_folder:
+        (IMAGES_DIR / DEFAULT_CAMERA_ID).mkdir(parents=True, exist_ok=True)
+
+
 def main() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     (DATA_DIR / "db").mkdir(parents=True, exist_ok=True)
-    (IMAGES_DIR / DEFAULT_CAMERA_ID).mkdir(parents=True, exist_ok=True)
+    seed_default_camera_folder()
     SOURCE_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     db.sync_images()
+    live_detector.start()
+    live_cameras = live.start_all(
+        on_frame=live_detector.submit_frame,
+        only_camera_ids=[camera["id"] for camera in db.list_cameras()],
+    )
+    if live_cameras:
+        print(f"Live camera grabbers running for: {', '.join(live_cameras)}")
     host = "127.0.0.1"
     starting_port = int(os.environ.get("PORT", "8000"))
     server = None

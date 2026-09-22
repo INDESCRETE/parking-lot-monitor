@@ -5,6 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Parking Lot Monitor — Dashboard</title>
     <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      // Applied here (before the page paints) so switching pages or reloading
+      // never shows a flash of the wrong theme. theme.js (loaded later, at
+      // the bottom of the page) handles the toggle button itself.
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          // Storage blocked (e.g. private browsing) -- just fall back to light.
+        }
+      })();
+    </script>
   </head>
   <body class="dashboard-body">
     <header class="topbar">
@@ -12,7 +28,10 @@
         <h1>Dashboard</h1>
         <p>Occupancy analytics across clients and lots</p>
       </div>
-      <a class="nav-link" href="/">Annotation View</a>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/">Annotation View</a>
+      </div>
     </header>
 
     <main class="dashboard-main">
@@ -107,6 +126,7 @@
       </div>
     </main>
 
+    <script src="/static/theme.js"></script>
     <script src="/static/dashboard.js"></script>
   </body>
 </html>

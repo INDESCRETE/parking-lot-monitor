@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy this file to camera_sources.json (same folder) and fill in your camera. camera_sources.json is gitignored because it holds the camera password. The key below must match a camera id in the app (see the Camera dropdown / + Add Camera).",
+  "camera_1": {
+    "host": "192.168.1.50",
+    "username": "admin",
+    "password": "CHANGE_ME",
+    "interval_seconds": 3,
+    "live_fps": 2,
+    "frame_policy": "none"
+  }
+}
