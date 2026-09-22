@@ -65,7 +65,12 @@ def parse_range_bound(value: str, *, inclusive_end: bool) -> datetime:
         value = value[:-1] + "+00:00"
     dt = datetime.fromisoformat(value)
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        # No explicit offset means this came from a bare calendar date
+        # (someone picking a day, not a precise instant) -- that's a local
+        # calendar day to whoever picked it, not a UTC one. astimezone() on
+        # a naive datetime attaches the system's local timezone rather
+        # than assuming UTC.
+        dt = dt.astimezone()
     if is_bare_date and inclusive_end:
         dt = dt + timedelta(days=1)
     return dt
@@ -217,7 +222,17 @@ def _run_detection_worker(camera_id: str) -> None:
             if timed_out:
                 error = f"Detection timed out after {DETECTION_TIMEOUT_SECONDS // 60} minutes."
             elif returncode != 0:
-                error = "\n".join(output_lines).strip()[-2000:] or "Detection failed."
+                joined = "\n".join(output_lines).strip()
+                # stdout/stderr are merged (see the Popen call above) so a
+                # real failure's output is often preceded by unrelated
+                # startup noise -- library deprecation warnings, RF-DETR's
+                # own "loading weights" messages, etc. When there's an
+                # actual Python traceback, show just that instead of
+                # however much noise happened to print before it.
+                tb_marker = "Traceback (most recent call last):"
+                if tb_marker in joined:
+                    joined = joined[joined.rindex(tb_marker):]
+                error = joined[-2000:] or "Detection failed."
         except OSError as exc:
             error = str(exc)
 
@@ -1715,6 +1730,13 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        # Without this, some browsers reuse a stale cached copy of these
+        # files (there's no ETag/Last-Modified for them to revalidate
+        # against) even on an ordinary reload -- confusing during active
+        # development, since a "reload and check" can silently show old
+        # behavior. These are small and served locally, so there's no real
+        # cost to always fetching fresh.
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 

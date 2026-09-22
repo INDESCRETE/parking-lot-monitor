@@ -113,8 +113,12 @@ function formatHourLabel(hour) {
   return `${hour - 12}pm`;
 }
 
-function todayUtcIso() {
-  return new Date().toISOString().slice(0, 10);
+function todayLocalIso() {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function addDaysIso(isoDate, delta) {
@@ -128,13 +132,51 @@ function addDaysIso(isoDate, delta) {
  * a gap rather than a zero-height bar, mirroring app/reports.py's
  * `_bar_chart` exactly so the dashboard and the printed report never
  * look inconsistent for the same data. */
-function barChartSvg(labels, values, { color, valueFormatter, width = 760, height = 220 }) {
+function niceNumber(value, round) {
+  const exponent = Math.floor(Math.log10(value));
+  const fraction = value / 10 ** exponent;
+  let niceFraction;
+  if (round) {
+    if (fraction < 1.5) niceFraction = 1;
+    else if (fraction < 3) niceFraction = 2;
+    else if (fraction < 7) niceFraction = 5;
+    else niceFraction = 10;
+  } else {
+    if (fraction <= 1) niceFraction = 1;
+    else if (fraction <= 2) niceFraction = 2;
+    else if (fraction <= 5) niceFraction = 5;
+    else niceFraction = 10;
+  }
+  return niceFraction * 10 ** exponent;
+}
+
+/** Picks a "nice" y-axis ceiling and evenly-spaced tick values below it
+ * (the standard graph-labeling algorithm) -- e.g. a data max of 0.42 becomes
+ * ticks at 0/0.1/0.2/0.3/0.4/0.5, not an arbitrary scale tied to whatever
+ * the data's raw max happens to be. targetCount is how many gridlines to
+ * aim for (the actual count can be one more or less once rounded). */
+function niceTicks(maxValue, targetCount = 4) {
+  if (!(maxValue > 0)) {
+    return { niceMax: 1, ticks: [0, 1] };
+  }
+  const niceRange = niceNumber(maxValue, false);
+  const step = niceNumber(niceRange / Math.max(1, targetCount - 1), true);
+  const niceMax = Math.ceil(maxValue / step) * step;
+  const ticks = [];
+  for (let v = 0; v <= niceMax + step / 1e6; v += step) {
+    ticks.push(Math.round(v / step) * step);
+  }
+  return { niceMax, ticks };
+}
+
+function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, width = 760, height = 220 }) {
   if (labels.length === 0) {
     return '<p class="empty-note">No data in this range.</p>';
   }
   const mutedColor = cssVar("--muted", MUTED);
   const lineColor = cssVar("--line", LINE);
-  const paddingLeft = 36;
+  const formatAxisValue = axisFormatter || valueFormatter;
+  const paddingLeft = 42;
   const paddingBottom = 28;
   const paddingTop = 12;
   const plotWidth = width - paddingLeft - 10;
@@ -143,7 +185,8 @@ function barChartSvg(labels, values, { color, valueFormatter, width = 760, heigh
   const barWidth = Math.max(2.0, (plotWidth / n) * 0.65);
   const gap = plotWidth / n;
   const numeric = values.filter((v) => v !== null && v !== undefined);
-  const maxValue = Math.max(numeric.length ? Math.max(...numeric) : 1.0, 1e-9);
+  const dataMax = Math.max(numeric.length ? Math.max(...numeric) : 1.0, 1e-9);
+  const { niceMax, ticks: axisTicks } = niceTicks(dataMax);
 
   const bars = [];
   const ticks = [];
@@ -154,7 +197,7 @@ function barChartSvg(labels, values, { color, valueFormatter, width = 760, heigh
     const x = paddingLeft + i * gap + (gap - barWidth) / 2;
     lastX = x;
     if (value !== null && value !== undefined) {
-      const barHeight = (value / maxValue) * plotHeight;
+      const barHeight = (value / niceMax) * plotHeight;
       const y = paddingTop + (plotHeight - barHeight);
       const title = `${label}: ${valueFormatter(value)}`;
       bars.push(
@@ -168,10 +211,24 @@ function barChartSvg(labels, values, { color, valueFormatter, width = 760, heigh
       );
     }
   });
-  const axisY = paddingTop + plotHeight;
+  // Y-axis: a hairline gridline per "nice" tick value, with its value
+  // labeled at the left -- recessive (drawn first, under the bars), same
+  // line color/weight as the old single baseline this replaces.
+  const yGridlines = [];
+  const yLabels = [];
+  for (const tick of axisTicks) {
+    const y = paddingTop + plotHeight - (tick / niceMax) * plotHeight;
+    yGridlines.push(
+      `<line x1="${paddingLeft}" y1="${y.toFixed(1)}" x2="${width - 10}" y2="${y.toFixed(1)}" stroke="${lineColor}" stroke-width="1"/>`
+    );
+    yLabels.push(
+      `<text x="${(paddingLeft - 6).toFixed(1)}" y="${y.toFixed(1)}" font-size="10" fill="${mutedColor}" text-anchor="end" dominant-baseline="middle">${escapeHtml(formatAxisValue(tick))}</text>`
+    );
+  }
   return (
     `<svg viewBox="0 0 ${width} ${height}" width="100%" height="${height}" xmlns="http://www.w3.org/2000/svg" role="img">` +
-    `<line x1="${paddingLeft}" y1="${axisY}" x2="${width - 10}" y2="${axisY}" stroke="${lineColor}" stroke-width="1"/>` +
+    yGridlines.join("") +
+    yLabels.join("") +
     bars.join("") +
     ticks.join("") +
     "</svg>"
@@ -394,6 +451,7 @@ function renderReport(report) {
   occupancyChart.innerHTML = barChartSvg(occupancyLabels, occupancyValues, {
     color: cssVar("--accent", ACCENT),
     valueFormatter: formatPct,
+    axisFormatter: (v) => `${Math.round(v * 100)}%`,
   });
 
   const turnoverLabels = report.turnover_by_day.map((d) => formatDateLabel(d.date));
@@ -401,6 +459,7 @@ function renderReport(report) {
   turnoverChart.innerHTML = barChartSvg(turnoverLabels, turnoverValues, {
     color: cssVar("--accent-strong", ACCENT_STRONG),
     valueFormatter: (v) => `${Math.round(v)} arrivals`,
+    axisFormatter: (v) => `${Math.round(v)}`,
   });
 
   const hourLabels = report.peak_hours.map((h) => formatHourLabel(h.hour));
@@ -408,13 +467,14 @@ function renderReport(report) {
   hourChart.innerHTML = barChartSvg(hourLabels, hourValues, {
     color: cssVar("--occupied", OCCUPIED),
     valueFormatter: formatPct,
+    axisFormatter: (v) => `${Math.round(v * 100)}%`,
   });
 
   dwellChart.innerHTML = dwellBarsSvg(report.dwell_by_space);
 }
 
 function initCustomRangeDefaults() {
-  const end = todayUtcIso();
+  const end = todayLocalIso();
   const start = addDaysIso(end, -7);
   if (!startDateInput.value) startDateInput.value = start;
   if (!endDateInput.value) endDateInput.value = end;

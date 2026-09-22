@@ -29,11 +29,22 @@ from typing import Any
 
 
 def _parse(ts: str) -> datetime:
-    return datetime.fromisoformat(ts)
+    # Stored timestamps are UTC (that's correct -- it's what avoids
+    # ambiguity in the database). Converting to the system's local
+    # timezone here, once, as every row is read, means every .hour/.date()
+    # taken from the result anywhere downstream is automatically a real
+    # local wall-clock value instead of a UTC one -- correctly handling
+    # DST too, since .astimezone() resolves it per-instant rather than
+    # using one fixed offset for a whole report.
+    return datetime.fromisoformat(ts).astimezone()
 
 
 def _date_range(start: datetime, end: datetime) -> list[str]:
-    """Every calendar date touched by the half-open range [start, end)."""
+    """Every calendar date touched by the half-open range [start, end), as
+    local calendar days -- a "day" should mean Rob's day, even though
+    start/end are UTC (see _clipped_intervals for why they stay that way)."""
+    start = start.astimezone()
+    end = end.astimezone()
     if end <= start:
         return [start.date().isoformat()]
     days = []
@@ -98,10 +109,12 @@ def _clipped_intervals(
         """,
         (*space_ids, end.isoformat(), start.isoformat()),
     ).fetchall()
+    start_local = start.astimezone()
+    end_local = end.astimezone()
     clipped = []
     for row in rows:
-        clip_start = max(_parse(row["start_captured_at"]), start)
-        clip_end = min(_parse(row["end_captured_at"]), end)
+        clip_start = max(_parse(row["start_captured_at"]), start_local)
+        clip_end = min(_parse(row["end_captured_at"]), end_local)
         if clip_end <= clip_start:
             continue
         clipped.append(

@@ -21,6 +21,7 @@ const state = {
   liveSnapshotTimer: null,
   statusPollTimer: null,
   liveFeedActive: false,
+  liveFrameSource: false,
   liveFeedTimer: null,
   liveFeedIntervalSeconds: 3,
   liveFeedConfigured: false,
@@ -184,7 +185,7 @@ function setCameraControlsEnabled(hasCamera) {
 async function loadCameraData() {
   if (!state.cameraId) {
     stopStatusPolling();
-    stopLiveFeed();
+    exitLiveFrame();
     setCameraControlsEnabled(false);
     configLink.removeAttribute("href");
     renderMinOccupiedInput();
@@ -227,6 +228,12 @@ function renderMinOccupiedInput() {
 function renderDetectionStatus(status) {
   detectionStatus.classList.remove("detecting", "detection-error");
   if (!status || status.status === "idle") {
+    detectionStatus.textContent = "";
+    return;
+  }
+  if (status.status === "error" && state.images.length === 0) {
+    // Not actionable any more (see renderImages -- Run Detection is now
+    // disabled for a camera with no images), so don't leave it on screen.
     detectionStatus.textContent = "";
     return;
   }
@@ -400,6 +407,10 @@ async function createCamera(name) {
 }
 
 function renderImages() {
+  runDetectionButton.disabled = state.noCamera || state.images.length === 0;
+  runDetectionButton.title = state.images.length === 0
+    ? "No stored images to run batch detection on -- upload/import images, or check the live feed if this camera has one"
+    : "";
   imageList.innerHTML = "";
   if (state.images.length === 0) {
     imageList.textContent = "No images yet.";
@@ -432,7 +443,7 @@ async function selectImage(image, options = {}) {
   if (!image || state.selectedImage?.id === image.id) {
     return;
   }
-  stopLiveFeed(); // picking a specific photo means editing it, not watching the live feed
+  exitLiveFrame(); // picking a specific photo means editing it, not watching the live feed
   state.selectedImage = image;
   state.draftPoints = [];
   state.hoveredSpaceId = null;
@@ -687,7 +698,7 @@ function observationForSpace(spaceId) {
   // their live current_occupied/current_since fields (kept fresh by
   // startStatusPolling) instead of the batch detection results tied to a
   // specific stored image -- there is no "selected image" in live mode.
-  if (state.liveFeedActive) {
+  if (state.liveFrameSource) {
     const space = state.spaces.find((item) => item.id === spaceId);
     if (!space || space.current_occupied === null || space.current_occupied === undefined) {
       return null;
@@ -1223,7 +1234,7 @@ cancelCameraButton.addEventListener("click", () => {
 
 cameraSelect.addEventListener("change", async () => {
   stopDetectionPolling();
-  stopLiveFeed();
+  exitLiveFrame();
   state.cameraId = cameraSelect.value;
   rememberCameraId(state.cameraId);
   state.draftPoints = [];
@@ -1293,6 +1304,11 @@ function updateLiveFeedControls() {
   liveFeedIndicator.hidden = !state.liveFeedActive;
 }
 
+function exitLiveFrame() {
+  stopLiveFeed();
+  state.liveFrameSource = false;
+}
+
 function stopLiveFeed() {
   if (state.liveFeedTimer) {
     clearInterval(state.liveFeedTimer);
@@ -1333,6 +1349,7 @@ function enterLiveFeed() {
   }
   stopLiveFeed();
   state.liveFeedActive = true;
+  state.liveFrameSource = true;
   state.selectedImage = null;
   state.mode = "idle";
   state.draftPoints = [];
@@ -1354,7 +1371,7 @@ async function refreshLiveAvailability() {
   if (!cameraId) {
     liveViewButton.hidden = true;
     state.liveFeedConfigured = false;
-    stopLiveFeed();
+    exitLiveFrame();
     updateLiveFeedControls();
     return;
   }
@@ -1367,13 +1384,13 @@ async function refreshLiveAvailability() {
     if (state.liveFeedConfigured) {
       enterLiveFeed();
     } else {
-      stopLiveFeed();
+      exitLiveFrame();
       updateLiveFeedControls();
     }
   } catch (error) {
     liveViewButton.hidden = true;
     state.liveFeedConfigured = false;
-    stopLiveFeed();
+    exitLiveFrame();
     updateLiveFeedControls();
   }
 }
@@ -1491,9 +1508,14 @@ function openLive() {
 liveViewButton.addEventListener("click", openLive);
 closeLiveButton.addEventListener("click", () => liveDialog.close());
 liveDialog.addEventListener("close", stopLive);
-window.addEventListener("pagehide", () => {
-  stopLive();
-  stopLiveFeed();
+window.addEventListener("pagehide", stopLive);
+
+// Recovers the live feed if a back/forward-cache restore (e.g. clicking
+// Back after visiting the dashboard) didn't resume its timer on its own.
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted && state.liveFeedConfigured && !state.liveFeedActive) {
+    enterLiveFeed();
+  }
 });
 
 runDetectionButton.addEventListener("click", async () => {
@@ -1747,7 +1769,7 @@ async function deleteCurrentCamera() {
   state.hoveredDetectionId = null;
   state.selectedSpaceId = null;
   state.mode = "idle";
-  stopLiveFeed();
+  exitLiveFrame();
   renderCameras();
   await loadCameraData();
   renderDetectionStatus(null);

@@ -10,6 +10,7 @@ print CSS hides the one interactive control (the Print button).
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta
 from html import escape
 from typing import Any
@@ -58,12 +59,57 @@ def _format_hour_label(hour: int) -> str:
     return f"{hour - 12}pm"
 
 
+def _nice_number(value: float, round_value: bool) -> float:
+    """Heckbert's "nice numbers for graph labels" algorithm -- picks a
+    clean value (1/2/5 x a power of 10) near `value`, for axis ticks."""
+    if value <= 0:
+        return 1.0
+    exponent = math.floor(math.log10(value))
+    fraction = value / (10 ** exponent)
+    if round_value:
+        if fraction < 1.5:
+            nice_fraction = 1
+        elif fraction < 3:
+            nice_fraction = 2
+        elif fraction < 7:
+            nice_fraction = 5
+        else:
+            nice_fraction = 10
+    else:
+        if fraction <= 1:
+            nice_fraction = 1
+        elif fraction <= 2:
+            nice_fraction = 2
+        elif fraction <= 5:
+            nice_fraction = 5
+        else:
+            nice_fraction = 10
+    return nice_fraction * (10 ** exponent)
+
+
+def _nice_ticks(max_value: float, target_count: int = 4) -> tuple[float, list[float]]:
+    """Returns (nice_max, ticks) -- an axis max rounded up to a clean value,
+    and the evenly-spaced clean tick values from 0 to nice_max."""
+    if not (max_value > 0):
+        return 1.0, [0.0, 1.0]
+    nice_range = _nice_number(max_value, False)
+    step = _nice_number(nice_range / max(1, target_count - 1), True)
+    nice_max = math.ceil(max_value / step) * step
+    ticks = []
+    v = 0.0
+    while v <= nice_max + step / 1e6:
+        ticks.append(round(v / step) * step)
+        v += step
+    return nice_max, ticks
+
+
 def _bar_chart(
     labels: list[str],
     values: list[float | None],
     *,
     color: str,
     value_formatter,
+    axis_formatter=None,
     width: int = 760,
     height: int = 220,
 ) -> str:
@@ -72,15 +118,17 @@ def _bar_chart(
     "genuinely zero" never look the same."""
     if not labels:
         return '<p class="empty-note">No data in this range.</p>'
-    padding_left, padding_bottom, padding_top = 36, 28, 12
+    padding_left, padding_bottom, padding_top = 42, 28, 12
     plot_width = width - padding_left - 10
     plot_height = height - padding_bottom - padding_top
     n = len(labels)
     bar_width = max(2.0, plot_width / n * 0.65)
     gap = plot_width / n
     numeric = [v for v in values if v is not None]
-    max_value = max(numeric) if numeric else 1.0
-    max_value = max(max_value, 1e-9)
+    data_max = max(numeric) if numeric else 1.0
+    data_max = max(data_max, 1e-9)
+    format_axis_value = axis_formatter or value_formatter
+    nice_max, axis_ticks = _nice_ticks(data_max)
 
     bars = []
     ticks = []
@@ -88,7 +136,7 @@ def _bar_chart(
     for i, (label, value) in enumerate(zip(labels, values)):
         x = padding_left + i * gap + (gap - bar_width) / 2
         if value is not None:
-            bar_height = (value / max_value) * plot_height
+            bar_height = (value / nice_max) * plot_height
             y = padding_top + (plot_height - bar_height)
             title = f"{label}: {value_formatter(value)}"
             bars.append(
@@ -101,11 +149,23 @@ def _bar_chart(
                 f'<text x="{tick_x:.1f}" y="{height - 8}" font-size="10" fill="{MUTED}" '
                 f'text-anchor="middle">{escape(label)}</text>'
             )
-    axis_y = padding_top + plot_height
+    y_gridlines = []
+    y_labels = []
+    for tick in axis_ticks:
+        y = padding_top + plot_height - (tick / nice_max) * plot_height
+        y_gridlines.append(
+            f'<line x1="{padding_left}" y1="{y:.1f}" x2="{width - 10}" y2="{y:.1f}" '
+            f'stroke="{LINE}" stroke-width="1"/>'
+        )
+        y_labels.append(
+            f'<text x="{padding_left - 6:.1f}" y="{y:.1f}" font-size="10" fill="{MUTED}" '
+            f'text-anchor="end" dominant-baseline="middle">{escape(format_axis_value(tick))}</text>'
+        )
     return (
         f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
         f'xmlns="http://www.w3.org/2000/svg" role="img">'
-        f'<line x1="{padding_left}" y1="{axis_y}" x2="{width - 10}" y2="{axis_y}" stroke="{LINE}" stroke-width="1"/>'
+        + "".join(y_gridlines)
+        + "".join(y_labels)
         + "".join(bars)
         + "".join(ticks)
         + "</svg>"
@@ -154,25 +214,42 @@ def render_report_html(
     lot: dict[str, Any], report: dict[str, Any], camera: dict[str, Any] | None = None
 ) -> str:
     summary = report["summary"]
-    start = datetime.fromisoformat(report["start"])
-    end = datetime.fromisoformat(report["end"])
+    # report["start"]/["end"] are UTC (see app/analytics.py) -- converted to
+    # local here purely for display, so the printed date range header shows
+    # the calendar days this actually covers for Rob, not UTC's.
+    start = datetime.fromisoformat(report["start"]).astimezone()
+    end = datetime.fromisoformat(report["end"]).astimezone()
     generated_at = datetime.now().strftime("%b %-d, %Y %-I:%M %p")
 
     occupancy_labels = [_format_date_label(d["date"]) for d in report["occupancy_by_day"]]
     occupancy_values = [d["rate"] for d in report["occupancy_by_day"]]
     occupancy_chart = _bar_chart(
-        occupancy_labels, occupancy_values, color=ACCENT, value_formatter=_format_pct
+        occupancy_labels,
+        occupancy_values,
+        color=ACCENT,
+        value_formatter=_format_pct,
+        axis_formatter=lambda v: f"{round(v * 100)}%",
     )
 
     turnover_labels = [_format_date_label(d["date"]) for d in report["turnover_by_day"]]
     turnover_values = [float(d["arrivals"]) for d in report["turnover_by_day"]]
     turnover_chart = _bar_chart(
-        turnover_labels, turnover_values, color=ACCENT_STRONG, value_formatter=lambda v: f"{int(v)} arrivals"
+        turnover_labels,
+        turnover_values,
+        color=ACCENT_STRONG,
+        value_formatter=lambda v: f"{int(v)} arrivals",
+        axis_formatter=lambda v: f"{round(v)}",
     )
 
     hour_labels = [_format_hour_label(h["hour"]) for h in report["peak_hours"]]
     hour_values = [h["rate"] for h in report["peak_hours"]]
-    hour_chart = _bar_chart(hour_labels, hour_values, color=OCCUPIED, value_formatter=_format_pct)
+    hour_chart = _bar_chart(
+        hour_labels,
+        hour_values,
+        color=OCCUPIED,
+        value_formatter=_format_pct,
+        axis_formatter=lambda v: f"{round(v * 100)}%",
+    )
 
     dwell_chart = _dwell_bars(report["dwell_by_space"])
 
