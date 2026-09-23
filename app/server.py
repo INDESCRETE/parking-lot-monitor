@@ -1181,6 +1181,17 @@ live_detector = live_detection.LiveDetector(db)
 class Handler(BaseHTTPRequestHandler):
     server_version = "ParkingLotPOC/0.1"
 
+    def log_message(self, format: str, *args: Any) -> None:
+        # The dashboard polls several endpoints every 1-3 seconds (live
+        # snapshot, live status, detection progress). The default
+        # BaseHTTPRequestHandler logs a line per request to the console,
+        # which floods the terminal and makes it unusable for anything
+        # else. Only log real problems (4xx/5xx); routine 2xx/3xx traffic
+        # is silent.
+        status = str(args[1]) if len(args) > 1 else ""
+        if status[:1] in ("4", "5"):
+            super().log_message(format, *args)
+
     def do_GET(self) -> None:
         # Live-camera routes are polled every second or two (or held open as a
         # video stream), and never touch the database, so they are handled
