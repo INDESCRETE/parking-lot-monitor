@@ -246,6 +246,36 @@ def assign_detections_to_spaces(
     }
 
     for detection_id, detection in stored_detections:
+        # Area overlap is a much stronger signal of "which space is this car
+        # actually in" than the anchor point alone: the anchor is a single
+        # test point (see box_anchor/ANCHOR_Y_RATIO) that can cross into a
+        # neighboring space's polygon when two spaces are drawn close
+        # together, even when the car itself barely touches that neighbor.
+        # So try the best-overlapping space first, across ALL spaces, not
+        # just the ones containing the anchor.
+        overlap_space = None
+        overlap_score = 0.0
+        for space in spaces:
+            score = occupancy_overlap_score(space["polygon"], detection.box)
+            if score > overlap_score:
+                overlap_space = space
+                overlap_score = score
+
+        if overlap_space and overlap_score >= fallback_overlap_threshold:
+            candidates_by_space_id[overlap_space["id"]].append(
+                {
+                    "detection_id": detection_id,
+                    "score": overlap_score,
+                    "confidence": detection.confidence,
+                }
+            )
+            continue
+
+        # No space clears the area-overlap threshold outright -- this is
+        # usually a car that's mostly occluded or cropped at the frame edge.
+        # Fall back to the anchor point (near where the vehicle meets the
+        # ground), which is often still reliable even when visible area is
+        # small.
         anchor = box_anchor(detection.box, anchor_y_ratio)
         containing_spaces = [
             space
@@ -261,23 +291,6 @@ def assign_detections_to_spaces(
                 {
                     "detection_id": detection_id,
                     "score": 1.0,
-                    "confidence": detection.confidence,
-                }
-            )
-            continue
-
-        fallback_space = None
-        fallback_score = 0.0
-        for space in spaces:
-            score = occupancy_overlap_score(space["polygon"], detection.box)
-            if score > fallback_score:
-                fallback_space = space
-                fallback_score = score
-        if fallback_space and fallback_score >= fallback_overlap_threshold:
-            candidates_by_space_id[fallback_space["id"]].append(
-                {
-                    "detection_id": detection_id,
-                    "score": fallback_score,
                     "confidence": detection.confidence,
                 }
             )
