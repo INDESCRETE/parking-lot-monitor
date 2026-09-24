@@ -107,6 +107,10 @@ class LiveDetector:
         self._worker: Optional[threading.Thread] = None
         self._status_lock = threading.Lock()
         self._status: dict[str, dict[str, Any]] = {}
+        # What the detector saw on each camera's most recent frame (boxes,
+        # confidence, which space each box was matched to). Memory only, for
+        # troubleshooting via GET /api/cameras/<id>/live-debug.
+        self._last_debug: dict[str, dict[str, Any]] = {}
 
     def start(self) -> None:
         """Starts the background worker thread. Safe to call even if no live
@@ -146,6 +150,11 @@ class LiveDetector:
         with self._status_lock:
             entry = self._status.get(camera_id)
             return dict(entry) if entry else {"frames_processed": 0, "last_frame_at": None, "last_error": None}
+
+    def last_debug(self, camera_id: str) -> Optional[dict[str, Any]]:
+        with self._status_lock:
+            entry = self._last_debug.get(camera_id)
+            return dict(entry) if entry else None
 
     def _update_status(self, camera_id: str, **fields: Any) -> None:
         with self._status_lock:
@@ -224,6 +233,41 @@ class LiveDetector:
         occupied_by_space_id = detection_core.assign_detections_to_spaces(
             space_dicts, indexed_detections, ANCHOR_Y_RATIO, FALLBACK_OVERLAP_THRESHOLD
         )
+
+        winner_space_by_index = {
+            int(candidate["detection_id"]): space_id for space_id, candidate in occupied_by_space_id.items()
+        }
+        best_overlap_by_index = {}
+        for index, detection in indexed_detections:
+            scores = [
+                (detection_core.occupancy_overlap_score(space["polygon"], detection.box), space["id"])
+                for space in space_dicts
+            ]
+            best_overlap_by_index[index] = max(scores) if scores else (0.0, None)
+        label_by_id = {space["id"]: space.get("label") for space in spaces}
+        debug = {
+            "captured_at": captured_at,
+            "frame_size": list(rgb_image.size),
+            "crop_region": detection_core.crop_region_for_polygons(
+                [space["polygon"] for space in space_dicts], rgb_image.size
+            ),
+            "confidence_threshold": CONFIDENCE,
+            "detections": [
+                {
+                    "box": [round(v, 1) for v in detection.box],
+                    "confidence": round(detection.confidence, 3),
+                    "class_name": detection.class_name,
+                    "best_overlap": round(best_overlap_by_index[index][0], 3),
+                    "best_overlap_space": label_by_id.get(best_overlap_by_index[index][1]),
+                    "assigned_space": label_by_id.get(winner_space_by_index.get(index)),
+                }
+                for index, detection in indexed_detections
+            ],
+            "occupied_spaces": sorted(label_by_id[sid] for sid in occupied_by_space_id),
+            "space_polygons": {space["label"]: sd["polygon"] for space, sd in zip(spaces, space_dicts)},
+        }
+        with self._status_lock:
+            self._last_debug[camera_id] = debug
 
         min_occupied_seconds = camera.get("min_occupied_seconds")
         if min_occupied_seconds is None:

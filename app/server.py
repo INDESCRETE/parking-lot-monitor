@@ -1687,7 +1687,7 @@ class Handler(BaseHTTPRequestHandler):
     def handle_live_get(self) -> bool:
         """Serves the live-camera routes. Returns False if the path isn't one."""
         path = urlparse(self.path).path
-        match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|latest\.jpg|live\.mjpg)", path)
+        match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|live-debug|latest\.jpg|live\.mjpg)", path)
         if not match:
             return False
         camera_id, action = match.groups()
@@ -1695,6 +1695,8 @@ class Handler(BaseHTTPRequestHandler):
             status = live.get_status(camera_id)
             status["detection"] = live_detector.status(camera_id)
             self.send_json(status)
+        elif action == "live-debug":
+            self.send_json({"camera_id": camera_id, "last_frame": live_detector.last_debug(camera_id)})
         elif action == "latest.jpg":
             self.serve_latest_frame(camera_id)
         else:
