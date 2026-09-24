@@ -77,9 +77,6 @@ def main() -> None:
         args.model_size
     ]
     model = model_cls()
-    detections = detection_core.run_detector(model, rgb_image, CONFIDENCE)
-    print(f"{len(detections)} vehicle detection(s) at confidence >= {CONFIDENCE}\n")
-
     space_dicts = [
         {
             "id": s["id"],
@@ -90,6 +87,11 @@ def main() -> None:
         }
         for s in spaces
     ]
+    polygons = [s["polygon"] for s in space_dicts]
+    region = detection_core.crop_region_for_polygons(polygons, rgb_image.size)
+    print(f"Cropping to {region} before detection" if region else "Using the full frame (no crop)")
+    detections = detection_core.detect_vehicles(model, rgb_image, CONFIDENCE, polygons)
+    print(f"{len(detections)} vehicle detection(s) at confidence >= {CONFIDENCE} (duplicates removed)\n")
 
     indexed_detections = list(enumerate(detections))
     occupied_by_space_id = detection_core.assign_detections_to_spaces(

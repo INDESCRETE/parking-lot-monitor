@@ -191,7 +191,6 @@ class LiveDetector:
 
         model = self._get_model()
         rgb_image = detection_core.rgb_image_from_bytes(jpeg)
-        detections = detection_core.run_detector(model, rgb_image, CONFIDENCE)
         # Scale each space's polygon to this frame's actual size before
         # matching -- the live camera's snapshots can be (and for Rob's
         # reolink_live camera, were) a different resolution than whatever
@@ -211,6 +210,11 @@ class LiveDetector:
             }
             for space in spaces
         ]
+        # Crops to the marked spaces and drops duplicate boxes -- see
+        # detect_vehicles in app/detection_core.py.
+        detections = detection_core.detect_vehicles(
+            model, rgb_image, CONFIDENCE, [space["polygon"] for space in space_dicts]
+        )
         # assign_detections_to_spaces expects (detection_id, Detection) pairs
         # to hand back which one won a space, for storing in occupancy_
         # observations. Live mode never stores detections, so a throwaway

@@ -81,6 +81,111 @@ def run_detector(model: Any, rgb_image: Image.Image, confidence: float) -> list[
     return detections
 
 
+# --- Cropping to the marked spaces -------------------------------------------
+# The model always shrinks whatever image it's given down to a fixed working
+# size (576px across for "medium") before looking at it. When the parking
+# spaces only fill a small part of a wide camera frame, the cars end up just
+# a few dozen pixels across after that shrink -- too small to be seen
+# reliably. Cutting the frame down to the area around the marked spaces
+# first means that same fixed working size is spent on the lot instead of
+# the sky/walls/furniture around it, so every car comes out several times
+# bigger. Padding keeps cars that stick out past their outline (tall
+# vehicles seen at an angle, cars half in a space) inside the crop.
+CROP_PADDING_RATIO = 0.25  # of the spaces' own width/height, on each side
+CROP_MIN_PADDING_PX = 64
+# If the spaces (plus padding) already cover most of the frame, cropping
+# gains nothing -- just use the full frame.
+CROP_SKIP_IF_AREA_FRACTION = 0.80
+
+# DETR-style models (RF-DETR included) don't run the usual "merge
+# overlapping boxes" clean-up step, so one car can come back as two or three
+# nearly identical boxes. Left alone, a duplicate box that's shifted a bit
+# can land on the neighboring space and mark it occupied when it isn't.
+DUPLICATE_IOU_THRESHOLD = 0.5
+
+
+def box_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    """Overlap between two boxes as intersection / union (0 = apart, 1 = identical)."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+    if inter <= 0:
+        return 0.0
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def remove_duplicate_detections(
+    detections: list[Detection], iou_threshold: float = DUPLICATE_IOU_THRESHOLD
+) -> list[Detection]:
+    """Keeps the most confident box out of any group of boxes that overlap
+    by at least `iou_threshold` -- i.e. one box per vehicle. Class-blind on
+    purpose: a toy bus reported once as "bus" and once as "car" is still one
+    vehicle."""
+    kept: list[Detection] = []
+    for detection in sorted(detections, key=lambda d: d.confidence, reverse=True):
+        if all(box_iou(detection.box, other.box) < iou_threshold for other in kept):
+            kept.append(detection)
+    return kept
+
+
+def crop_region_for_polygons(
+    polygons: list[list[dict[str, float]]],
+    image_size: tuple[int, int],
+) -> tuple[int, int, int, int] | None:
+    """The rectangle (left, top, right, bottom) around every space polygon,
+    padded and clamped to the frame -- or None when cropping wouldn't help
+    (no spaces, or they already cover most of the frame)."""
+    points = [p for polygon in polygons for p in polygon]
+    if not points:
+        return None
+    width, height = image_size
+    min_x = min(p["x"] for p in points)
+    max_x = max(p["x"] for p in points)
+    min_y = min(p["y"] for p in points)
+    max_y = max(p["y"] for p in points)
+    pad_x = max(CROP_MIN_PADDING_PX, (max_x - min_x) * CROP_PADDING_RATIO)
+    pad_y = max(CROP_MIN_PADDING_PX, (max_y - min_y) * CROP_PADDING_RATIO)
+    left = int(max(0, min_x - pad_x))
+    top = int(max(0, min_y - pad_y))
+    right = int(min(width, max_x + pad_x + 1))
+    bottom = int(min(height, max_y + pad_y + 1))
+    if right - left < 2 or bottom - top < 2:
+        return None
+    if (right - left) * (bottom - top) >= CROP_SKIP_IF_AREA_FRACTION * width * height:
+        return None
+    return (left, top, right, bottom)
+
+
+def detect_vehicles(
+    model: Any,
+    rgb_image: Image.Image,
+    confidence: float,
+    polygons: list[list[dict[str, float]]] | None = None,
+) -> list[Detection]:
+    """The one entry point every pipeline uses to find vehicles in a frame:
+    crops to the marked spaces when that helps (see CROP_* above), runs the
+    model, shifts the boxes back into full-frame coordinates (so they still
+    line up with the space outlines), and drops duplicate boxes."""
+    region = crop_region_for_polygons(polygons or [], rgb_image.size)
+    if region is None:
+        detections = run_detector(model, rgb_image, confidence)
+    else:
+        left, top, _, _ = region
+        detections = [
+            Detection(
+                class_id=d.class_id,
+                class_name=d.class_name,
+                confidence=d.confidence,
+                box=(d.box[0] + left, d.box[1] + top, d.box[2] + left, d.box[3] + top),
+            )
+            for d in run_detector(model, rgb_image.crop(region), confidence)
+        ]
+    return remove_duplicate_detections(detections)
+
+
 def box_to_json(box: tuple[float, float, float, float]) -> dict[str, float]:
     x1, y1, x2, y2 = box
     return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}

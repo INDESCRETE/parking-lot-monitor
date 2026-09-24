@@ -20,8 +20,8 @@ from app.detection_core import (  # noqa: E402  (must come after the sys.path li
     Detection,
     assign_detections_to_spaces,
     box_to_json,
+    detect_vehicles,
     load_rgb_image,
-    run_detector,
     scale_polygon,
 )
 from app.intervals import (  # noqa: E402
@@ -271,7 +271,13 @@ def main() -> None:
         for index, image in enumerate(images):
             image_path = IMAGES_DIR / image["camera_id"] / image["filename"]
             rgb_image = load_rgb_image(image_path)
-            detections = run_detector(model, rgb_image, args.confidence)
+            polygons = [
+                scale_polygon(
+                    space["polygon"], (space.get("reference_width"), space.get("reference_height")), rgb_image.size
+                )
+                for space in spaces
+            ]
+            detections = detect_vehicles(model, rgb_image, args.confidence, polygons)
             stored_detections = store_detections(conn, image["id"], model_name, detections)
             store_occupancy(
                 conn,
