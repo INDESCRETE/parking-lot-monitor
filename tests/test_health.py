@@ -70,13 +70,7 @@ class Harness:
 
     def start(self):
         # Don't launch threads in tests; do what start() does, then drive tick() by hand.
-        m = self.monitor
-        m.health_dir.mkdir(parents=True, exist_ok=True)
-        prev = health._read_json(m.state_path)
-        m._state = prev if isinstance(prev, dict) else {}
-        m._report_previous_downtime(prev if isinstance(prev, dict) else None)
-        m._state.update(started_at=m.started_at.isoformat(), clean_shutdown=False)
-        m._save_state()
+        self.monitor.load_previous_state()
 
     def tick(self):
         self.monitor._last_heartbeat = 0.0
@@ -239,6 +233,21 @@ class HealthTests(unittest.TestCase):
         self.assertNotIn("Test Lot: Internet back", h.titles())
 
     # -- disk / backups / check-in / config -------------------------------------------
+    def test_open_problem_not_repeated_after_restart(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        full = {"percent_used": 96.7, "free_gb": 8.2, "database_mb": 3.0}
+        h.monitor.disk_usage = lambda: full
+        h.tick()
+        h.monitor.mark_clean_shutdown()
+        self.clock.advance(seconds=20)
+        h2 = self.restart(h); h2.start()
+        h2.monitor.disk_usage = lambda: full
+        h2.tick(); h2.tick()
+        self.assertEqual(h2.titles(), [])  # still full, already told
+        h2.monitor.disk_usage = lambda: {"percent_used": 50.0, "free_gb": 100.0, "database_mb": 3.0}
+        h2.tick()
+        self.assertEqual(h2.titles(), ["Test Lot: Disk space OK"])
+
     def test_disk_warning(self):
         h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
         h.monitor.disk_usage = lambda: {"percent_used": 91.0, "free_gb": 4.0, "database_mb": 120.0}

@@ -448,12 +448,7 @@ class HealthMonitor:
 
     # -- lifecycle --------------------------------------------------------
     def start(self) -> None:
-        self.health_dir.mkdir(parents=True, exist_ok=True)
-        previous = _read_json(self.state_path)
-        self._state = previous if isinstance(previous, dict) else {}
-        self._report_previous_downtime(previous if isinstance(previous, dict) else None)
-        self._state.update(started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid())
-        self._save_state()
+        self.load_previous_state()
         if self.config_error:
             self.notifier.notify("Alert settings problem", f"data/alerts.json: {self.config_error}", "high", "warning", "config")
         channels = configured_channels(self.config)
@@ -462,6 +457,20 @@ class HealthMonitor:
         self.notifier.start()
         self._thread = threading.Thread(target=self._run, daemon=True, name="health-monitor")
         self._thread.start()
+
+    def load_previous_state(self) -> None:
+        """Reads what the last run left behind, reports any downtime, and picks up
+        problems that were already alerted on, so a restart doesn't repeat them."""
+        self.health_dir.mkdir(parents=True, exist_ok=True)
+        previous = _read_json(self.state_path)
+        self._state = previous if isinstance(previous, dict) else {}
+        saved = self._state.get("problems")
+        if isinstance(saved, dict):
+            with self._lock:
+                self._problems = {k: v for k, v in saved.items() if isinstance(v, dict) and "since" in v}
+        self._report_previous_downtime(previous if isinstance(previous, dict) else None)
+        self._state.update(started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid())
+        self._save_state()
 
     def stop(self) -> None:
         self._halt.set()
@@ -473,6 +482,8 @@ class HealthMonitor:
         self._save_state()
 
     def _save_state(self) -> None:
+        with self._lock:
+            self._state["problems"] = {k: dict(v) for k, v in self._problems.items()}
         try:
             _atomic_write_json(self.state_path, self._state)
         except OSError as exc:
@@ -567,6 +578,7 @@ class HealthMonitor:
             if key in self._problems:
                 return
             self._problems[key] = {"since": since.isoformat(), "title": title, "message": message}
+        self._save_state()
         self.notifier.notify(title, message, priority, "warning", key.split(":")[0])
 
     def _resolve_problem(self, key: str, title: str, message_fn: Callable[[datetime, datetime], str]) -> None:
@@ -574,6 +586,7 @@ class HealthMonitor:
             problem = self._problems.pop(key, None)
         if problem is None:
             return
+        self._save_state()
         since = parse_iso(problem["since"]) or self.clock()
         self.notifier.notify(title, message_fn(since, self.clock()), "default", "white_check_mark", key.split(":")[0] + "_ok")
 
