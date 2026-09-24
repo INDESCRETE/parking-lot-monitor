@@ -66,7 +66,6 @@ const hourChart = document.querySelector("#hourChart");
 const dayHourChart = document.querySelector("#dayHourChart");
 const dayChartTitle = document.querySelector("#dayChartTitle");
 const dayPrevButton = document.querySelector("#dayPrevButton");
-const dayTodayButton = document.querySelector("#dayTodayButton");
 const dayNextButton = document.querySelector("#dayNextButton");
 const dwellChart = document.querySelector("#dwellChart");
 
@@ -542,7 +541,6 @@ function renderDayChart() {
   const isToday = state.dayIso === today;
   dayChartTitle.textContent = formatDayTitle(state.dayIso);
   dayNextButton.disabled = state.dayIso >= today;
-  dayTodayButton.disabled = isToday;
 
   const report = state.dayReport;
   if (!report) {
@@ -626,7 +624,6 @@ cameraFilterSelect.addEventListener("change", async () => {
 
 dayPrevButton.addEventListener("click", () => changeDay(addDaysIso(state.dayIso || todayLocalIso(), -1)));
 dayNextButton.addEventListener("click", () => changeDay(addDaysIso(state.dayIso || todayLocalIso(), 1)));
-dayTodayButton.addEventListener("click", () => changeDay(todayLocalIso()));
 
 rangeSelect.addEventListener("change", async () => {
   state.rangeMode = rangeSelect.value;
