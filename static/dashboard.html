@@ -113,8 +113,23 @@
         </section>
 
         <section class="chart-panel">
-          <h2>Peak / Off-Peak Hours</h2>
-          <p class="panel-sub">Average occupancy rate by hour of day, across the full date range.</p>
+          <div class="panel-header">
+            <div>
+              <h2>Hour by Hour: <span id="dayChartTitle">Today</span></h2>
+              <p class="panel-sub">How full the lot was during each hour of one single day. Use the arrows to step through past days (this chart ignores the Range setting).</p>
+            </div>
+            <div class="day-nav" role="group" aria-label="Choose a day">
+              <button type="button" id="dayPrevButton" title="Previous day" aria-label="Previous day">&#9664;</button>
+              <button type="button" id="dayTodayButton">Today</button>
+              <button type="button" id="dayNextButton" title="Next day" aria-label="Next day">&#9654;</button>
+            </div>
+          </div>
+          <div id="dayHourChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Average by Hour of Day</h2>
+          <p class="panel-sub">Typical occupancy for each hour, averaged across every day in the selected range. Use this to spot peak and off-peak times.</p>
           <div id="hourChart" class="chart-svg-wrap"></div>
         </section>
 

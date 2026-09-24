@@ -389,8 +389,8 @@ def render_report_html(
   </section>
 
   <section class="panel">
-    <h2>Peak / Off-Peak Hours</h2>
-    <p class="panel-sub">Average occupancy rate by hour of day, across the full date range.</p>
+    <h2>Average by Hour of Day</h2>
+    <p class="panel-sub">Typical occupancy for each hour, averaged across every day in the report's date range.</p>
     {hour_chart}
   </section>
 

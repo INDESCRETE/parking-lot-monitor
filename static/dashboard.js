@@ -32,6 +32,14 @@ const state = {
   lotId: null,
   cameraId: "",
   rangeMode: "7",
+  // Single-day "Hour by Hour" chart: which local calendar day it shows,
+  // independent of the Range dropdown (which only drives the averaged
+  // charts). dayFollowsToday keeps it on "today" across midnight if the
+  // tab is left open.
+  dayIso: null,
+  dayFollowsToday: true,
+  dayReport: null,
+  dayRequestId: 0,
 };
 
 const clientSelect = document.querySelector("#clientSelect");
@@ -55,6 +63,11 @@ const statPeakSub = document.querySelector("#statPeakSub");
 const occupancyChart = document.querySelector("#occupancyChart");
 const turnoverChart = document.querySelector("#turnoverChart");
 const hourChart = document.querySelector("#hourChart");
+const dayHourChart = document.querySelector("#dayHourChart");
+const dayChartTitle = document.querySelector("#dayChartTitle");
+const dayPrevButton = document.querySelector("#dayPrevButton");
+const dayTodayButton = document.querySelector("#dayTodayButton");
+const dayNextButton = document.querySelector("#dayNextButton");
 const dwellChart = document.querySelector("#dwellChart");
 
 function escapeHtml(value) {
@@ -169,7 +182,7 @@ function niceTicks(maxValue, targetCount = 4) {
   return { niceMax, ticks };
 }
 
-function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, nowIndex = null, width = 760, height = 220 }) {
+function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, nowIndex = null, showZero = false, width = 760, height = 220 }) {
   if (labels.length === 0) {
     return '<p class="empty-note">No data in this range.</p>';
   }
@@ -196,7 +209,14 @@ function barChartSvg(labels, values, { color, valueFormatter, axisFormatter, now
     const value = values[i];
     const x = paddingLeft + i * gap + (gap - barWidth) / 2;
     lastX = x;
-    if (value !== null && value !== undefined) {
+    if (showZero && value === 0) {
+      // A measured 0% (the lot was watched and nothing was parked) gets a
+      // thin stub on the baseline, so it reads differently from a gap
+      // (no data at all for that hour).
+      bars.push(
+        `<rect x="${x.toFixed(1)}" y="${(paddingTop + plotHeight - 2).toFixed(1)}" width="${barWidth.toFixed(1)}" height="2" fill="${mutedColor}" rx="1"><title>${escapeHtml(`${label}: ${valueFormatter(0)}`)}</title></rect>`
+      );
+    } else if (value !== null && value !== undefined) {
       const barHeight = (value / niceMax) * plotHeight;
       const y = paddingTop + (plotHeight - barHeight);
       const title = `${label}: ${valueFormatter(value)}`;
@@ -420,6 +440,7 @@ async function loadCameras() {
     state.cameraId = "";
     cameraFilterSelect.value = "";
     cameraFilterSelect.disabled = state.cameras.length === 0;
+    loadDayChart();
     await loadReport();
   } catch (err) {
     setStatus(`Couldn't load cameras: ${err.message}`, { error: true });
@@ -444,6 +465,7 @@ async function loadReport() {
     renderReport(report);
     setStatus("");
     dashboardContent.hidden = false;
+    renderDayChart();
   } catch (err) {
     setStatus(`Couldn't load analytics: ${err.message}`, { error: true });
   }
@@ -479,18 +501,104 @@ function renderReport(report) {
 
   const hourLabels = report.peak_hours.map((h) => formatHourLabel(h.hour));
   const hourValues = report.peak_hours.map((h) => h.rate);
-  // Only draw the "now" line when the selected range's end is today --
-  // otherwise (a fully historical range) every hour should already have a
-  // complete day's worth of data behind it, and the marker would be noise.
-  const rangeEndsToday = new Date(report.end).toDateString() === new Date().toDateString();
+  // An average across many days -- no "now" line here; the single-day
+  // "Hour by Hour" chart is where "what's happening today" lives.
   hourChart.innerHTML = barChartSvg(hourLabels, hourValues, {
     color: cssVar("--occupied", OCCUPIED),
-    valueFormatter: formatPct,
+    valueFormatter: (v) => `${formatPct(v)} average`,
     axisFormatter: (v) => `${Math.round(v * 100)}%`,
-    nowIndex: rangeEndsToday ? new Date().getHours() : null,
   });
 
   dwellChart.innerHTML = dwellBarsSvg(report.dwell_by_space);
+}
+
+/** Start/end timestamps for one local calendar day. For today the end is
+ * "now", so hours that haven't happened yet correctly stay empty. Sent as
+ * precise timestamps (not bare dates) so the server's inclusive-end-date
+ * rule doesn't stretch the window to two days. */
+function localDayBounds(isoDate) {
+  const [year, month, day] = isoDate.split("-").map(Number);
+  const start = new Date(year, month - 1, day);
+  let end = new Date(year, month - 1, day + 1);
+  const now = new Date();
+  if (end > now) end = now;
+  return { start: start.toISOString(), end: end.toISOString() };
+}
+
+function formatDayTitle(isoDate) {
+  const today = todayLocalIso();
+  const [year, month, day] = isoDate.split("-").map(Number);
+  const date = new Date(year, month - 1, day);
+  const short = date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (isoDate === today) return `Today, ${short}`;
+  if (isoDate === addDaysIso(today, -1)) return `Yesterday, ${short}`;
+  return date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+}
+
+function renderDayChart() {
+  const today = todayLocalIso();
+  if (state.dayFollowsToday) state.dayIso = today;
+  if (!state.dayIso) state.dayIso = today;
+  const isToday = state.dayIso === today;
+  dayChartTitle.textContent = formatDayTitle(state.dayIso);
+  dayNextButton.disabled = state.dayIso >= today;
+  dayTodayButton.disabled = isToday;
+
+  const report = state.dayReport;
+  if (!report) {
+    dayHourChart.innerHTML = '<p class="empty-note">Loading…</p>';
+    return;
+  }
+  const values = report.peak_hours.map((h) => h.rate);
+  if (values.every((v) => v === null || v === undefined)) {
+    dayHourChart.innerHTML = '<p class="empty-note">No monitoring data for this day.</p>';
+    return;
+  }
+  dayHourChart.innerHTML = barChartSvg(
+    report.peak_hours.map((h) => formatHourLabel(h.hour)),
+    values,
+    {
+      color: cssVar("--occupied", OCCUPIED),
+      valueFormatter: (v) => `${formatPct(v)} occupied`,
+      axisFormatter: (v) => `${Math.round(v * 100)}%`,
+      showZero: true,
+      nowIndex: isToday ? new Date().getHours() : null,
+    }
+  );
+}
+
+/** Fetches one day's numbers from the same /api/reports/metrics endpoint
+ * the rest of the dashboard uses -- for a single day, its hour-of-day
+ * breakdown IS that day's hour-by-hour occupancy. A request counter drops
+ * any response that arrives after the user already moved on (switched
+ * day, lot or camera). */
+async function loadDayChart({ quiet = false } = {}) {
+  if (!state.lotId) return;
+  if (state.dayFollowsToday || !state.dayIso) state.dayIso = todayLocalIso();
+  const requestId = ++state.dayRequestId;
+  if (!quiet) {
+    state.dayReport = null;
+    renderDayChart();
+  }
+  try {
+    const { start, end } = localDayBounds(state.dayIso);
+    const params = new URLSearchParams({ lot_id: state.lotId, start, end });
+    if (state.cameraId) params.set("camera_id", state.cameraId);
+    const report = await fetchJson(`/api/reports/metrics?${params.toString()}`);
+    if (requestId !== state.dayRequestId) return;
+    state.dayReport = report;
+    renderDayChart();
+  } catch (err) {
+    if (requestId !== state.dayRequestId) return;
+    dayHourChart.innerHTML = `<p class="empty-note">Couldn't load this day: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+function changeDay(isoDate) {
+  const today = todayLocalIso();
+  state.dayIso = isoDate > today ? today : isoDate;
+  state.dayFollowsToday = state.dayIso === today;
+  loadDayChart();
 }
 
 function initCustomRangeDefaults() {
@@ -512,8 +620,13 @@ lotSelect.addEventListener("change", async () => {
 
 cameraFilterSelect.addEventListener("change", async () => {
   state.cameraId = cameraFilterSelect.value;
+  loadDayChart();
   await loadReport();
 });
+
+dayPrevButton.addEventListener("click", () => changeDay(addDaysIso(state.dayIso || todayLocalIso(), -1)));
+dayNextButton.addEventListener("click", () => changeDay(addDaysIso(state.dayIso || todayLocalIso(), 1)));
+dayTodayButton.addEventListener("click", () => changeDay(todayLocalIso()));
 
 rangeSelect.addEventListener("change", async () => {
   state.rangeMode = rangeSelect.value;
@@ -541,6 +654,7 @@ window.addEventListener("themechange", () => {
   if (state.lastReport) {
     renderReport(state.lastReport);
   }
+  renderDayChart();
 });
 
 // The Peak/Off-Peak Hours chart's "now" line is computed at draw time from
@@ -553,6 +667,14 @@ window.addEventListener("themechange", () => {
 setInterval(() => {
   if (state.lastReport) {
     renderReport(state.lastReport);
+  }
+  // The single-day chart, when it's showing today, re-fetches so the
+  // current hour's bar (and the "now" line) keep up with the live camera.
+  // Past days never change, so they're just redrawn.
+  if (state.dayFollowsToday) {
+    loadDayChart({ quiet: true });
+  } else {
+    renderDayChart();
   }
 }, 60000);
 

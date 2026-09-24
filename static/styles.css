@@ -683,6 +683,26 @@ body.dashboard-body {
   font-size: 13px;
 }
 
+.panel-header {
+  align-items: flex-start;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: space-between;
+}
+
+.day-nav {
+  display: flex;
+  flex-shrink: 0;
+  gap: 6px;
+}
+
+.day-nav button {
+  font-size: 13px;
+  min-height: 30px;
+  padding: 0 10px;
+}
+
 @media (max-width: 800px) {
   .dashboard-main {
     padding: 16px 14px 48px;
