@@ -24,6 +24,7 @@ restarting a lot while testing Live View specifically.
 """
 from __future__ import annotations
 
+import signal
 import subprocess
 import sys
 import time
@@ -68,7 +69,15 @@ def describe_changes(before: dict[Path, float], after: dict[Path, float]) -> str
     return ", ".join(names) if names else "a watched file"
 
 
+def _raise_keyboard_interrupt(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main() -> None:
+    # When run as a background service (deploy/macos), "stop" arrives as
+    # SIGTERM rather than Ctrl+C. Treat it the same, so the server child is
+    # shut down cleanly instead of being left running and holding the port.
+    signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
     print(f"Watching for .py changes under: {', '.join(str(d.relative_to(ROOT)) for d in WATCH_DIRS)}")
     proc = start_server()
     last_snapshot = snapshot()
