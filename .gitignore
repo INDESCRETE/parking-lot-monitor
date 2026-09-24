@@ -19,3 +19,8 @@ data/images/**/*
 # Live camera: credentials, and the single newest frame per camera
 data/camera_sources.json
 data/live/
+
+# Health monitor: alert settings (may hold an email password), state, outbox, backups
+data/alerts.json
+data/health/
+data/backups/

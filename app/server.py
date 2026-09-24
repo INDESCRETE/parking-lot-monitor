@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import analytics, live, live_detection, reports
+from app import analytics, health, live, live_detection, reports
 from app.intervals import DEFAULT_MIN_OCCUPIED_SECONDS, recompute_space_intervals
 from app.video_extract import FfmpegUnavailable, extract_frames
 
@@ -1178,6 +1179,29 @@ db = Database(DB_PATH)
 live_detector = live_detection.LiveDetector(db)
 
 
+def health_camera_statuses() -> list[dict[str, Any]]:
+    """What the health monitor needs to know about each live camera."""
+    statuses = []
+    for camera_id in live.configured_camera_ids():
+        camera = db.get_camera(camera_id) or {}
+        statuses.append(
+            {
+                "camera_id": camera_id,
+                "name": camera.get("name") or camera_id,
+                "grabber": live.get_status(camera_id),
+                "detection": live_detector.status(camera_id),
+            }
+        )
+    return statuses
+
+
+health_monitor = health.HealthMonitor(
+    DB_PATH,
+    camera_statuses=health_camera_statuses,
+    config_error_fn=live.get_config_error,
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ParkingLotPOC/0.1"
 
@@ -1211,8 +1235,10 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / path.removeprefix("/static/"))
         elif path.startswith("/media/"):
             self.serve_media(path)
+        elif path == "/health":
+            self.serve_file(STATIC_DIR / "health.html")
         elif path == "/api/health":
-            self.send_json({"ok": True})
+            self.send_json(health_monitor.status())
         elif path == "/api/cameras":
             lot_id_raw = query.get("lot_id", [None])[0]
             if lot_id_raw is None:
@@ -1278,6 +1304,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             trigger_detection(camera_id)
             self.send_json(get_detection_status(camera_id), HTTPStatus.ACCEPTED)
+        elif parsed.path == "/api/health/test-alert":
+            alert = health_monitor.send_test()
+            self.send_json({"queued": True, "channels": health.configured_channels(health_monitor.config), "alert": alert})
         elif parsed.path == "/api/spaces":
             payload = self.read_json()
             try:
@@ -1784,6 +1813,10 @@ def main() -> None:
     )
     if live_cameras:
         print(f"Live camera grabbers running for: {', '.join(live_cameras)}")
+    health_monitor.start()
+    # A normal stop (Ctrl+C, the dev server's restart, or `systemctl stop` on the
+    # lot computer) is recorded as clean, so only real outages trigger an alert.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
     host = "127.0.0.1"
     starting_port = int(os.environ.get("PORT", "8000"))
     server = None
@@ -1799,7 +1832,14 @@ def main() -> None:
 
     address = server.server_address
     print(f"Parking Lot Monitor POC running at http://{address[0]}:{address[1]}")
-    server.serve_forever()
+    print(f"System health and alerts: http://{address[0]}:{address[1]}/health")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        health_monitor.mark_clean_shutdown()
+        server.server_close()
 
 
 if __name__ == "__main__":

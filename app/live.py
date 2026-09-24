@@ -450,6 +450,18 @@ def get_source(camera_id: str) -> Optional[CameraSource]:
     return grabber.source if grabber else None
 
 
+def configured_camera_ids() -> list:
+    """Ids of every camera that currently has a running grabber."""
+    with _registry_lock:
+        return sorted(_grabbers)
+
+
+def get_config_error() -> Optional[str]:
+    """Why camera_sources.json couldn't be used, or None if it's fine."""
+    with _registry_lock:
+        return _config_error
+
+
 def get_status(camera_id: str) -> dict:
     with _registry_lock:
         grabber = _grabbers.get(camera_id)
