@@ -25,6 +25,16 @@ if [ "${1:-}" = "uninstall" ]; then
   exit 0
 fi
 
+# macOS won't let background services read Documents, Desktop or Downloads
+# (they fail with "Operation not permitted"), so the project must live elsewhere.
+case "$REPO" in
+  "$HOME/Documents"*|"$HOME/Desktop"*|"$HOME/Downloads"*)
+    echo "The project is in $REPO."
+    echo "macOS blocks background services from reading that folder. Move it first, e.g.:"
+    echo "  mv \"$REPO\" \"$HOME/$(basename "$REPO")\""
+    exit 1 ;;
+esac
+
 PYTHON="$REPO/.venv/bin/python3"
 [ -x "$PYTHON" ] || { echo "Can't find $PYTHON (the project's .venv)"; exit 1; }
 
