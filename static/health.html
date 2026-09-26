@@ -33,6 +33,17 @@
       .alert-row:first-child { border-top: none; }
       .alert-time { color: var(--muted); font-size: 12px; }
       #testResult { margin-left: 10px; }
+      .alerts-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+      .alerts-head h2 { margin: 0; }
+      .alert-filter { display: inline-flex; gap: 6px; }
+      .alert-filter button { font-size: 13px; padding: 4px 10px; }
+      .alert-filter button.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+      .alert-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: start; }
+      .alert-body { min-width: 0; }
+      .alert-keep { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      .alert-keep.soon { color: var(--danger); }
+      .save-btn { font-size: 12px; padding: 4px 10px; white-space: nowrap; }
+      .save-btn.saved { border-color: var(--accent); background: var(--accent); color: #fff; }
     </style>
   </head>
   <body class="dashboard-body">
@@ -68,7 +79,14 @@
       </section>
 
       <section class="health-card">
-        <h2>Recent alerts</h2>
+        <div class="alerts-head">
+          <h2>Alerts</h2>
+          <div class="alert-filter" role="group" aria-label="Show">
+            <button type="button" data-filter="all" class="active" aria-pressed="true">All <span id="countAll"></span></button>
+            <button type="button" data-filter="saved" aria-pressed="false">Saved <span id="countSaved"></span></button>
+          </div>
+        </div>
+        <p class="muted" id="keepNote" style="margin:0 0 8px">Alerts are deleted after 30 days unless you save them.</p>
         <div id="alertList" class="muted">None yet.</div>
       </section>
     </main>
@@ -125,18 +143,76 @@
         if (h.last_send_error) rows.push(["Last send error", h.last_send_error]);
         rows.forEach(function (r) { s.appendChild(el("dt", r[0])); s.appendChild(el("dd", r[1])); });
 
+        lastHealth = h;
+        renderAlerts();
+      }
+      var lastHealth = null;
+      var alertFilter = "all";
+      function keepText(al) {
+        if (al.saved) return { text: "Saved. Kept until you unsave it.", soon: false };
+        var ms = new Date(al.delete_at) - Date.now();
+        var hours = Math.max(0, Math.round(ms / 3600000));
+        var suffix = al.unsaved_at ? " unless saved again" : "";
+        if (ms < 48 * 3600000) return { text: "Deletes in " + (hours < 1 ? "under an hour" : hours + (hours === 1 ? " hour" : " hours")) + suffix, soon: true };
+        return { text: "Deletes " + new Date(al.delete_at).toLocaleDateString([], { month: "short", day: "numeric" }) + suffix, soon: false };
+      }
+      function renderAlerts() {
+        var h = lastHealth;
+        if (!h) return;
+        var all = h.recent_alerts || [];
+        var counts = h.alert_counts || { total: all.length, saved: 0 };
+        document.getElementById("countAll").textContent = "(" + counts.total + ")";
+        document.getElementById("countSaved").textContent = "(" + counts.saved + ")";
+        if (h.alert_keep_days) {
+          document.getElementById("keepNote").textContent = "Alerts are deleted after " + h.alert_keep_days +
+            " days unless you save them. Unsaving an older alert gives you " + h.alert_unsave_grace_hours + " hours to change your mind.";
+        }
+        var shown = alertFilter === "saved" ? all.filter(function (al) { return al.saved; }) : all;
         var a = document.getElementById("alertList");
         a.replaceChildren();
-        if (!(h.recent_alerts || []).length) { a.textContent = "None yet."; a.className = "muted"; return; }
+        if (!shown.length) {
+          a.textContent = alertFilter === "saved" ? "No saved alerts. Press Save on an alert to keep it." : "None yet.";
+          a.className = "muted";
+          return;
+        }
         a.className = "";
-        h.recent_alerts.forEach(function (al) {
+        shown.forEach(function (al) {
           var row = el("div", null, "alert-row");
-          row.appendChild(el("div", when(al.created_at), "alert-time"));
-          row.appendChild(el("strong", al.title));
-          row.appendChild(el("div", al.message));
+          var body = el("div", null, "alert-body");
+          body.appendChild(el("div", when(al.created_at), "alert-time"));
+          body.appendChild(el("strong", al.title));
+          body.appendChild(el("div", al.message));
+          var keep = keepText(al);
+          body.appendChild(el("div", keep.text, "alert-keep" + (keep.soon ? " soon" : "")));
+          row.appendChild(body);
+          var btn = el("button", al.saved ? "Saved" : "Save", "save-btn" + (al.saved ? " saved" : ""));
+          btn.type = "button";
+          btn.setAttribute("aria-pressed", al.saved ? "true" : "false");
+          btn.title = al.saved ? "Unsave (it will then be deleted on the normal schedule)" : "Keep this alert until you unsave it";
+          btn.addEventListener("click", function () { toggleSaved(al, btn); });
+          row.appendChild(btn);
           a.appendChild(row);
         });
       }
+      function toggleSaved(al, btn) {
+        btn.disabled = true;
+        fetch("/api/health/alerts/" + al.id + "/saved", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ saved: !al.saved }),
+        }).then(function (r) { return r.json(); }).then(refresh).catch(function () { btn.disabled = false; });
+      }
+      document.querySelectorAll(".alert-filter button").forEach(function (b) {
+        b.addEventListener("click", function () {
+          alertFilter = b.getAttribute("data-filter");
+          document.querySelectorAll(".alert-filter button").forEach(function (x) {
+            var on = x === b;
+            x.classList.toggle("active", on);
+            x.setAttribute("aria-pressed", on ? "true" : "false");
+          });
+          renderAlerts();
+        });
+      });
       function refresh() {
         fetch("/api/health").then(function (r) { return r.json(); }).then(render).catch(function () {
           document.getElementById("overallDot").className = "dot bad";

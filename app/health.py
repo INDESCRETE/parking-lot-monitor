@@ -62,7 +62,6 @@ HEARTBEAT_INTERVAL_SECONDS = 60.0
 SEND_RETRY_SECONDS = 30.0
 SEND_TIMEOUT_SECONDS = 10.0
 MAX_OUTBOX = 200
-MAX_LOG_BYTES = 1_000_000
 LATE_DELIVERY_SECONDS = 120.0
 
 DEFAULT_CONFIG: dict = {
@@ -272,6 +271,129 @@ def configured_channels(config: dict) -> list:
     return channels
 
 
+# Alert history: every alert is kept for HISTORY_KEEP_DAYS, then deleted,
+# unless it's been saved. Saved alerts stay until they're unsaved. An alert
+# unsaved after it's already past HISTORY_KEEP_DAYS gets UNSAVE_GRACE_HOURS
+# before it goes, so an accidental unsave can be undone.
+HISTORY_KEEP_DAYS = 30
+UNSAVE_GRACE_HOURS = 24
+MAX_HISTORY = 5000  # safety cap; the oldest unsaved alerts go first
+
+
+class AlertHistory:
+    """Every alert ever sent, stored in data/health/alerts.json, each with a
+    "saved" flag. Thread-safe."""
+
+    def __init__(self, path: Path, clock: Callable[[], datetime] = utc_now, legacy_logs: tuple = ()):
+        self.path = path
+        self.clock = clock
+        self._lock = threading.Lock()
+        loaded = _read_json(path)
+        if isinstance(loaded, list):
+            self._items: list = [a for a in loaded if isinstance(a, dict) and a.get("id")]
+        else:
+            self._items = self._import_legacy(legacy_logs)
+            self._save()
+
+    @staticmethod
+    def _import_legacy(paths: tuple) -> list:
+        """Carries over alerts from the older one-line-per-alert log files."""
+        items = []
+        for path in paths:
+            try:
+                lines = Path(path).read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("created_at"):
+                    items.append(
+                        {
+                            "id": secrets.token_hex(6),
+                            "created_at": entry["created_at"],
+                            "kind": entry.get("kind", "info"),
+                            "title": entry.get("title", ""),
+                            "message": entry.get("message", ""),
+                            "priority": entry.get("priority", "default"),
+                            "saved": False,
+                            "unsaved_at": None,
+                        }
+                    )
+        items.sort(key=lambda a: a["created_at"])
+        return items
+
+    def _save(self) -> None:
+        try:
+            _atomic_write_json(self.path, self._items)
+        except OSError:
+            pass
+
+    def add(self, alert: dict) -> dict:
+        entry = {k: alert[k] for k in ("id", "created_at", "kind", "title", "message", "priority")}
+        entry.update(saved=False, unsaved_at=None)
+        with self._lock:
+            self._items.append(entry)
+            if len(self._items) > MAX_HISTORY:
+                unsaved = [a for a in self._items if not a["saved"]]
+                drop = {a["id"] for a in unsaved[: len(self._items) - MAX_HISTORY]}
+                self._items = [a for a in self._items if a["id"] not in drop]
+            self._save()
+        return dict(entry)
+
+    def delete_at(self, entry: dict) -> Optional[datetime]:
+        """When this alert will be deleted, or None while it's saved."""
+        if entry.get("saved"):
+            return None
+        created = parse_iso(entry["created_at"]) or self.clock()
+        when = created + timedelta(days=HISTORY_KEEP_DAYS)
+        unsaved_at = parse_iso(entry.get("unsaved_at"))
+        if unsaved_at is not None:
+            when = max(when, unsaved_at + timedelta(hours=UNSAVE_GRACE_HOURS))
+        return when
+
+    def set_saved(self, alert_id: str, saved: bool) -> Optional[dict]:
+        with self._lock:
+            for entry in self._items:
+                if entry["id"] == alert_id:
+                    if saved:
+                        entry["saved"], entry["unsaved_at"] = True, None
+                    elif entry.get("saved"):
+                        entry["saved"], entry["unsaved_at"] = False, self.clock().isoformat()
+                    self._save()
+                    return self._view(entry)
+        return None
+
+    def purge(self) -> int:
+        """Deletes every alert whose time is up. Returns how many went."""
+        now = self.clock()
+        with self._lock:
+            keep = [a for a in self._items if a.get("saved") or self.delete_at(a) > now]
+            removed = len(self._items) - len(keep)
+            if removed:
+                self._items = keep
+                self._save()
+        return removed
+
+    def _view(self, entry: dict) -> dict:
+        view = dict(entry)
+        when = self.delete_at(entry)
+        view["delete_at"] = when.isoformat() if when else None
+        return view
+
+    def list(self, limit: Optional[int] = None) -> list:
+        """Newest first, each with its delete_at time."""
+        with self._lock:
+            items = [self._view(a) for a in reversed(self._items)]
+        return items[:limit] if limit else items
+
+    def counts(self) -> dict:
+        with self._lock:
+            return {"total": len(self._items), "saved": sum(1 for a in self._items if a.get("saved"))}
+
+
 class Notifier:
     """Queues alerts on disk and keeps retrying until every channel has them."""
 
@@ -280,7 +402,12 @@ class Notifier:
         self.clock = clock
         self.health_dir = health_dir
         self.outbox_path = health_dir / "outbox.json"
-        self.log_path = health_dir / "alerts.log"
+        self.log_path = health_dir / "alerts.log"  # older format, imported once into history
+        self.history = AlertHistory(
+            health_dir / "alerts.json",
+            clock,
+            legacy_logs=(self.log_path.with_suffix(".log.1"), self.log_path),
+        )
         self._lock = threading.Lock()
         self._wake = threading.Event()
         self._halt = threading.Event()
@@ -307,7 +434,7 @@ class Notifier:
             "delivered": [],
         }
         print(f"[health] {alert['title']} -- {message}", flush=True)
-        self._append_log(alert)
+        self.history.add(alert)
         with self._lock:
             if configured_channels(self.config):
                 self._outbox.append(alert)
@@ -320,29 +447,8 @@ class Notifier:
         with self._lock:
             return [dict(a) for a in self._outbox]
 
-    def recent(self, limit: int = 20) -> list:
-        entries = []
-        for path in (self.log_path.with_suffix(".log.1"), self.log_path):
-            try:
-                for line in path.read_text(encoding="utf-8").splitlines():
-                    try:
-                        entries.append(json.loads(line))
-                    except ValueError:
-                        pass
-            except OSError:
-                pass
-        return entries[-limit:][::-1]
-
-    def _append_log(self, alert: dict) -> None:
-        try:
-            self.health_dir.mkdir(parents=True, exist_ok=True)
-            if self.log_path.exists() and self.log_path.stat().st_size > MAX_LOG_BYTES:
-                os.replace(self.log_path, self.log_path.with_suffix(".log.1"))
-            entry = {k: alert[k] for k in ("created_at", "kind", "title", "message", "priority")}
-            with self.log_path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(entry) + "\n")
-        except OSError:
-            pass
+    def recent(self, limit: Optional[int] = 20) -> list:
+        return self.history.list(limit)
 
     def _save_outbox(self) -> None:
         try:
@@ -543,6 +649,7 @@ class HealthMonitor:
             self._heartbeat_and_internet,
             self._maybe_backup,
             self._maybe_daily_checkin,
+            self.notifier.history.purge,
         )
         for step in steps:
             try:
@@ -815,7 +922,10 @@ class HealthMonitor:
             "last_check_error": self.last_check_error,
             "disk": self.disk_usage(),
             "last_backup": backups[-1].name if backups else None,
-            "recent_alerts": self.notifier.recent(20),
+            "recent_alerts": self.notifier.recent(None),
+            "alert_counts": self.notifier.history.counts(),
+            "alert_keep_days": HISTORY_KEEP_DAYS,
+            "alert_unsave_grace_hours": UNSAVE_GRACE_HOURS,
         }
 
     def send_test(self) -> dict:

@@ -1304,6 +1304,20 @@ class Handler(BaseHTTPRequestHandler):
                 return
             trigger_detection(camera_id)
             self.send_json(get_detection_status(camera_id), HTTPStatus.ACCEPTED)
+        elif re.fullmatch(r"/api/health/alerts/([0-9a-f]+)/saved", parsed.path):
+            alert_id = re.fullmatch(r"/api/health/alerts/([0-9a-f]+)/saved", parsed.path).group(1)
+            try:
+                saved = self.read_json().get("saved")
+            except (ValueError, AttributeError):
+                saved = None
+            if not isinstance(saved, bool):
+                self.send_json({"error": 'Send {"saved": true} or {"saved": false}.'}, HTTPStatus.BAD_REQUEST)
+                return
+            entry = health_monitor.notifier.history.set_saved(alert_id, saved)
+            if entry is None:
+                self.send_json({"error": "No alert with that id (it may have been deleted)."}, HTTPStatus.NOT_FOUND)
+                return
+            self.send_json({"alert": entry})
         elif parsed.path == "/api/health/test-alert":
             alert = health_monitor.send_test()
             self.send_json({"queued": True, "channels": health.configured_channels(health_monitor.config), "alert": alert})

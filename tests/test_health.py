@@ -297,5 +297,88 @@ class HealthTests(unittest.TestCase):
         self.assertIn("camera list exploded", h.monitor.last_check_error)
 
 
+class AlertHistoryTests(unittest.TestCase):
+    """Alerts auto-delete after 30 days unless saved; unsaving an old one
+    gives 24 hours to change your mind."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.clock = FakeClock()
+        self.history = health.AlertHistory(self.tmp / "alerts.json", self.clock)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def add(self, title="Camera down"):
+        return self.history.add({
+            "id": health.secrets.token_hex(6), "created_at": self.clock().isoformat(),
+            "kind": "camera", "title": title, "message": "m", "priority": "high",
+        })
+
+    def ids(self):
+        return [a["id"] for a in self.history.list()]
+
+    def test_unsaved_alert_deleted_after_30_days(self):
+        a = self.add()
+        self.clock.advance(days=29, hours=23); self.history.purge()
+        self.assertIn(a["id"], self.ids())
+        self.clock.advance(hours=2); self.history.purge()
+        self.assertNotIn(a["id"], self.ids())
+
+    def test_saved_alert_kept_forever(self):
+        a = self.add()
+        self.history.set_saved(a["id"], True)
+        self.clock.advance(days=400); self.history.purge()
+        self.assertIn(a["id"], self.ids())
+        self.assertIsNone(self.history.list()[0]["delete_at"])
+
+    def test_unsaving_an_old_alert_gives_24_hours(self):
+        a = self.add()
+        self.history.set_saved(a["id"], True)
+        self.clock.advance(days=45)
+        view = self.history.set_saved(a["id"], False)
+        self.assertEqual(health.parse_iso(view["delete_at"]), self.clock() + health.timedelta(hours=24))
+        self.clock.advance(hours=23); self.history.purge()
+        self.assertIn(a["id"], self.ids())
+        self.clock.advance(hours=2); self.history.purge()
+        self.assertNotIn(a["id"], self.ids())
+
+    def test_saving_again_during_grace_keeps_it(self):
+        a = self.add()
+        self.history.set_saved(a["id"], True)
+        self.clock.advance(days=45)
+        self.history.set_saved(a["id"], False)
+        self.clock.advance(hours=12)
+        self.history.set_saved(a["id"], True)
+        self.clock.advance(days=10); self.history.purge()
+        self.assertIn(a["id"], self.ids())
+
+    def test_unsaving_a_young_alert_keeps_normal_30_days(self):
+        a = self.add()
+        self.history.set_saved(a["id"], True)
+        self.clock.advance(days=5)
+        self.history.set_saved(a["id"], False)
+        self.clock.advance(days=24, hours=23); self.history.purge()
+        self.assertIn(a["id"], self.ids())
+        self.clock.advance(hours=2); self.history.purge()
+        self.assertNotIn(a["id"], self.ids())
+
+    def test_saved_flag_survives_restart_and_old_log_is_imported(self):
+        legacy = self.tmp / "alerts.log"
+        legacy.write_text(json.dumps({"created_at": self.clock().isoformat(), "kind": "disk",
+                                      "title": "Disk almost full", "message": "m", "priority": "high"}) + "\n")
+        h = health.AlertHistory(self.tmp / "new.json", self.clock, legacy_logs=(legacy,))
+        old = h.list()[0]
+        self.assertEqual(old["title"], "Disk almost full")
+        h.set_saved(old["id"], True)
+        h2 = health.AlertHistory(self.tmp / "new.json", self.clock, legacy_logs=(legacy,))
+        self.assertEqual(len(h2.list()), 1)  # not imported twice
+        self.assertTrue(h2.list()[0]["saved"])
+
+    def test_unknown_id(self):
+        self.assertIsNone(self.history.set_saved("abc123", True))
+
+
 if __name__ == "__main__":
     unittest.main()
