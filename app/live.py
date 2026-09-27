@@ -4,9 +4,17 @@ What this module does
 ---------------------
 * Reads ``data/camera_sources.json`` (gitignored, because it holds camera
   passwords) and runs one background grabber thread per configured camera.
-* Every ``interval_seconds`` (default 3) a grabber asks its camera for a JPEG
-  snapshot and passes it to an optional ``on_frame`` callback -- the hook the
-  continuous detector plugs into next.
+* Every ``interval_seconds`` (default 3) a grabber gets the newest picture from
+  its camera and passes it to an optional ``on_frame`` callback (the
+  continuous detector). How it gets the picture depends on the camera's
+  ``type``:
+
+  - ``"reolink"`` (the default): Reolink's own snapshot command over HTTP.
+  - ``"rtsp"``: the standard video stream nearly every IP camera, NVR and DVR
+    offers (Hikvision, Dahua, Axis, Uniview, Lorex, Amcrest, UniFi...). One
+    ffmpeg process stays connected and hands over the newest frame.
+  - ``"http_snapshot"``: any camera or recorder with a "give me a JPEG" web
+    address (basic or digest login both work).
 * Keeps exactly ONE image on disk per camera, ``data/live/<camera_id>/latest.jpg``,
   overwritten atomically every time. Nothing accumulates, so storage stays flat.
 * Can relay the camera's RTSP stream to a browser as MJPEG (about 2 fps) through
@@ -56,6 +64,14 @@ MAX_FRAME_BYTES = 20 * 1024 * 1024
 SNAPSHOT_TIMEOUT_SECONDS = 8.0
 MAX_BACKOFF_SECONDS = 60.0
 PLACEHOLDER_PASSWORD = "CHANGE_ME"
+
+CAMERA_TYPES = ("reolink", "rtsp", "http_snapshot")
+RTSP_DECODE_MODES = ("keyframes", "all")
+# A new stream can take a while to hand over its first picture (connecting,
+# logging in, waiting for the first full "key" frame).
+RTSP_FIRST_FRAME_TIMEOUT_SECONDS = 20.0
+# Once running, no new picture for this long means the stream is stuck.
+RTSP_STALL_TIMEOUT_SECONDS = 20.0
 
 MAX_RELAYS_PER_CAMERA = 2
 RELAY_FIRST_DATA_TIMEOUT_SECONDS = 12.0
@@ -107,8 +123,49 @@ class CameraSource:
     frame_policy: str = "none"
     live_fps: float = 2.0
     live_stream: str = "sub"
+    type: str = "reolink"
+    # For type "rtsp" (and optionally "http_snapshot", for Live View): the
+    # stream address WITHOUT the login -- the username/password are added at
+    # connect time so they never have to sit inside a URL in the config.
+    stream_url: Optional[str] = None
+    # Optional lighter stream just for the browser's Live View (e.g. a
+    # camera's "sub stream"); detection still uses stream_url.
+    live_stream_url: Optional[str] = None
+    # For type "http_snapshot": the JPEG address (login added via HTTP auth).
+    snapshot_address: Optional[str] = None
+    # "keyframes" decodes only the stream's full frames (a picture every
+    # 1-4 s on most cameras, very little CPU); "all" decodes everything.
+    rtsp_decode: str = "keyframes"
 
     def snapshot_url(self) -> str:
+        if self.type == "http_snapshot":
+            return self.snapshot_address or ""
+        return self._reolink_snapshot_url()
+
+    def _with_login(self, url: str) -> str:
+        """Adds this camera's username/password to a stream address."""
+        parts = urllib.parse.urlsplit(url)
+        if not self.username or parts.username:
+            return url
+        user = urllib.parse.quote(self.username, safe="")
+        password = urllib.parse.quote(self.password, safe="")
+        netloc = f"{user}:{password}@{parts.netloc}" if self.password else f"{user}@{parts.netloc}"
+        return urllib.parse.urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
+    def detection_rtsp_url(self) -> Optional[str]:
+        """The stream detection reads, login included (type "rtsp" only)."""
+        if self.type == "rtsp" and self.stream_url:
+            return self._with_login(self.stream_url)
+        return None
+
+    def live_view_rtsp_url(self) -> Optional[str]:
+        """The stream the browser's Live View relays, or None if there isn't one."""
+        if self.type == "reolink":
+            return self.rtsp_url()
+        url = self.live_stream_url or self.stream_url
+        return self._with_login(url) if url else None
+
+    def _reolink_snapshot_url(self) -> str:
         query = urllib.parse.urlencode(
             {
                 "cmd": "Snap",
@@ -133,9 +190,10 @@ class CameraSource:
     def scrub(self, text: str) -> str:
         """Removes this camera's password (raw and URL-encoded) from a message."""
         if self.password:
-            for secret in {self.password, urllib.parse.quote(self.password, safe="")}:
+            for secret in sorted({self.password, urllib.parse.quote(self.password, safe="")}, key=len, reverse=True):
                 text = text.replace(secret, "***")
-        return text
+        # Any login left inside an address (e.g. echoed back by ffmpeg).
+        return re.sub(r"(rtsps?://|https?://)[^/\s]*@", r"\1***@", text)
 
 
 def _number(entry: dict, key: str, default: float, low: float, high: float, cam: str) -> float:
@@ -156,6 +214,29 @@ def _integer(entry: dict, key: str, default: int, low: int, high: int, cam: str)
     return value
 
 
+def _clean_url(entry: dict, key: str, schemes: tuple, cam: str, username: str, password: str, *, required: bool):
+    """Validates one address field. A login typed into the address itself
+    (rtsp://admin:pw@...) is moved into username/password, so the address
+    kept in memory -- and shown in errors -- never contains the password.
+    Returns (url or None, username, password)."""
+    value = entry.get(key)
+    if value is None or value == "":
+        if required:
+            raise LiveConfigError(f'{cam}: "{key}" is required for this camera type.')
+        return None, username, password
+    if not isinstance(value, str):
+        raise LiveConfigError(f'{cam}: "{key}" must be text.')
+    parts = urllib.parse.urlsplit(value.strip())
+    if parts.scheme not in schemes or not parts.hostname:
+        raise LiveConfigError(f'{cam}: "{key}" must start with {" or ".join(s + "://" for s in schemes)} and include the camera\'s address.')
+    if parts.username is not None:
+        username = username or urllib.parse.unquote(parts.username)
+        password = password or urllib.parse.unquote(parts.password or "")
+        netloc = parts.hostname + (f":{parts.port}" if parts.port else "")
+        parts = parts._replace(netloc=netloc)
+    return urllib.parse.urlunsplit(parts), username, password
+
+
 def parse_config(raw: Any) -> dict:
     """Validates the decoded JSON and returns ``{camera_id: CameraSource}``.
 
@@ -172,17 +253,36 @@ def parse_config(raw: Any) -> dict:
         if not isinstance(entry, dict):
             raise LiveConfigError(f"{camera_id}: settings must be a JSON object.")
 
-        host = entry.get("host")
-        if not isinstance(host, str) or not _HOST_RE.match(host.strip()):
-            raise LiveConfigError(f'{camera_id}: "host" must be the camera\'s IP address, e.g. "192.168.1.50".')
-        username = entry.get("username")
-        if not isinstance(username, str) or not username:
-            raise LiveConfigError(f'{camera_id}: "username" is required (Reolink default is "admin").')
-        password = entry.get("password")
-        if not isinstance(password, str) or not password:
-            raise LiveConfigError(f'{camera_id}: "password" is required.')
+        camera_type = entry.get("type", "reolink")
+        if camera_type not in CAMERA_TYPES:
+            raise LiveConfigError(f'{camera_id}: "type" must be one of: {", ".join(CAMERA_TYPES)}.')
+
+        username = entry.get("username", "")
+        password = entry.get("password", "")
+        if not isinstance(username, str) or not isinstance(password, str):
+            raise LiveConfigError(f'{camera_id}: "username" and "password" must be text.')
         if password == PLACEHOLDER_PASSWORD:
             raise LiveConfigError(f'{camera_id}: replace the placeholder "{PLACEHOLDER_PASSWORD}" with the camera\'s real password.')
+
+        stream_url = snapshot_address = live_stream_url = None
+        if camera_type == "reolink":
+            if not username:
+                raise LiveConfigError(f'{camera_id}: "username" is required (Reolink default is "admin").')
+            if not password:
+                raise LiveConfigError(f'{camera_id}: "password" is required.')
+        else:
+            if camera_type == "rtsp":
+                stream_url, username, password = _clean_url(entry, "rtsp_url", ("rtsp", "rtsps"), camera_id, username, password, required=True)
+            else:
+                snapshot_address, username, password = _clean_url(entry, "snapshot_url", ("http", "https"), camera_id, username, password, required=True)
+                stream_url, username, password = _clean_url(entry, "rtsp_url", ("rtsp", "rtsps"), camera_id, username, password, required=False)
+            live_stream_url, username, password = _clean_url(entry, "live_rtsp_url", ("rtsp", "rtsps"), camera_id, username, password, required=False)
+
+        host = entry.get("host")
+        if host is None and camera_type != "reolink":
+            host = urllib.parse.urlsplit(stream_url or snapshot_address).hostname or ""
+        if not isinstance(host, str) or not _HOST_RE.match(host.strip()):
+            raise LiveConfigError(f'{camera_id}: "host" must be the camera\'s IP address, e.g. "192.168.1.50".')
 
         scheme = entry.get("scheme", "http")
         if scheme not in ("http", "https"):
@@ -190,6 +290,9 @@ def parse_config(raw: Any) -> dict:
         stream = entry.get("live_stream", "sub")
         if stream not in ("sub", "main"):
             raise LiveConfigError(f'{camera_id}: "live_stream" must be "sub" or "main".')
+        decode = entry.get("rtsp_decode", "keyframes")
+        if decode not in RTSP_DECODE_MODES:
+            raise LiveConfigError(f'{camera_id}: "rtsp_decode" must be "keyframes" or "all".')
         policy = entry.get("frame_policy", "none")
         if policy not in SUPPORTED_FRAME_POLICIES:
             raise LiveConfigError(
@@ -212,6 +315,11 @@ def parse_config(raw: Any) -> dict:
             frame_policy=policy,
             live_fps=_number(entry, "live_fps", 2.0, 0.5, 10.0, camera_id),
             live_stream=stream,
+            type=camera_type,
+            stream_url=stream_url,
+            live_stream_url=live_stream_url,
+            snapshot_address=snapshot_address,
+            rtsp_decode=decode,
         )
     return sources
 
@@ -297,6 +405,273 @@ def write_latest_frame(camera_id: str, jpeg: bytes) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Getting pictures from each camera type
+# ---------------------------------------------------------------------------
+
+
+class ReolinkFetcher:
+    """Reolink's own snapshot command (the original, still-default path)."""
+
+    def __init__(self, source: CameraSource):
+        self.source = source
+
+    def fetch(self) -> bytes:
+        return fetch_snapshot(self.source)
+
+    def close(self) -> None:
+        pass
+
+
+class HttpSnapshotFetcher:
+    """Any "give me a JPEG" web address, e.g. Hikvision's
+    /ISAPI/Streaming/channels/101/picture or Dahua's /cgi-bin/snapshot.cgi.
+    Handles both basic and digest logins (most recorders use digest)."""
+
+    def __init__(self, source: CameraSource):
+        self.source = source
+        handlers: list = []
+        if source.username:
+            passwords = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+            passwords.add_password(None, source.snapshot_address, source.username, source.password)
+            handlers += [urllib.request.HTTPDigestAuthHandler(passwords), urllib.request.HTTPBasicAuthHandler(passwords)]
+        if (source.snapshot_address or "").startswith("https"):
+            handlers.append(urllib.request.HTTPSHandler(context=ssl._create_unverified_context()))
+        self._opener = urllib.request.build_opener(*handlers)
+
+    def fetch(self) -> bytes:
+        request = urllib.request.Request(self.source.snapshot_address, headers={"User-Agent": "ParkingLotPOC"})
+        try:
+            with self._opener.open(request, timeout=SNAPSHOT_TIMEOUT_SECONDS) as response:
+                data = response.read(MAX_FRAME_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                raise LiveFrameError("the camera rejected the username or password (check them in data/camera_sources.json)") from None
+            if exc.code == 404:
+                raise LiveFrameError("the camera says that snapshot address doesn't exist (HTTP 404): check snapshot_url") from None
+            raise LiveFrameError(f"camera answered HTTP {exc.code}") from None
+        except urllib.error.URLError as exc:
+            raise LiveFrameError(self.source.scrub(_unreachable_message(self.source, exc.reason))) from None
+        except (OSError, ValueError) as exc:
+            raise LiveFrameError(self.source.scrub(_unreachable_message(self.source, exc))) from None
+        if len(data) > MAX_FRAME_BYTES:
+            raise LiveFrameError("camera sent an unexpectedly large response")
+        if not data.startswith(b"\xff\xd8"):
+            snippet = self.source.scrub(data[:160].decode("utf-8", "replace").strip())
+            raise LiveFrameError(f"camera did not return a photo: {snippet or 'empty response'}")
+        return data
+
+    def close(self) -> None:
+        pass
+
+
+def _rtsp_failure_hint(detail: str) -> str:
+    """Turns ffmpeg's last error line into plain advice."""
+    low = detail.lower()
+    if "401" in low or "unauthorized" in low:
+        return "the camera rejected the username or password"
+    if "404" in low or "not found" in low or "454" in low:
+        return "the camera doesn't have a stream at that address: check the path in rtsp_url"
+    if "refused" in low:
+        return "the camera refused the connection: check the port and that RTSP is turned on in the camera's settings"
+    if "timed out" in low or "no route" in low or "unreachable" in low:
+        return "no answer from the camera: check its IP address and network cable"
+    return ""
+
+
+_passthrough_flag_cache: dict = {}
+
+
+def _passthrough_flags(ffmpeg: str) -> list:
+    """Stops ffmpeg duplicating frames to fill a fixed frame rate (it would
+    otherwise re-send each key frame over and over). The option was renamed
+    in ffmpeg 5.1, so ask the installed ffmpeg which one it knows."""
+    if ffmpeg not in _passthrough_flag_cache:
+        flags = ["-vsync", "0"]
+        try:
+            out = subprocess.run([ffmpeg, "-hide_banner", "-h", "long"], capture_output=True, text=True, timeout=10).stdout
+            if "-fps_mode" in out:
+                flags = ["-fps_mode", "passthrough"]
+        except (OSError, subprocess.SubprocessError):
+            pass
+        _passthrough_flag_cache[ffmpeg] = flags
+    return _passthrough_flag_cache[ffmpeg]
+
+
+def build_rtsp_frame_command(source: CameraSource, url: str) -> list:
+    """ffmpeg reading the camera's stream and writing JPEGs, one after
+    another, to its output (multipart, each part with its byte length)."""
+    ffmpeg = find_ffmpeg()
+    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if url.startswith(("rtsp://", "rtsps://")):
+        command += ["-rtsp_transport", "tcp"]
+    if source.rtsp_decode == "keyframes":
+        # Only decode the stream's complete "key" frames. Cameras send one
+        # every 1-4 seconds, which is plenty for parking, at a fraction of
+        # the CPU of decoding every frame of a 5MP stream.
+        command += ["-skip_frame", "nokey"]
+    command += ["-i", url, "-an"]
+    if source.rtsp_decode == "all":
+        command += ["-vf", f"fps=1/{source.interval_seconds:g}"]
+    command += _passthrough_flags(ffmpeg)
+    command += ["-q:v", "3", "-f", "mpjpeg", "-boundary_tag", "frame", "pipe:1"]
+    return command
+
+
+class RtspFetcher:
+    """Keeps one ffmpeg connection open to the camera's stream and always
+    has the newest picture ready. fetch() hands over a picture newer than
+    the last one it returned, (re)connecting when needed."""
+
+    def __init__(self, source: CameraSource, command: Optional[list] = None,
+                 first_frame_timeout: float = RTSP_FIRST_FRAME_TIMEOUT_SECONDS,
+                 stall_timeout: float = RTSP_STALL_TIMEOUT_SECONDS):
+        self.source = source
+        self.command = command
+        self.first_frame_timeout = first_frame_timeout
+        self.stall_timeout = stall_timeout
+        self._proc: Optional[subprocess.Popen] = None
+        self._cond = threading.Condition()
+        self._latest: Optional[bytes] = None
+        self._seq = 0
+        self._returned_seq = 0
+        self._stderr_lines: list = []
+        self._reader_error: Optional[str] = None
+
+    # -- process management ------------------------------------------------
+    def _start(self) -> None:
+        url = self.source.detection_rtsp_url()
+        if not url:
+            raise LiveFrameError("no rtsp_url is set for this camera")
+        command = self.command or build_rtsp_frame_command(self.source, url)
+        try:
+            proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
+        except FileNotFoundError:
+            raise LiveFrameError("reading camera streams needs ffmpeg, which the server can't find (pip install imageio-ffmpeg)") from None
+        with self._cond:
+            self._proc = proc
+            self._latest = None
+            self._stderr_lines = []
+            self._reader_error = None
+        threading.Thread(target=self._read_frames, args=(proc,), daemon=True, name=f"rtsp-{self.source.camera_id}").start()
+        threading.Thread(target=self._read_stderr, args=(proc,), daemon=True, name=f"rtsp-err-{self.source.camera_id}").start()
+
+    def _read_stderr(self, proc: subprocess.Popen) -> None:
+        for raw in iter(proc.stderr.readline, b""):
+            line = raw.decode("utf-8", "replace").strip()
+            if line:
+                with self._cond:
+                    self._stderr_lines = (self._stderr_lines + [line])[-20:]
+
+    def _read_frames(self, proc: subprocess.Popen) -> None:
+        stream = proc.stdout
+        try:
+            while True:
+                length = None
+                # Part headers, ending in a blank line.
+                while True:
+                    line = stream.readline()
+                    if not line:
+                        return  # ffmpeg exited
+                    line = line.strip()
+                    if not line:
+                        if length is not None:
+                            break
+                        continue
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1])
+                if length <= 0 or length > MAX_FRAME_BYTES:
+                    raise ValueError(f"bad frame size {length}")
+                data = stream.read(length)
+                if len(data) < length:
+                    return
+                if not data.startswith(b"\xff\xd8"):
+                    continue
+                with self._cond:
+                    if self._proc is not proc:
+                        return  # replaced by a newer connection
+                    self._latest = data
+                    self._seq += 1
+                    self._cond.notify_all()
+        except (OSError, ValueError) as exc:
+            with self._cond:
+                self._reader_error = str(exc)
+        finally:
+            with self._cond:
+                self._cond.notify_all()
+
+    def _stop_proc(self) -> None:
+        with self._cond:
+            proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe is not None:
+                    pipe.close()
+            except OSError:
+                pass
+
+    def _failure(self, base: str) -> LiveFrameError:
+        with self._cond:
+            lines = list(self._stderr_lines)
+            reader_error = self._reader_error
+        self._stop_proc()
+        detail = self.source.scrub(lines[-1] if lines else (reader_error or ""))[-200:]
+        hint = _rtsp_failure_hint(detail)
+        message = hint or base
+        if detail and detail not in message:
+            message = f"{message} ({detail})"
+        return LiveFrameError(message)
+
+    # -- public ------------------------------------------------------------
+    def fetch(self) -> bytes:
+        with self._cond:
+            running = self._proc is not None and self._proc.poll() is None
+        if not running:
+            self._stop_proc()
+            self._start()
+            timeout = self.first_frame_timeout
+        else:
+            timeout = self.stall_timeout
+        deadline = time.monotonic() + timeout
+        with self._cond:
+            while self._seq <= self._returned_seq:
+                if self._proc is None or self._proc.poll() is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(min(remaining, 0.5))
+            if self._seq > self._returned_seq and self._latest is not None:
+                self._returned_seq = self._seq
+                return self._latest
+            exited = self._proc is None or self._proc.poll() is not None
+        if exited:
+            raise self._failure("the camera's video stream stopped")
+        raise self._failure(f"no new picture from the camera's video stream for {timeout:g} seconds")
+
+    def close(self) -> None:
+        self._stop_proc()
+
+
+def make_fetcher(source: CameraSource):
+    if source.type == "rtsp":
+        return RtspFetcher(source)
+    if source.type == "http_snapshot":
+        return HttpSnapshotFetcher(source)
+    return ReolinkFetcher(source)
+
+
+# ---------------------------------------------------------------------------
 # Grabber threads
 # ---------------------------------------------------------------------------
 
@@ -306,10 +681,11 @@ FrameCallback = Callable[[str, bytes, str], None]
 class FrameGrabber(threading.Thread):
     """Fetches a snapshot on a fixed cadence for one camera, backing off on errors."""
 
-    def __init__(self, source: CameraSource, on_frame: Optional[FrameCallback] = None):
+    def __init__(self, source: CameraSource, on_frame: Optional[FrameCallback] = None, fetcher: Any = None):
         super().__init__(daemon=True, name=f"grabber-{source.camera_id}")
         self.source = source
         self.on_frame = on_frame
+        self.fetcher = fetcher or make_fetcher(source)
         # NOTE: not named _stop -- threading.Thread already uses that name internally.
         self._halt = threading.Event()
         self._lock = threading.Lock()
@@ -332,6 +708,7 @@ class FrameGrabber(threading.Thread):
             status = dict(self._status)
         status["configured"] = True
         status["camera_id"] = self.source.camera_id
+        status["type"] = self.source.type
         status["interval_seconds"] = self.source.interval_seconds
         status["frame_policy"] = self.source.frame_policy
         status["live_fps"] = self.source.live_fps
@@ -350,7 +727,7 @@ class FrameGrabber(threading.Thread):
             while not self._halt.is_set():
                 started = time.monotonic()
                 try:
-                    jpeg = fetch_snapshot(self.source)
+                    jpeg = self.fetcher.fetch()
                     captured_at = utc_now_iso()
                     write_latest_frame(self.source.camera_id, jpeg)
                     failures = 0
@@ -384,6 +761,10 @@ class FrameGrabber(threading.Thread):
                     delay = self.source.interval_seconds
                 self._halt.wait(max(0.0, delay - (time.monotonic() - started)))
         finally:
+            try:
+                self.fetcher.close()
+            except Exception:
+                pass
             self._update(running=False)
 
 
@@ -503,13 +884,18 @@ def find_ffmpeg() -> str:
 
 def build_mjpeg_command(source: CameraSource) -> list:
     video_filter = f"fps={source.live_fps:g}"
-    if source.live_stream == "main":
-        video_filter += ",scale=1280:-2"  # main stream is 5MP; shrink it for the browser
+    if source.live_stream == "main" or source.type != "reolink":
+        # Keep it browser-sized: shrink anything wider than 1280px.
+        video_filter += ",scale='min(1280,iw)':-2"
+    url = source.live_view_rtsp_url()
+    if not url:
+        raise RelayFailed("This camera has no video stream set up for Live View (add an rtsp_url to its settings).")
+    transport = ["-rtsp_transport", "tcp"] if url.startswith(("rtsp://", "rtsps://")) else []
     return [
         find_ffmpeg(),
         "-hide_banner", "-loglevel", "error",
-        "-rtsp_transport", "tcp",
-        "-i", source.rtsp_url(),
+        *transport,
+        "-i", url,
         "-an",
         "-vf", video_filter,
         "-q:v", "5",
