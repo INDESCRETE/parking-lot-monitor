@@ -24,3 +24,6 @@ data/live/
 data/alerts.json
 data/health/
 data/backups/
+
+# Traffic counting runs (preview videos, CSVs)
+data/traffic_runs/
