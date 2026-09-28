@@ -48,8 +48,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import json
+import io
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -84,46 +85,42 @@ DEFAULT_CONFIDENCE = 0.25
 # --- Reading the video ----------------------------------------------------------
 
 
-def find_tool(name: str) -> str:
-    found = shutil.which(name)
-    if found:
-        return found
-    for candidate in (f"/opt/homebrew/bin/{name}", f"/usr/local/bin/{name}", f"/usr/bin/{name}"):
-        if Path(candidate).exists():
-            return candidate
-    raise SystemExit(f"Couldn't find {name}. Install it (on a Mac: brew install ffmpeg) and try again.")
+def find_ffmpeg() -> str:
+    """The same ffmpeg the rest of the app uses (the copy bundled with the
+    imageio-ffmpeg package in .venv), falling back to one on the system.
+    Deliberately doesn't need ffprobe: the bundled copy doesn't include it."""
+    from app.live import find_ffmpeg as app_find_ffmpeg
+
+    path = app_find_ffmpeg()
+    if shutil.which(path) or Path(path).exists():
+        return path
+    raise SystemExit(
+        "Couldn't find ffmpeg. Run this with the project's own Python "
+        "(.venv/bin/python), which has it built in."
+    )
 
 
 def probe_video(path: Path) -> dict:
-    """Width, height (as displayed, i.e. after phone rotation) and duration."""
-    ffprobe = find_tool("ffprobe")
+    """Width and height as displayed (after any phone rotation), and length.
+
+    Size comes from actually decoding the first frame, so rotation is
+    already applied; length comes from the "Duration:" line ffmpeg prints."""
+    ffmpeg = find_ffmpeg()
     out = subprocess.run(
-        [
-            ffprobe, "-v", "error", "-select_streams", "v:0",
-            "-show_streams", "-show_format", "-of", "json", str(path),
-        ],
-        capture_output=True, text=True,
+        [ffmpeg, "-hide_banner", "-i", str(path), "-frames:v", "1", "-f", "image2pipe", "-vcodec", "png", "-"],
+        capture_output=True,
     )
-    if out.returncode != 0:
-        raise SystemExit(f"Couldn't read {path}: {out.stderr.strip() or 'not a video?'}")
-    info = json.loads(out.stdout or "{}")
-    streams = info.get("streams") or []
-    if not streams:
-        raise SystemExit(f"{path} has no video in it.")
-    stream = streams[0]
-    width, height = int(stream["width"]), int(stream["height"])
-    rotation = 0
-    try:
-        rotation = int(float((stream.get("tags") or {}).get("rotate", 0)))
-    except ValueError:
-        pass
-    for side in stream.get("side_data_list") or []:
-        if "rotation" in side:
-            rotation = int(float(side["rotation"]))
-    if abs(rotation) % 180 == 90:
-        width, height = height, width
-    duration = stream.get("duration") or (info.get("format") or {}).get("duration")
-    return {"width": width, "height": height, "duration": float(duration) if duration else None}
+    if out.returncode != 0 or not out.stdout:
+        detail = out.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise SystemExit(f"Couldn't read {path}: {detail[-1] if detail else 'not a video?'}")
+    with Image.open(io.BytesIO(out.stdout)) as first:
+        width, height = first.size
+    duration = None
+    match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", out.stderr.decode("utf-8", "replace"))
+    if match:
+        h, m, sec = match.groups()
+        duration = int(h) * 3600 + int(m) * 60 + float(sec)
+    return {"width": width, "height": height, "duration": duration}
 
 
 def output_size(width: int, height: int, max_width: int) -> tuple:
@@ -135,7 +132,7 @@ def output_size(width: int, height: int, max_width: int) -> tuple:
 
 def read_frames(path: Path, fps: float, size: tuple, seconds: Optional[float]) -> Iterator[Image.Image]:
     """Yields RGB frames, `fps` per second of video, resized to `size`."""
-    ffmpeg = find_tool("ffmpeg")
+    ffmpeg = find_ffmpeg()
     width, height = size
     cmd = [ffmpeg, "-v", "error", "-i", str(path)]
     if seconds:
@@ -250,7 +247,7 @@ def snapshot_image(frame: Image.Image, lines: list, region: Optional[tuple]) -> 
 
 class PreviewWriter:
     def __init__(self, path: Path, size: tuple, fps: float) -> None:
-        ffmpeg = find_tool("ffmpeg")
+        ffmpeg = find_ffmpeg()
         encoders = subprocess.run([ffmpeg, "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
         codec = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"] if "libx264" in encoders else ["-c:v", "mpeg4", "-q:v", "5"]
         self.proc = subprocess.Popen(

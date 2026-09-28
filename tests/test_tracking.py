@@ -167,9 +167,20 @@ class FollowingCarsTest(unittest.TestCase):
 
 
 
-def _ffmpeg_ok() -> bool:
+def _ffmpeg_path():
+    """Same lookup the app uses (bundled imageio-ffmpeg first). No ffprobe
+    needed -- Rob's Mac doesn't have it."""
     import shutil
-    return bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+    from app.live import find_ffmpeg
+    try:
+        path = find_ffmpeg()
+    except Exception:
+        return None
+    return path if shutil.which(path) else None
+
+
+def _ffmpeg_ok() -> bool:
+    return _ffmpeg_path() is not None
 
 
 def _bright_box_detector(bands):
@@ -224,7 +235,7 @@ class VideoEndToEndTest(unittest.TestCase):
                 "[ab][b]overlay=x='1300-mod(t*150,1400)':y=350"
             )
             subprocess.run(
-                ["ffmpeg", "-v", "error", "-y", "-filter_complex", graph, "-t", "30",
+                [_ffmpeg_path(), "-v", "error", "-y", "-filter_complex", graph, "-t", "30",
                  "-pix_fmt", "yuv420p", str(video)],
                 check=True,
             )
