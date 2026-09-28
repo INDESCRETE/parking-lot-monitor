@@ -42,6 +42,11 @@ Output (in data/traffic_runs/<video>_<time>/ unless --out is given):
   preview.mp4        the video with lines, tracked vehicles and running counts
 
 Use --seconds 120 for a quick trial on the first two minutes.
+
+Tip: run the line all the way to the edge of the picture (0.0 or 1.0) when a
+lane is right at the edge -- a vehicle is counted by its bottom-middle
+point, and a lane at the very bottom of the picture can pass below a line
+that stops short.
 """
 
 from __future__ import annotations
@@ -376,7 +381,11 @@ def main(argv: Optional[list] = None) -> int:
     parser.add_argument("--start", help='real clock time the video starts, e.g. "2026-09-27 14:00"')
     parser.add_argument("--bin-minutes", type=float, default=15.0)
     parser.add_argument("--seconds", type=float, help="only look at the first N seconds")
-    parser.add_argument("--no-crop", action="store_true", help="look at the whole picture, not just around the lines")
+    parser.add_argument(
+        "--crop", action="store_true",
+        help="look only at the area around the lines (helps for big, high-res pictures with small far-away "
+             "vehicles; off by default because at normal video sizes it cuts off big nearby vehicles)",
+    )
     parser.add_argument("--no-preview", action="store_true", help="skip writing preview.mp4 (a bit faster)")
     parser.add_argument("--out", type=Path, help="output folder")
     args = parser.parse_args(argv)
@@ -398,7 +407,11 @@ def main(argv: Optional[list] = None) -> int:
             lines.append(line)
     except ValueError as exc:
         parser.error(str(exc))
-    region = None if args.no_crop else crop_region_for_lines(lines, size)
+    # Off by default: the first real test (a 960x540 street video) showed
+    # the crop zone cutting big near-lane vehicles in half, so they were
+    # missed. Cropping pays off only for large, high-res frames where the
+    # vehicles near the line are small.
+    region = crop_region_for_lines(lines, size) if args.crop else None
 
     stem = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in args.video.stem)[:40]
     out_dir = args.out or RUNS_DIR / f"{stem}_{datetime.now().strftime('%Y%m%d-%H%M%S')}"
