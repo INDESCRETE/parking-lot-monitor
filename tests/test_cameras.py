@@ -235,6 +235,44 @@ class RtspFetcherTests(unittest.TestCase):
         self.assertGreater(gap, 1.0)
         self.assertLess(gap, 4.0)
 
+    def test_all_frames_mode_keeps_every_picture_from_a_bursty_stream(self):
+        # A camera's pictures come off the network in bursts. Taking only the
+        # newest lost ~25% of them on Rob's Reolink; every one must be kept,
+        # with evenly spaced times.
+        producer = (
+            "import sys,time\n"
+            "j=b'\\xff\\xd8' + b'x'*50 + b'\\xff\\xd9'\n"
+            "w=sys.stdout.buffer\n"
+            "while True:\n"
+            "    for _ in range(3):\n"
+            "        w.write(b'--frame\\r\\nContent-Type: image/jpeg\\r\\nContent-length: %d\\r\\n\\r\\n' % len(j) + j + b'\\r\\n')\n"
+            "    w.flush(); time.sleep(0.6)\n"
+        )
+        import sys
+        from datetime import datetime
+        src = self.source("all", interval=0.2)
+        fetcher = live.RtspFetcher(src, command=[sys.executable, "-c", producer], first_frame_timeout=10)
+        grabber = live.FrameGrabber(src, None, fetcher=fetcher)
+        stamps = []
+        grabber.on_frame = lambda cam, jpeg, at: stamps.append(datetime.fromisoformat(at).timestamp())
+        grabber.start()
+        try:
+            time.sleep(3.2)
+        finally:
+            grabber.stop()
+        self.assertGreaterEqual(len(stamps), 13, f"only {len(stamps)} pictures in 3.2 s at 5 per second")
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        self.assertTrue(all(abs(g - 0.2) < 0.01 for g in gaps), gaps)
+
+    def test_ffmpeg_stream_description_is_read(self):
+        info = live._parse_stream_description(
+            "[in#0/rtsp @ 0x1] Stream #0:0: Video: h264 (Main), yuv420p(progressive), 640x480, 10 fps, 10 tbr, 90k tbn"
+        )
+        self.assertEqual(info, {"codec": "h264", "stream_width": 640, "stream_height": 480, "stream_fps": 10.0})
+        self.assertIsNone(live._parse_stream_description("Stream #0:0: Video: mjpeg, yuvj420p, 640x480, 5 fps"))
+        self.assertEqual(live._split_ffmpeg_level("[rtsp @ 0x1] [error] 401 Unauthorized"),
+                         ("error", "[rtsp @ 0x1] 401 Unauthorized"))
+
     def test_stream_that_ends_is_reported_then_reconnects(self):
         src = self.source("keyframes")
         short = Path(self.tmp.name) / "short.mp4"

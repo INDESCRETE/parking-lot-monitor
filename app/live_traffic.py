@@ -13,9 +13,9 @@ Design
 * One worker thread and one model for every traffic camera, separate from
   the parking detector (app/live_detection.py), so a busy street never
   slows down parking and the two never share a model between threads.
-* Pictures arrive several times a second. The queue only holds a couple of
-  them: if the model falls behind, the oldest waiting picture is dropped and
-  the tracker simply sees a bigger time step (it works in real seconds, not
+* Pictures arrive several times a second, in small bursts. The queue holds
+  about two seconds' worth: if the model falls behind for longer, the oldest
+  waiting picture is dropped and the tracker simply sees a bigger time step (it works in real seconds, not
   frame numbers). processing_fps in the status shows whether it keeps up.
 * Lines are stored as fractions of the picture (0-1), so they stay put if
   the stream's resolution changes. They're turned into pixels per picture.
@@ -35,7 +35,10 @@ from typing import Any, Callable, Optional
 from app import detection_core
 from app.tracking import CountLine, LineCounter, VehicleTracker, ground_point
 
-MAX_QUEUE_SIZE = 2
+# Pictures arrive from the network in small bursts, so the queue must hold a
+# burst (about 2 s at 5 per second) without dropping any. If the computer is
+# genuinely too slow, the oldest waiting picture is dropped.
+MAX_QUEUE_SIZE = 10
 CONFIDENCE = 0.25  # same as scripts/count_traffic.py (validated on real video)
 RECENT_CROSSINGS_KEPT = 30
 # If no picture was analysed for this long, start the tracker fresh (old

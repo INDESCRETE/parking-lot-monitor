@@ -529,6 +529,36 @@ function loadFrame(cameraId, view, seq) {
 
 // --- Rendering the sidebar --------------------------------------------------------
 
+function formatRate(value) {
+  return value ? value.toFixed(1) : "…";
+}
+
+// Explains where pictures get lost, if they do: at the camera (it sends
+// fewer than asked for) or at this computer (it can't analyse them all).
+function speedNotes(camera, status) {
+  const notes = [];
+  const wanted = camera.interval_seconds ? 1 / camera.interval_seconds : null;
+  const received = camera.pictures_per_second;
+  const analysed = status.processing_fps;
+  const streamFps = camera.stream_fps;
+  if (camera.stream_width) {
+    notes.push(
+      `Camera stream: ${camera.stream_width}×${camera.stream_height}${streamFps ? `, ${streamFps.toFixed(streamFps % 1 ? 1 : 0)} frames/s` : ""}.`,
+    );
+  }
+  if (wanted && received && received < wanted * 0.9) {
+    let note = `Receiving ${received.toFixed(1)} of the ${wanted.toFixed(0)} pictures/s asked for.`;
+    if (streamFps && streamFps < wanted * 0.95) {
+      note += ` The camera's stream is set to ${streamFps.toFixed(0)} frames/s; raise its frame rate in the camera's settings to get more.`;
+    }
+    notes.push(note);
+  }
+  if (received && analysed && analysed < received * 0.85) {
+    notes.push(`This computer analyses ${analysed.toFixed(1)} of the ${received.toFixed(1)} it receives, so fast cars may be missed.`);
+  }
+  return notes;
+}
+
 function renderConnection(view) {
   const camera = view.camera || {};
   const status = view.status || {};
@@ -560,12 +590,9 @@ function renderConnection(view) {
     text = `No picture analysed for ${Math.round(secondsSince(status.last_frame_at))} s.${status.last_error ? " Last error: " + escapeHtml(status.last_error) : ""}`;
   } else {
     kind = "ok";
-    const wanted = camera.interval_seconds ? 1 / camera.interval_seconds : null;
-    const fps = status.processing_fps;
-    text = `&#9679; Live · analysing ${fps ? fps.toFixed(1) : "…"} pictures/s`;
-    if (fps && wanted && fps < wanted * 0.75) {
-      text += ` (camera sends ${wanted.toFixed(1)}/s; this computer can't keep up with all of them, so fast cars may be missed)`;
-    }
+    text = `&#9679; Live · analysing ${formatRate(status.processing_fps)} pictures/s`;
+    const notes = speedNotes(camera, status);
+    if (notes.length) text += `<br><span class="traffic-muted">${notes.join("<br>")}</span>`;
   }
   connectionStatus.className = `traffic-connection ${kind}`;
   connectionStatus.innerHTML = text;

@@ -35,6 +35,7 @@ are not. When they are added, they slot in where ``on_frame`` is called.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -486,6 +487,48 @@ class HttpSnapshotFetcher:
         pass
 
 
+RATE_WINDOW_SECONDS = 10.0
+PACED_BACKLOG = 50  # pictures waiting to be handed over ("all" mode); ~10 s at 5/s
+PACED_RESYNC_SECONDS = 1.0
+# e.g. "[info] Stream #0:0 ..." or "[swscaler @ 0x7f..] [warning] deprecated ..."
+_LEVEL_RE = re.compile(
+    r"^(\[[^\]]*@[^\]]*\]\s*)?\[(quiet|panic|fatal|error|warning|info|verbose|debug|trace)\]\s*(.*)$"
+)
+_VIDEO_STREAM_RE = re.compile(r"Stream #\S+.*?: Video: ([^,\s]+).*?(\d{2,5})x(\d{2,5})")
+_FPS_RE = re.compile(r"([\d.]+)\s*(fps|tbr)\b")
+
+
+def _split_ffmpeg_level(line: str) -> tuple:
+    """"[info] Stream #0:0 ..." -> ("info", "Stream #0:0 ..."). Lines without
+    a level prefix (other ffmpeg builds) are treated as errors, as before."""
+    match = _LEVEL_RE.match(line)
+    if not match:
+        return "error", line
+    return match.group(2), (match.group(1) or "") + match.group(3)
+
+
+def _parse_stream_description(text: str) -> Optional[dict]:
+    """Picks the camera's own video size and frame rate out of ffmpeg's
+    description of the INPUT stream (the output one is ours, not the camera's)."""
+    if "Video:" not in text or "mjpeg" in text.split("Video:", 1)[1][:12]:
+        return None  # our own JPEG output stream
+    match = _VIDEO_STREAM_RE.search(text)
+    if not match:
+        return None
+    info = {"codec": match.group(1), "stream_width": int(match.group(2)), "stream_height": int(match.group(3))}
+    rates = {kind: float(value) for value, kind in _FPS_RE.findall(text)}
+    rate = rates.get("fps") or rates.get("tbr")
+    if rate and rate < 1000:
+        info["stream_fps"] = rate
+    return info
+
+
+def _rate(times: list) -> Optional[float]:
+    if len(times) < 2 or times[-1] <= times[0]:
+        return None
+    return round((len(times) - 1) / (times[-1] - times[0]), 2)
+
+
 def _rtsp_failure_hint(detail: str) -> str:
     """Turns ffmpeg's last error line into plain advice."""
     low = detail.lower()
@@ -523,7 +566,10 @@ def build_rtsp_frame_command(source: CameraSource, url: str) -> list:
     """ffmpeg reading the camera's stream and writing JPEGs, one after
     another, to its output (multipart, each part with its byte length)."""
     ffmpeg = find_ffmpeg()
-    command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    # "level+info" prefixes each message with its level, so errors can be told
+    # apart from the one-time description of the camera's stream (its size and
+    # frame rate), which is read for the status page. -nostats: no progress lines.
+    command = [ffmpeg, "-hide_banner", "-nostats", "-loglevel", "level+info", "-nostdin"]
     if url.startswith(("rtsp://", "rtsps://")):
         command += ["-rtsp_transport", "tcp"]
     if source.rtsp_decode == "keyframes":
@@ -544,9 +590,21 @@ def build_rtsp_frame_command(source: CameraSource, url: str) -> list:
 
 
 class RtspFetcher:
-    """Keeps one ffmpeg connection open to the camera's stream and always
-    has the newest picture ready. fetch() hands over a picture newer than
-    the last one it returned, (re)connecting when needed."""
+    """Keeps one ffmpeg connection open to the camera's stream, (re)connecting
+    when needed.
+
+    Two ways of handing pictures over:
+
+    * keyframes mode (parking): fetch() returns the newest picture, skipping
+      any older ones -- only the current state of the lot matters.
+    * "all" mode (traffic counting, ``paced``): ffmpeg already delivers
+      exactly the wanted number of pictures a second, so fetch() returns
+      EVERY one of them in order. Taking only the newest lost about a quarter
+      of them on a real camera, because pictures come off the network in
+      small bursts rather than evenly spaced. Each picture's time is put on
+      an even grid (see _paced_time), because a burst's arrival times say
+      nothing about when the pictures were actually taken.
+    """
 
     def __init__(self, source: CameraSource, command: Optional[list] = None,
                  first_frame_timeout: float = RTSP_FIRST_FRAME_TIMEOUT_SECONDS,
@@ -562,6 +620,17 @@ class RtspFetcher:
         self._returned_seq = 0
         self._stderr_lines: list = []
         self._reader_error: Optional[str] = None
+        # What the camera says its stream is (from ffmpeg's description of it).
+        self.stream_info: dict = {}
+        # Arrival times of recent pictures from ffmpeg, for a measured rate.
+        self._arrivals: list = []
+        self.paced = source.rtsp_decode == "all"
+        # "all" mode: pictures not handed over yet, oldest first, with the
+        # wall-clock time each arrived. Bounded, so a stuck consumer can't
+        # eat memory (the oldest are dropped).
+        self._pending: "collections.deque" = collections.deque(maxlen=PACED_BACKLOG)
+        self._next_time: Optional[float] = None
+        self.last_captured_at: Optional[str] = None
 
     # -- process management ------------------------------------------------
     def _start(self) -> None:
@@ -576,6 +645,8 @@ class RtspFetcher:
         with self._cond:
             self._proc = proc
             self._latest = None
+            self._pending.clear()
+            self._next_time = None
             self._stderr_lines = []
             self._reader_error = None
         threading.Thread(target=self._read_frames, args=(proc,), daemon=True, name=f"rtsp-{self.source.camera_id}").start()
@@ -584,9 +655,19 @@ class RtspFetcher:
     def _read_stderr(self, proc: subprocess.Popen) -> None:
         for raw in iter(proc.stderr.readline, b""):
             line = raw.decode("utf-8", "replace").strip()
-            if line:
-                with self._cond:
-                    self._stderr_lines = (self._stderr_lines + [line])[-20:]
+            if not line:
+                continue
+            level, text = _split_ffmpeg_level(line)
+            if level not in ("error", "fatal", "panic"):
+                # Only errors are kept for failure messages (as with the old
+                # "-loglevel error"); info is read for the stream description.
+                info = _parse_stream_description(text)
+                if info:
+                    with self._cond:
+                        self.stream_info = info
+                continue
+            with self._cond:
+                self._stderr_lines = (self._stderr_lines + [text])[-20:]
 
     def _read_frames(self, proc: subprocess.Popen) -> None:
         stream = proc.stdout
@@ -617,6 +698,12 @@ class RtspFetcher:
                         return  # replaced by a newer connection
                     self._latest = data
                     self._seq += 1
+                    if self.paced:
+                        self._pending.append((data, time.time()))
+                    now = time.monotonic()
+                    self._arrivals.append(now)
+                    while self._arrivals and self._arrivals[0] < now - RATE_WINDOW_SECONDS:
+                        self._arrivals.pop(0)
                     self._cond.notify_all()
         except (OSError, ValueError) as exc:
             with self._cond:
@@ -669,6 +756,8 @@ class RtspFetcher:
         else:
             timeout = self.stall_timeout
         deadline = time.monotonic() + timeout
+        if self.paced:
+            return self._fetch_next_in_order(deadline, timeout)
         with self._cond:
             while self._seq <= self._returned_seq:
                 if self._proc is None or self._proc.poll() is not None:
@@ -685,8 +774,45 @@ class RtspFetcher:
             raise self._failure("the camera's video stream stopped")
         raise self._failure(f"no new picture from the camera's video stream for {timeout:g} seconds")
 
+    def _fetch_next_in_order(self, deadline: float, timeout: float) -> bytes:
+        with self._cond:
+            while not self._pending:
+                if self._proc is None or self._proc.poll() is not None:
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._cond.wait(min(remaining, 0.5))
+            if self._pending:
+                data, arrived = self._pending.popleft()
+                self.last_captured_at = datetime.fromtimestamp(self._paced_time(arrived), timezone.utc).isoformat()
+                return data
+            exited = self._proc is None or self._proc.poll() is not None
+        if exited:
+            raise self._failure("the camera's video stream stopped")
+        raise self._failure(f"no new picture from the camera's video stream for {timeout:g} seconds")
+
+    def _paced_time(self, arrived: float) -> float:
+        """ffmpeg's fps filter makes pictures exactly interval_seconds apart
+        in the camera's own time, so consecutive pictures get consecutive
+        grid times. The grid is re-anchored to the real clock when it drifts
+        more than a second away (a hiccup, or the camera's frame rate
+        differing from what was asked for)."""
+        expected = self._next_time
+        stamp = arrived if expected is None or abs(arrived - expected) > PACED_RESYNC_SECONDS else expected
+        self._next_time = stamp + self.source.interval_seconds
+        return stamp
+
     def close(self) -> None:
         self._stop_proc()
+
+    def diagnostics(self) -> dict:
+        """What the stream reports about itself, and how many pictures a
+        second actually came out of ffmpeg recently."""
+        with self._cond:
+            info = dict(self.stream_info)
+            info["stream_pictures_per_second"] = _rate(self._arrivals)
+        return info
 
 
 def make_fetcher(source: CameraSource):
@@ -715,6 +841,7 @@ class FrameGrabber(threading.Thread):
         # NOTE: not named _stop -- threading.Thread already uses that name internally.
         self._halt = threading.Event()
         self._lock = threading.Lock()
+        self._grab_times: list = []
         self._status: dict = {
             "running": False,
             "started_at": None,
@@ -738,6 +865,14 @@ class FrameGrabber(threading.Thread):
         status["interval_seconds"] = self.source.interval_seconds
         status["frame_policy"] = self.source.frame_policy
         status["live_fps"] = self.source.live_fps
+        with self._lock:
+            status["pictures_per_second"] = _rate(self._grab_times)
+        diagnostics = getattr(self.fetcher, "diagnostics", None)
+        if diagnostics is not None:
+            try:
+                status.update(diagnostics())
+            except Exception:
+                pass
         with _relay_lock:
             status["stream_error"] = _stream_errors.get(self.source.camera_id)
         return status
@@ -749,15 +884,21 @@ class FrameGrabber(threading.Thread):
     def run(self) -> None:
         self._update(running=True, started_at=utc_now_iso())
         failures = 0
+        paced = bool(getattr(self.fetcher, "paced", False))
         try:
             while not self._halt.is_set():
                 started = time.monotonic()
                 try:
                     jpeg = self.fetcher.fetch()
-                    captured_at = utc_now_iso()
+                    captured_at = getattr(self.fetcher, "last_captured_at", None) if paced else None
+                    captured_at = captured_at or utc_now_iso()
                     write_latest_frame(self.source.camera_id, jpeg)
                     failures = 0
                     with self._lock:
+                        now = time.monotonic()
+                        self._grab_times.append(now)
+                        while self._grab_times and self._grab_times[0] < now - RATE_WINDOW_SECONDS:
+                            self._grab_times.pop(0)
                         self._status.update(
                             last_frame_at=captured_at,
                             last_frame_bytes=len(jpeg),
@@ -783,6 +924,8 @@ class FrameGrabber(threading.Thread):
 
                 if failures:
                     delay = min(self.source.interval_seconds * (2 ** min(failures, 6)), MAX_BACKOFF_SECONDS)
+                elif paced:
+                    delay = 0.0  # the stream sets the pace; fetch() waits for the next picture
                 else:
                     delay = self.source.interval_seconds
                 self._halt.wait(max(0.0, delay - (time.monotonic() - started)))
