@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Lot Monitor — Traffic</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      // Same early theme switch as the other pages (no flash of the wrong theme).
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Traffic Counting</h1>
+        <p>Vehicles crossing counting lines</p>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/">Parking</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/health">Health</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section>
+          <div class="section-title-row">
+            <label for="cameraSelect" class="section-title">Camera</label>
+            <div class="camera-buttons">
+              <button type="button" id="addCameraButton" class="add-camera-button">+ Add Camera</button>
+              <button type="button" id="deleteCameraButton" class="delete-camera-button" title="Delete the selected camera">Delete</button>
+            </div>
+          </div>
+          <select id="cameraSelect"></select>
+          <p id="connectionStatus" class="traffic-connection" role="status"></p>
+        </section>
+
+        <section>
+          <div class="section-title-row">
+            <div class="section-title">Counting lines</div>
+            <span id="countsRangeLabel" class="traffic-muted">Today</span>
+          </div>
+          <div id="lineList" class="line-list"></div>
+        </section>
+
+        <section>
+          <div class="section-title">Download counts</div>
+          <div class="traffic-download">
+            <input id="countDateInput" type="date" aria-label="Day to download">
+            <select id="binSelect" aria-label="Interval length">
+              <option value="15" selected>15 min</option>
+              <option value="5">5 min</option>
+              <option value="30">30 min</option>
+              <option value="60">1 hour</option>
+            </select>
+            <button type="button" id="downloadButton">CSV</button>
+          </div>
+          <p id="peakHour" class="traffic-muted"></p>
+        </section>
+
+        <section class="status-section">
+          <div class="section-title">Latest crossings</div>
+          <ol id="crossingList" class="crossing-list"></ol>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div class="toolbar">
+          <button id="drawLineButton" type="button" title="Shortcut: L">Draw Line (L)</button>
+          <button id="cancelDrawButton" type="button" hidden>Cancel</button>
+          <label class="toolbar-check"><input id="showBoxesInput" type="checkbox" checked> Show vehicles</label>
+          <span id="trafficIndicator" class="live-feed-indicator" hidden>&#9679; Live</span>
+          <span id="status" role="status"></span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="trafficCanvas"></canvas>
+          <div id="emptyState" class="empty-state"></div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="lineDialog">
+      <form method="dialog" id="lineForm" class="dialog-form">
+        <h2 id="lineDialogTitle">New counting line</h2>
+        <label for="lineNameInput">Line name</label>
+        <input id="lineNameInput" autocomplete="off" placeholder="e.g. Main St" required maxlength="60">
+        <label for="forwardLabelInput"><span id="forwardArrow" class="direction-arrow"></span> Direction A name</label>
+        <input id="forwardLabelInput" autocomplete="off" maxlength="60" required>
+        <label for="reverseLabelInput"><span id="reverseArrow" class="direction-arrow"></span> Direction B name</label>
+        <input id="reverseLabelInput" autocomplete="off" maxlength="60" required>
+        <p class="dialog-hint">The arrows on the picture show which way each name counts. Rename them to anything, e.g. Northbound / Southbound or In / Out.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelLineButton">Cancel</button>
+          <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="cameraDialog">
+      <form method="dialog" id="cameraForm" class="dialog-form">
+        <h2>Add traffic camera</h2>
+        <label for="cameraNameInput">Camera name</label>
+        <input id="cameraNameInput" autocomplete="off" placeholder="e.g. State St northbound" required>
+        <p class="dialog-hint">To connect it to a real camera, its settings go in data/camera_sources.json under the camera's id (shown after it's created).</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCameraButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirmDialog">
+      <form method="dialog" class="dialog-form">
+        <h2 id="confirmTitle"></h2>
+        <p id="confirmMessage" class="confirm-message"></p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="confirmCancelButton">Cancel</button>
+          <button value="ok" type="submit" id="confirmOkButton" class="danger-button">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/theme.js"></script>
+    <script src="/static/traffic.js"></script>
+  </body>
+</html>

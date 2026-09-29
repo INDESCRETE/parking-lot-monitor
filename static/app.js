@@ -142,7 +142,7 @@ function getRememberedCameraId() {
 
 async function loadInitialData() {
   const payload = await fetchJson("/api/cameras");
-  state.cameras = payload.cameras;
+  state.cameras = parkingCameras(payload.cameras);
   const remembered = getRememberedCameraId();
   state.cameraId = state.cameras.some((camera) => camera.id === remembered)
     ? remembered
@@ -390,14 +390,24 @@ function renderCameras() {
   cameraSelect.value = state.cameraId;
 }
 
-async function createCamera(name) {
+// Traffic cameras (counting lines) live on their own page, /traffic, so this
+// page only lists parking cameras.
+function parkingCameras(cameras) {
+  return cameras.filter((camera) => camera.kind !== "traffic");
+}
+
+async function createCamera(name, kind = "parking") {
   const payload = await fetchJson("/api/cameras", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name }),
+    body: JSON.stringify({ name, kind }),
   });
+  if (payload.camera.kind === "traffic") {
+    window.location.href = `/traffic?camera=${encodeURIComponent(payload.camera.id)}`;
+    return;
+  }
   const camerasPayload = await fetchJson("/api/cameras");
-  state.cameras = camerasPayload.cameras;
+  state.cameras = parkingCameras(camerasPayload.cameras);
   state.cameraId = payload.camera.id;
   rememberCameraId(state.cameraId);
   renderCameras();
@@ -1236,12 +1246,13 @@ addCameraButton.addEventListener("click", () => {
 cameraForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const name = cameraNameInput.value.trim();
+  const kind = cameraForm.querySelector('input[name="cameraKind"]:checked')?.value || "parking";
   cameraDialog.close();
   if (!name) {
     return;
   }
   try {
-    await createCamera(name);
+    await createCamera(name, kind);
   } catch (error) {
     setStatus(error.message);
   }
@@ -1780,7 +1791,7 @@ async function deleteCurrentCamera() {
     }
   }
   const camerasPayload = await fetchJson("/api/cameras");
-  state.cameras = camerasPayload.cameras;
+  state.cameras = parkingCameras(camerasPayload.cameras);
   state.cameraId = state.cameras[0]?.id || null;
   rememberCameraId(state.cameraId);
   state.draftPoints = [];

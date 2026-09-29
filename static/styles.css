@@ -874,3 +874,258 @@ body.dashboard-body {
   border-color: var(--danger);
   filter: brightness(0.92);
 }
+
+/* --- Add Camera: parking or traffic ------------------------------------ */
+.kind-choice {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px 10px;
+}
+
+.kind-choice legend {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0 4px;
+  text-transform: uppercase;
+}
+
+.kind-option {
+  align-items: flex-start;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  font-weight: 400;
+  gap: 8px;
+  margin: 0;
+  text-transform: none;
+}
+
+.kind-option input {
+  margin-top: 3px;
+}
+
+.kind-option span {
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.kind-option strong {
+  color: var(--text);
+}
+
+/* --- Traffic page --------------------------------------------------------- */
+:root {
+  --dir-a: #2563eb;
+  --dir-b: #c2410c;
+  --line-color: #facc15;
+}
+
+:root[data-theme="dark"] {
+  --dir-a: #60a5fa;
+  --dir-b: #fb923c;
+  --line-color: #facc15;
+}
+
+.dialog-form {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+}
+
+.dialog-form h2 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.dialog-form label {
+  margin-bottom: 0;
+}
+
+.dialog-form input[type="text"],
+.dialog-form input:not([type]) {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.confirm-message {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.traffic-muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.traffic-connection {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 10px 0 0;
+}
+
+.traffic-connection.ok {
+  color: var(--accent-strong);
+}
+
+.traffic-connection.problem {
+  color: var(--danger);
+}
+
+.traffic-connection code {
+  font-size: 12px;
+}
+
+.line-list {
+  display: grid;
+  gap: 10px;
+}
+
+.line-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+}
+
+.line-card-head {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.line-card-name {
+  flex: 1;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.line-card-head button {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.line-card-head .delete-line {
+  color: var(--danger);
+}
+
+.direction-row {
+  align-items: baseline;
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+}
+
+.direction-row .direction-name {
+  flex: 1;
+}
+
+.direction-row .direction-count {
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.direction-arrow {
+  display: inline-block;
+  font-weight: 700;
+  width: 1.1em;
+}
+
+.dir-a {
+  color: var(--dir-a);
+}
+
+.dir-b {
+  color: var(--dir-b);
+}
+
+.line-empty {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.traffic-download {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.traffic-download input,
+.traffic-download select {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  min-height: 36px;
+  min-width: 0;
+  padding: 0 6px;
+}
+
+#peakHour {
+  margin: 8px 0 0;
+}
+
+.crossing-list {
+  display: grid;
+  font-size: 13px;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.crossing-list li {
+  display: flex;
+  gap: 8px;
+}
+
+.crossing-list time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 70px;
+}
+
+.toolbar-check {
+  align-items: center;
+  color: var(--text);
+  display: flex;
+  font-size: 13px;
+  font-weight: 400;
+  gap: 6px;
+  margin: 0;
+  text-transform: none;
+}
+
+#drawLineButton.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#trafficCanvas {
+  background: var(--canvas-bg);
+  border: 1px solid var(--line);
+  display: none;
+  /* Display size is set by traffic.js to fit the space without scrolling. */
+}
+
+#trafficCanvas.drawing {
+  cursor: crosshair;
+}

@@ -31,12 +31,24 @@
       "username": "admin",
       "password": "CHANGE_ME"
     },
+    "reolink_traffic_counting": {
+      "_comment": "For a camera whose type is Traffic counting (Traffic page). Tracking moving cars needs about 5 pictures a second, so read the video stream in full. Can be the same physical camera as a parking camera.",
+      "type": "rtsp",
+      "rtsp_url": "rtsp://192.168.1.50:554/Preview_01_sub",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "rtsp_decode": "all",
+      "interval_seconds": 0.2,
+      "max_width": 1280
+    },
     "_options": {
       "type": "reolink (default if left out) | rtsp | http_snapshot",
       "rtsp_url": "the camera's full-resolution stream; a login typed into it is moved out automatically",
       "live_rtsp_url": "optional smaller stream just for the Live View popup",
-      "rtsp_decode": "keyframes (default: light on CPU, a picture every 1-4 s) | all (use if the camera sends key frames rarely)",
-      "interval_seconds": "how often to check the spaces (default 3)"
+      "rtsp_decode": "keyframes (default: light on CPU, a picture every 1-4 s) | all (every picture, needed for traffic counting)",
+      "interval_seconds": "seconds between pictures (default 3). Below 1 (e.g. 0.2 = 5 per second) needs type rtsp with rtsp_decode all",
+      "max_width": "optional, rtsp_decode all only: shrink wider pictures to this width to save CPU (e.g. 1280)",
+      "enabled": "optional: false keeps the settings but doesn't connect to the camera"
     }
   }
 }

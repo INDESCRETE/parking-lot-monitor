@@ -59,6 +59,10 @@ LIVE_DIR = DATA_DIR / "live"
 
 SUPPORTED_FRAME_POLICIES = ("none",)
 MIN_INTERVAL_SECONDS = 1.0
+# Traffic counting follows moving cars, so it needs several pictures a second.
+# That's only possible from a video stream decoded in full (type "rtsp" with
+# rtsp_decode "all"); snapshot cameras stay at one picture a second or slower.
+MIN_STREAM_INTERVAL_SECONDS = 0.1
 MAX_INTERVAL_SECONDS = 3600.0
 MAX_FRAME_BYTES = 20 * 1024 * 1024
 SNAPSHOT_TIMEOUT_SECONDS = 8.0
@@ -136,6 +140,11 @@ class CameraSource:
     # "keyframes" decodes only the stream's full frames (a picture every
     # 1-4 s on most cameras, very little CPU); "all" decodes everything.
     rtsp_decode: str = "keyframes"
+    # rtsp_decode "all" only: shrink wider pictures to this width (keeps the
+    # shape). Saves a lot of CPU when a 5MP main stream feeds traffic counting.
+    max_width: Optional[int] = None
+    # False keeps the camera's settings in the file but doesn't connect to it.
+    enabled: bool = True
 
     def snapshot_url(self) -> str:
         if self.type == "http_snapshot":
@@ -301,6 +310,17 @@ def parse_config(raw: Any) -> dict:
             )
         port_raw = entry.get("port")
         port = None if port_raw is None else _integer(entry, "port", 0, 1, 65535, camera_id)
+        enabled = entry.get("enabled", True)
+        if not isinstance(enabled, bool):
+            raise LiveConfigError(f'{camera_id}: "enabled" must be true or false.')
+        interval = _number(entry, "interval_seconds", 3.0, MIN_STREAM_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS, camera_id)
+        if interval < MIN_INTERVAL_SECONDS and not (camera_type == "rtsp" and decode == "all"):
+            raise LiveConfigError(
+                f'{camera_id}: "interval_seconds" under {MIN_INTERVAL_SECONDS:g} needs "type": "rtsp" '
+                'and "rtsp_decode": "all" (several pictures a second only come from a video stream).'
+            )
+        max_width_raw = entry.get("max_width")
+        max_width = None if max_width_raw is None else _integer(entry, "max_width", 0, 160, 7680, camera_id)
 
         sources[camera_id] = CameraSource(
             camera_id=camera_id,
@@ -311,7 +331,7 @@ def parse_config(raw: Any) -> dict:
             scheme=scheme,
             port=port,
             rtsp_port=_integer(entry, "rtsp_port", 554, 1, 65535, camera_id),
-            interval_seconds=_number(entry, "interval_seconds", 3.0, MIN_INTERVAL_SECONDS, MAX_INTERVAL_SECONDS, camera_id),
+            interval_seconds=interval,
             frame_policy=policy,
             live_fps=_number(entry, "live_fps", 2.0, 0.5, 10.0, camera_id),
             live_stream=stream,
@@ -320,6 +340,8 @@ def parse_config(raw: Any) -> dict:
             live_stream_url=live_stream_url,
             snapshot_address=snapshot_address,
             rtsp_decode=decode,
+            max_width=max_width,
+            enabled=enabled,
         )
     return sources
 
@@ -511,7 +533,11 @@ def build_rtsp_frame_command(source: CameraSource, url: str) -> list:
         command += ["-skip_frame", "nokey"]
     command += ["-i", url, "-an"]
     if source.rtsp_decode == "all":
-        command += ["-vf", f"fps=1/{source.interval_seconds:g}"]
+        filters = [f"fps={round(1.0 / source.interval_seconds, 4):g}"]
+        if source.max_width:
+            # Only ever shrink; -2 keeps the height even, as JPEG encoders like.
+            filters.append(f"scale='min({source.max_width},iw)':-2")
+        command += ["-vf", ",".join(filters)]
     command += _passthrough_flags(ffmpeg)
     command += ["-q:v", "3", "-f", "mpjpeg", "-boundary_tag", "frame", "pipe:1"]
     return command
@@ -800,11 +826,41 @@ def start_all(
             if allowed is not None and camera_id not in allowed:
                 print(f"Skipping live camera '{camera_id}': no camera with that id on the website.")
                 del sources[camera_id]
+        for camera_id in [c for c, src in sources.items() if not src.enabled]:
+            print(f"Live camera '{camera_id}' is turned off (\"enabled\": false in camera_sources.json).")
+            del sources[camera_id]
         for camera_id, source in sources.items():
             grabber = FrameGrabber(source, on_frame)
             _grabbers[camera_id] = grabber
             grabber.start()
     return sorted(sources)
+
+
+def start_camera(
+    camera_id: str,
+    on_frame: Optional[FrameCallback] = None,
+    config_path: Optional[Path] = None,
+) -> bool:
+    """Starts one camera's grabber if it has (enabled) settings in the file and
+    isn't running yet -- used right after a camera is added on the website, so
+    a new camera starts without restarting the server. Returns True if running."""
+    global _config_error
+    try:
+        sources = load_config(config_path)
+    except LiveConfigError as exc:
+        with _registry_lock:
+            _config_error = str(exc)
+        return False
+    source = sources.get(camera_id)
+    if source is None or not source.enabled:
+        return False
+    with _registry_lock:
+        if camera_id in _grabbers:
+            return True
+        grabber = FrameGrabber(source, on_frame)
+        _grabbers[camera_id] = grabber
+    grabber.start()
+    return True
 
 
 def stop_all() -> None:

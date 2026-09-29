@@ -65,6 +65,16 @@ Occupancy is assigned using a vehicle ground-anchor point near the bottom-center
 
 `ultralytics` (YOLOv8/YOLO11/etc.) is licensed **AGPL-3.0**, which applies even to internal or SaaS use — not just redistribution. Selling this as a product, or running it as a service for a customer, would legally require either open-sourcing the whole application or paying Ultralytics for an Enterprise license. RF-DETR is **Apache-2.0**: free to use in a closed-source, paid product with no revenue threshold and no source-disclosure obligation. (This isn't legal advice — verify current license terms directly before shipping commercially.)
 
+## Live Traffic Counting
+
+Each camera is either a **Parking** camera (mark spaces, see which are occupied) or a **Traffic** camera (draw lines, count vehicles crossing them). Pick the type in **+ Add Camera**. Traffic cameras live on their own page, `/traffic`.
+
+1. Give the camera a video-stream entry in `data/camera_sources.json` with `"type": "rtsp"`, `"rtsp_decode": "all"` and `"interval_seconds": 0.2` (5 pictures a second). See `reolink_traffic_counting` in `camera_sources.example.json`. One physical camera can feed both a parking camera and a traffic camera.
+2. On `/traffic`, press **Draw Line (L)** and click two points across the road or driveway. Name the line and its two directions (e.g. Northbound / Southbound). Drag a line's end dots to move it.
+3. Each tracked vehicle is counted once per line when the bottom-middle of its box crosses it. Counts appear live, are saved in `line_crossings`, and download as a CSV of 5/15/30/60-minute intervals per direction.
+
+The tracker is `app/tracking.py` (shared with `scripts/count_traffic.py` for recorded video); the live worker is `app/live_traffic.py`; tables and count summaries are in `app/traffic_store.py`.
+
 ## Project Shape
 
 ```text

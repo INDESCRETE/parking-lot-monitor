@@ -424,7 +424,8 @@ async function loadCameras() {
   cameraFilterSelect.innerHTML = '<option value="">Loading…</option>';
   try {
     const payload = await fetchJson(`/api/cameras?lot_id=${encodeURIComponent(state.lotId)}`);
-    state.cameras = payload.cameras;
+    // Traffic cameras count cars crossing lines; they have no parking spaces.
+    state.cameras = payload.cameras.filter((camera) => camera.kind !== "traffic");
     cameraFilterSelect.innerHTML = "";
     const allOption = document.createElement("option");
     allOption.value = "";

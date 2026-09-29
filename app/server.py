@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from app import analytics, health, live, live_detection, reports
+from app import analytics, health, live, live_detection, live_traffic, reports, traffic_store
 from app.intervals import DEFAULT_MIN_OCCUPIED_SECONDS, recompute_space_intervals
 from app.video_extract import FfmpegUnavailable, extract_frames
 
@@ -31,6 +31,8 @@ IMAGES_DIR = DATA_DIR / "images"
 SOURCE_VIDEOS_DIR = DATA_DIR / "source_videos"
 DB_PATH = DATA_DIR / "db" / "parking_lot.sqlite"
 DEFAULT_CAMERA_ID = "camera_1"
+# "parking": marked spaces, occupied/vacant. "traffic": counting lines, vehicles crossing them.
+CAMERA_KINDS = ("parking", "traffic")
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm", ".avi", ".mkv"}
 MAX_VIDEO_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB safety cap
@@ -413,6 +415,8 @@ class Database:
             self._migrate_camera_min_occupied_seconds_column(conn)
             self._migrate_space_intervals_nullable_image_ids(conn)
             self._migrate_parking_spaces_reference_size_columns(conn)
+            # Traffic counting: cameras.kind ("parking"/"traffic"), count_lines, line_crossings.
+            traffic_store.migrate(conn)
             # Seed the default "Camera 1" only into a genuinely empty install.
             # Doing it on every start would silently bring it back after the user
             # deliberately deleted it.
@@ -725,6 +729,7 @@ class Database:
                 conn.execute(f"DELETE FROM space_state_intervals WHERE parking_space_id IN ({marks})", chunk)
             conn.execute("DELETE FROM images WHERE camera_id = ?", (camera_id,))
             conn.execute("DELETE FROM parking_spaces WHERE camera_id = ?", (camera_id,))
+            lines_deleted = traffic_store.delete_for_camera(conn, camera_id)
             conn.execute("DELETE FROM cameras WHERE id = ?", (camera_id,))
             # The images folder must go before we commit: sync_images() re-creates a
             # camera from any folder it finds, so a leftover folder would bring the
@@ -742,12 +747,14 @@ class Database:
         # candidate space states) so a camera recreated with the same id
         # later doesn't inherit stale state from before the delete.
         live_detector.forget_camera(camera_id)
+        traffic_counter.forget_camera(camera_id)
         return {
             "deleted": True,
             "camera_id": camera_id,
             "name": camera["name"],
             "images_deleted": len(image_ids),
             "spaces_deleted": len(space_ids),
+            "lines_deleted": lines_deleted,
             "live_stopped": live_stopped,
             "warnings": warnings,
         }
@@ -897,6 +904,35 @@ class Database:
                 (lot_id,),
             ).fetchone()
             return dict(row) if row else None
+
+    # --- Traffic counting (see app/traffic_store.py) ---
+    def list_count_lines(self, camera_id: str) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return traffic_store.list_lines(conn, camera_id)
+
+    def get_count_line(self, line_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            return traffic_store.get_line(conn, line_id)
+
+    def create_count_line(self, camera_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        with self.connect() as conn:
+            return traffic_store.create_line(conn, camera_id, payload, live_traffic.default_direction_labels)
+
+    def update_count_line(self, line_id: int, payload: dict[str, Any]) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            return traffic_store.update_line(conn, line_id, payload)
+
+    def delete_count_line(self, line_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            return traffic_store.delete_line(conn, line_id)
+
+    def add_line_crossings(self, rows: list[dict[str, Any]]) -> None:
+        with self.connect() as conn:
+            traffic_store.add_crossings(conn, rows)
+
+    def traffic_counts(self, camera_id: str, start: datetime, end: datetime, bin_minutes: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            return traffic_store.counts(conn, camera_id, start, end, bin_minutes)
 
     def get_camera(self, camera_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -1096,7 +1132,7 @@ class Database:
             return item
 
     def create_camera(
-        self, name: str, camera_id: str | None = None, lot_id: int | None = None
+        self, name: str, camera_id: str | None = None, lot_id: int | None = None, kind: str = "parking"
     ) -> dict[str, Any]:
         """Creates a new, independent camera. Its images, marked spaces, and
         detection history are scoped entirely by camera_id (see list_images/
@@ -1108,6 +1144,8 @@ class Database:
         name = name.strip()
         if not name:
             raise ValueError("name is required")
+        if kind not in CAMERA_KINDS:
+            raise ValueError(f'kind must be one of: {", ".join(CAMERA_KINDS)}')
         with self.connect() as conn:
             # Reject a duplicate display name outright (case-insensitive):
             # two cameras that both show up as "Camera 2" in the picker are
@@ -1142,8 +1180,8 @@ class Database:
                 lot_id = self._ensure_unassigned_lot(conn)
 
             conn.execute(
-                "INSERT INTO cameras (id, name, lot_id, created_at) VALUES (?, ?, ?, ?)",
-                (resolved_camera_id, name, lot_id, utc_now()),
+                "INSERT INTO cameras (id, name, lot_id, kind, created_at) VALUES (?, ?, ?, ?, ?)",
+                (resolved_camera_id, name, lot_id, kind, utc_now()),
             )
             row = conn.execute(
                 """
@@ -1177,6 +1215,20 @@ def detection_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 db = Database(DB_PATH)
 live_detector = live_detection.LiveDetector(db)
+traffic_counter = live_traffic.TrafficCounter(db)
+
+
+def camera_kind(camera_id: str) -> str:
+    camera = db.get_camera(camera_id)
+    return (camera or {}).get("kind") or "parking"
+
+
+def on_live_frame(camera_id: str, jpeg: bytes, captured_at: str) -> None:
+    """Every live picture goes to the right worker for its camera's type."""
+    if camera_kind(camera_id) == "traffic":
+        traffic_counter.submit_frame(camera_id, jpeg, captured_at)
+    else:
+        live_detector.submit_frame(camera_id, jpeg, captured_at)
 
 
 def health_camera_statuses() -> list[dict[str, Any]]:
@@ -1189,7 +1241,11 @@ def health_camera_statuses() -> list[dict[str, Any]]:
                 "camera_id": camera_id,
                 "name": camera.get("name") or camera_id,
                 "grabber": live.get_status(camera_id),
-                "detection": live_detector.status(camera_id),
+                "detection": (
+                    traffic_counter.status(camera_id)
+                    if camera.get("kind") == "traffic"
+                    else live_detector.status(camera_id)
+                ),
             }
         )
     return statuses
@@ -1237,6 +1293,13 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_media(path)
         elif path == "/health":
             self.serve_file(STATIC_DIR / "health.html")
+        elif path == "/traffic":
+            self.serve_file(STATIC_DIR / "traffic.html")
+        elif path == "/api/lines":
+            camera_id = query.get("camera_id", [""])[0]
+            self.send_json({"lines": db.list_count_lines(camera_id)})
+        elif path in ("/api/traffic/counts", "/api/traffic/export.csv"):
+            self.handle_traffic_counts(query, as_csv=path.endswith(".csv"))
         elif path == "/api/health":
             self.send_json(health_monitor.status())
         elif path == "/api/cameras":
@@ -1358,10 +1421,15 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"error": "lot_id must be an integer"}, HTTPStatus.BAD_REQUEST)
                     return
             try:
-                camera = db.create_camera(name, camera_id=payload.get("camera_id"), lot_id=lot_id)
+                camera = db.create_camera(
+                    name, camera_id=payload.get("camera_id"), lot_id=lot_id, kind=payload.get("kind") or "parking"
+                )
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
                 return
+            # If camera_sources.json already has settings under this id, start
+            # reading pictures now instead of waiting for a server restart.
+            camera["live_started"] = live.start_camera(camera["id"], on_frame=on_live_frame)
             self.send_json({"camera": camera}, HTTPStatus.CREATED)
         elif parsed.path == "/api/clients":
             payload = self.read_json()
@@ -1370,6 +1438,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"error": "name is required"}, HTTPStatus.BAD_REQUEST)
                 return
             self.send_json({"client": db.create_client(name)}, HTTPStatus.CREATED)
+        elif parsed.path == "/api/lines":
+            payload = self.read_json()
+            camera_id = payload.get("camera_id") or ""
+            camera = db.get_camera(camera_id)
+            if camera is None:
+                self.send_json({"error": f'Camera "{camera_id}" does not exist.'}, HTTPStatus.NOT_FOUND)
+                return
+            if camera.get("kind") != "traffic":
+                self.send_json({"error": "Counting lines can only be added to a traffic camera."}, HTTPStatus.BAD_REQUEST)
+                return
+            try:
+                line = db.create_count_line(camera_id, payload)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            traffic_counter.lines_changed(camera_id)
+            self.send_json({"line": line}, HTTPStatus.CREATED)
         elif parsed.path == "/api/lots":
             payload = self.read_json()
             name = (payload.get("name") or "").strip()
@@ -1398,6 +1483,15 @@ class Handler(BaseHTTPRequestHandler):
         # 404'd) from whenever the image/camera delete feature was added
         # until this was noticed and merged into one method (2026-09-22).
         path = urlparse(self.path).path
+        line_match = re.fullmatch(r"/api/lines/(\d+)", path)
+        if line_match:
+            result = db.delete_count_line(int(line_match.group(1)))
+            if result is None:
+                self.send_json({"error": "That line no longer exists."}, HTTPStatus.NOT_FOUND)
+                return
+            traffic_counter.lines_changed(result["camera_id"])
+            self.send_json(result)
+            return
         space_match = re.fullmatch(r"/api/spaces/(\d+)", path)
         image_match = re.fullmatch(r"/api/images/(\d+)", path)
         camera_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)", path)
@@ -1456,6 +1550,19 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         parsed = urlparse(self.path)
+        line_match = re.fullmatch(r"/api/lines/(\d+)", parsed.path)
+        if line_match:
+            try:
+                line = db.update_count_line(int(line_match.group(1)), self.read_json())
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if line is None:
+                self.send_json({"error": "That line no longer exists."}, HTTPStatus.NOT_FOUND)
+                return
+            traffic_counter.lines_changed(line["camera_id"])
+            self.send_json({"line": line})
+            return
         space_match = re.fullmatch(r"/api/spaces/(\d+)", parsed.path)
         camera_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)", parsed.path)
         if space_match:
@@ -1701,7 +1808,10 @@ class Handler(BaseHTTPRequestHandler):
     def handle_live_get(self) -> bool:
         """Serves the live-camera routes. Returns False if the path isn't one."""
         path = urlparse(self.path).path
-        match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|live-debug|latest\.jpg|live\.mjpg)", path)
+        match = re.fullmatch(
+            r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|live-debug|latest\.jpg|live\.mjpg|traffic-view|traffic-frame\.jpg)",
+            path,
+        )
         if not match:
             return False
         camera_id, action = match.groups()
@@ -1713,9 +1823,57 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"camera_id": camera_id, "last_frame": live_detector.last_debug(camera_id)})
         elif action == "latest.jpg":
             self.serve_latest_frame(camera_id)
+        elif action == "traffic-view":
+            view = traffic_counter.view(camera_id)
+            view["camera"] = live.get_status(camera_id)
+            self.send_json(view)
+        elif action == "traffic-frame.jpg":
+            # The exact picture the boxes in traffic-view were found in.
+            body = traffic_counter.last_jpeg(camera_id)
+            if body is None:
+                self.serve_latest_frame(camera_id)
+            else:
+                self.send_bytes(body, "image/jpeg")
         else:
             self.stream_live(camera_id)
         return True
+
+    def send_bytes(self, body: bytes, content_type: str, extra_headers: dict[str, str] | None = None) -> None:
+        try:
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for key, value in (extra_headers or {}).items():
+                self.send_header(key, value)
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def handle_traffic_counts(self, query: dict[str, list[str]], as_csv: bool) -> None:
+        camera_id = query.get("camera_id", [""])[0]
+        camera = db.get_camera(camera_id)
+        if camera is None:
+            self.send_json({"error": f'Camera "{camera_id}" does not exist.'}, HTTPStatus.NOT_FOUND)
+            return
+        try:
+            start, end = parse_report_range(query)
+            bin_minutes = int(query.get("bin_minutes", ["15"])[0])
+            report = db.traffic_counts(camera_id, start, end, bin_minutes)
+        except ValueError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if not as_csv:
+            self.send_json(report)
+            return
+        day = start.astimezone().strftime("%Y-%m-%d")
+        filename = f"traffic-counts-{safe_segment(camera_id)}-{day}.csv"
+        self.send_bytes(
+            traffic_store.counts_csv(report).encode("utf-8"),
+            "text/csv; charset=utf-8",
+            {"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     def serve_latest_frame(self, camera_id: str) -> None:
         try:
@@ -1823,8 +1981,9 @@ def main() -> None:
     SOURCE_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     db.sync_images()
     live_detector.start()
+    traffic_counter.start()
     live_cameras = live.start_all(
-        on_frame=live_detector.submit_frame,
+        on_frame=on_live_frame,
         only_camera_ids=[camera["id"] for camera in db.list_cameras()],
     )
     if live_cameras:
