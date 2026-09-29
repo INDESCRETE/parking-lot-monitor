@@ -67,6 +67,8 @@ const cameraNameInput = document.querySelector("#cameraNameInput");
 const cancelCameraButton = document.querySelector("#cancelCameraButton");
 const runDetectionButton = document.querySelector("#runDetectionButton");
 const detectionStatus = document.querySelector("#detectionStatus");
+const pauseDetectionButton = document.querySelector("#pauseDetectionButton");
+const pausedNotice = document.querySelector("#pausedNotice");
 const minOccupiedInput = document.querySelector("#minOccupiedInput");
 const minOccupiedStatus = document.querySelector("#minOccupiedStatus");
 const liveViewButton = document.querySelector("#liveViewButton");
@@ -176,6 +178,7 @@ function setCameraControlsEnabled(hasCamera) {
     runDetectionButton,
     markSpaceButton,
     minOccupiedInput,
+    pauseDetectionButton,
   ]) {
     control.disabled = !hasCamera;
   }
@@ -189,6 +192,7 @@ async function loadCameraData() {
     setCameraControlsEnabled(false);
     configLink.removeAttribute("href");
     renderMinOccupiedInput();
+    renderPauseState();
     state.images = [];
     state.spaces = [];
     state.selectedImage = null;
@@ -201,6 +205,7 @@ async function loadCameraData() {
   setCameraControlsEnabled(true);
   configLink.href = `/api/config/${state.cameraId}`;
   renderMinOccupiedInput();
+  renderPauseState();
   const [imagesPayload, spacesPayload] = await Promise.all([
     fetchJson(`/api/images?camera_id=${encodeURIComponent(state.cameraId)}`),
     fetchJson(`/api/spaces?camera_id=${encodeURIComponent(state.cameraId)}`),
@@ -371,6 +376,50 @@ async function checkDetectionStatusOnce(cameraId) {
     await pollDetectionUntilDone(cameraId);
   }
 }
+
+// --- Pause / resume live detection ---------------------------------------
+// Paused cameras keep showing the live picture, but nothing is analysed or
+// recorded. The time shows up as "monitoring was interrupted" in History and
+// as unmonitored time in reports, rather than being counted as occupied or
+// vacant.
+function currentCamera() {
+  return state.cameras.find((camera) => camera.id === state.cameraId) || null;
+}
+
+function renderPauseState() {
+  const camera = currentCamera();
+  const paused = Boolean(camera?.paused);
+  pauseDetectionButton.textContent = paused ? "Resume Detection" : "Pause Detection";
+  pauseDetectionButton.classList.toggle("paused", paused);
+  pausedNotice.hidden = !paused;
+  if (paused) {
+    const since = camera.paused_changed_at ? ` since ${formatTimestamp(camera.paused_changed_at)}` : "";
+    pausedNotice.textContent = `Detection paused${since}. Nothing new is being recorded; the statuses below are from before the pause.`;
+  }
+}
+
+async function togglePause() {
+  const camera = currentCamera();
+  if (!camera) return;
+  const paused = !camera.paused;
+  pauseDetectionButton.disabled = true;
+  try {
+    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paused }),
+    });
+    Object.assign(camera, payload.camera);
+    setStatus(paused ? `Paused detection for "${camera.name}".` : `Resumed detection for "${camera.name}".`);
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    pauseDetectionButton.disabled = false;
+    renderPauseState();
+  }
+}
+
+pauseDetectionButton.addEventListener("click", togglePause);
 
 function renderCameras() {
   cameraSelect.innerHTML = "";
@@ -1400,6 +1449,7 @@ async function refreshLiveAvailability() {
   const cameraId = state.cameraId;
   if (!cameraId) {
     liveViewButton.hidden = true;
+    pauseDetectionButton.hidden = true;
     state.liveFeedConfigured = false;
     exitLiveFrame();
     updateLiveFeedControls();
@@ -1411,6 +1461,9 @@ async function refreshLiveAvailability() {
     liveViewButton.hidden = !(status.configured || status.config_error);
     state.liveFeedConfigured = Boolean(status.configured);
     state.liveFeedIntervalSeconds = status.interval_seconds || 3;
+    // Pausing only applies to live cameras (stored photos are only ever
+    // analysed when you press Run Detection).
+    pauseDetectionButton.hidden = !state.liveFeedConfigured;
     if (state.liveFeedConfigured) {
       enterLiveFeed();
     } else {
@@ -1419,6 +1472,7 @@ async function refreshLiveAvailability() {
     }
   } catch (error) {
     liveViewButton.hidden = true;
+    pauseDetectionButton.hidden = true;
     state.liveFeedConfigured = false;
     exitLiveFrame();
     updateLiveFeedControls();

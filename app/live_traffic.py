@@ -130,6 +130,13 @@ class TrafficCounter:
         with self._lock:
             self._lines_version[camera_id] = self._lines_version.get(camera_id, 0) + 1
 
+    def reset_camera(self, camera_id: str) -> None:
+        """Forget the tracker, last picture and boxes (used when paused). The
+        counters in status() and the recent crossings list are kept."""
+        with self._lock:
+            for store in (self._cameras, self._last_view, self._last_jpeg, self._frame_times):
+                store.pop(camera_id, None)
+
     def forget_camera(self, camera_id: str) -> None:
         with self._lock:
             for store in (self._cameras, self._lines_version, self._status, self._last_view,

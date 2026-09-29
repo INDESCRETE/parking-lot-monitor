@@ -736,10 +736,20 @@ class HealthMonitor:
 
             # Detection stalled: pictures arrive but nothing gets analysed.
             detect_key = f"detection:{camera_id}"
+            if cam.get("paused"):
+                # Switched off on purpose from the website: not a problem.
+                with self._lock:
+                    dropped = self._problems.pop(detect_key, None)
+                if dropped is not None:
+                    self._save_state()
+                continue
             camera_ok = last_frame is not None and (now - last_frame).total_seconds() < down_after
             detection = cam.get("detection") or {}
             last_detect = parse_iso(detection.get("last_frame_at"))
             detect_ref = max(last_detect or self.started_at, self.started_at)
+            resumed_at = parse_iso(cam.get("paused_changed_at"))
+            if resumed_at is not None:
+                detect_ref = max(detect_ref, resumed_at)  # time since it was switched back on
             if camera_ok and (now - detect_ref).total_seconds() >= stall_after:
                 error = detection.get("last_error") or "no error reported"
                 self._open_problem(

@@ -79,8 +79,10 @@
         <div class="toolbar">
           <button id="drawLineButton" type="button" title="Shortcut: L">Draw Line (L)</button>
           <button id="cancelDrawButton" type="button" hidden>Cancel</button>
+          <button id="pauseButton" type="button" class="pause-button" title="Stop or restart counting for this camera. The live picture keeps updating either way.">Pause Counting</button>
           <label class="toolbar-check"><input id="showBoxesInput" type="checkbox" checked> Show vehicles</label>
           <span id="trafficIndicator" class="live-feed-indicator" hidden>&#9679; Live</span>
+          <span id="pausedIndicator" class="paused-indicator" hidden>&#10074;&#10074; Paused</span>
           <span id="status" role="status"></span>
         </div>
         <div class="canvas-wrap">

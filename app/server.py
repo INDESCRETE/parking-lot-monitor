@@ -417,6 +417,7 @@ class Database:
             self._migrate_parking_spaces_reference_size_columns(conn)
             # Traffic counting: cameras.kind ("parking"/"traffic"), count_lines, line_crossings.
             traffic_store.migrate(conn)
+            self._migrate_camera_paused_columns(conn)
             # Seed the default "Camera 1" only into a genuinely empty install.
             # Doing it on every start would silently bring it back after the user
             # deliberately deleted it.
@@ -437,6 +438,16 @@ class Database:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
         if "lot_id" not in columns:
             conn.execute("ALTER TABLE cameras ADD COLUMN lot_id INTEGER REFERENCES lots(id)")
+
+    def _migrate_camera_paused_columns(self, conn: sqlite3.Connection) -> None:
+        """cameras.paused (1 = live detection/counting switched off from the
+        website; the picture keeps coming) and paused_changed_at (when it was
+        last paused or resumed)."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(cameras)")}
+        if "paused" not in columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        if "paused_changed_at" not in columns:
+            conn.execute("ALTER TABLE cameras ADD COLUMN paused_changed_at TEXT")
 
     def _migrate_camera_min_occupied_seconds_column(self, conn: sqlite3.Connection) -> None:
         """Add cameras.min_occupied_seconds if this DB predates the
@@ -855,6 +866,7 @@ class Database:
         *,
         lot_id: int | None = None,
         min_occupied_seconds: Any = _UNSET,
+        paused: bool | None = None,
     ) -> dict[str, Any] | None:
         """Updates whichever of a camera's settings were actually passed.
 
@@ -879,6 +891,12 @@ class Database:
                 conn.execute(
                     "UPDATE cameras SET min_occupied_seconds = ? WHERE id = ?",
                     (min_occupied_seconds, camera_id),
+                )
+            if paused is not None:
+                conn.execute(
+                    """UPDATE cameras SET paused = ?, paused_changed_at = ?
+                       WHERE id = ? AND paused != ?""",
+                    (int(paused), utc_now(), camera_id, int(paused)),
                 )
             row = conn.execute(
                 """
@@ -1224,8 +1242,13 @@ def camera_kind(camera_id: str) -> str:
 
 
 def on_live_frame(camera_id: str, jpeg: bytes, captured_at: str) -> None:
-    """Every live picture goes to the right worker for its camera's type."""
-    if camera_kind(camera_id) == "traffic":
+    """Every live picture goes to the right worker for its camera's type.
+    A paused camera's pictures still update the live view (the grabber
+    already saved latest.jpg) but aren't analysed or recorded."""
+    camera = db.get_camera(camera_id) or {}
+    if camera.get("paused"):
+        return
+    if camera.get("kind") == "traffic":
         traffic_counter.submit_frame(camera_id, jpeg, captured_at)
     else:
         live_detector.submit_frame(camera_id, jpeg, captured_at)
@@ -1241,6 +1264,8 @@ def health_camera_statuses() -> list[dict[str, Any]]:
                 "camera_id": camera_id,
                 "name": camera.get("name") or camera_id,
                 "grabber": live.get_status(camera_id),
+                "paused": bool(camera.get("paused")),
+                "paused_changed_at": camera.get("paused_changed_at"),
                 "detection": (
                     traffic_counter.status(camera_id)
                     if camera.get("kind") == "traffic"
@@ -1603,15 +1628,21 @@ class Handler(BaseHTTPRequestHandler):
                             HTTPStatus.BAD_REQUEST,
                         )
                         return
-            if lot_id is None and min_occupied_seconds is _UNSET:
+            paused: bool | None = None
+            if "paused" in payload:
+                if not isinstance(payload["paused"], bool):
+                    self.send_json({"error": "paused must be true or false"}, HTTPStatus.BAD_REQUEST)
+                    return
+                paused = payload["paused"]
+            if lot_id is None and min_occupied_seconds is _UNSET and paused is None:
                 self.send_json(
-                    {"error": "Provide lot_id and/or min_occupied_seconds to update."},
+                    {"error": "Provide lot_id, min_occupied_seconds and/or paused to update."},
                     HTTPStatus.BAD_REQUEST,
                 )
                 return
             try:
                 camera = db.update_camera(
-                    camera_match.group(1), lot_id=lot_id, min_occupied_seconds=min_occupied_seconds
+                    camera_match.group(1), lot_id=lot_id, min_occupied_seconds=min_occupied_seconds, paused=paused
                 )
             except ValueError as exc:
                 self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
@@ -1619,6 +1650,10 @@ class Handler(BaseHTTPRequestHandler):
             if camera is None:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
+            if paused:
+                # Drop the traffic tracker and its last picture/boxes, so the
+                # page shows the plain live picture instead of stale boxes.
+                traffic_counter.reset_camera(camera["id"])
             self.send_json({"camera": camera})
         else:
             self.send_error(HTTPStatus.NOT_FOUND)

@@ -1129,3 +1129,26 @@ body.dashboard-body {
 #trafficCanvas.drawing {
   cursor: crosshair;
 }
+
+/* --- Pause / resume live detection ---------------------------------------- */
+.pause-button.paused {
+  background: var(--draft);
+  border-color: var(--draft);
+  color: #1f1300;
+  font-weight: 700;
+}
+
+.paused-indicator {
+  color: var(--draft);
+  font-weight: 700;
+}
+
+.paused-notice {
+  background: color-mix(in srgb, var(--draft) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--draft) 45%, transparent);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+}

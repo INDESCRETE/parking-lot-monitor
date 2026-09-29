@@ -221,6 +221,17 @@ class CounterTests(unittest.TestCase):
         self.assertEqual(status["frames_processed"], 2)
         self.assertEqual(status["last_frame_at"], iso(0.2))
 
+    def test_reset_camera_drops_picture_and_tracks_but_keeps_counters(self):
+        self.drive([100, 130, 160, 190, 220, 250])
+        self.counter.reset_camera("street")
+        self.assertIsNone(self.counter.last_jpeg("street"))
+        view = self.counter.view("street")
+        self.assertNotIn("tracks", view)
+        self.assertEqual(len(view["recent_crossings"]), 1)
+        self.assertEqual(view["status"]["frames_processed"], 6)
+        # Starts over with a fresh tracker: the same car isn't counted twice.
+        self.assertEqual(self.drive([280, 290, 300], start_t=2.0), [])
+
     def test_forget_camera(self):
         self.drive([100, 130])
         self.counter.forget_camera("street")

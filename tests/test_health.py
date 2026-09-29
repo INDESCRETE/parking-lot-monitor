@@ -197,6 +197,29 @@ class HealthTests(unittest.TestCase):
         h.camera(last_frame_ago_s=2, detect_ago_s=2); h.tick()
         self.assertEqual(h.titles()[-1], "Test Lot: Car detection working again for 'Front lot'")
 
+    def test_paused_camera_is_not_a_detection_stall(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=2, detect_ago_s=15 * 60)
+        h.cameras[0]["paused"] = True
+        h.tick()
+        self.assertEqual(h.titles(), [])
+        # Resumed 1 minute ago: the clock for "stalled" starts at the resume.
+        h.cameras[0]["paused"] = False
+        h.cameras[0]["paused_changed_at"] = (self.clock() - timedelta(minutes=1)).isoformat()
+        h.tick()
+        self.assertEqual(h.titles(), [])
+
+    def test_pausing_clears_an_open_stall_quietly(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=2, detect_ago_s=15 * 60); h.tick()
+        self.assertEqual(len(h.titles()), 1)
+        h.cameras[0]["paused"] = True
+        h.tick()
+        self.assertEqual(len(h.titles()), 1)
+        self.assertFalse([p for p in h.monitor.problems() if p["key"].startswith("detection:")])
+
     # -- internet / outbox ----------------------------------------------------------
     def test_alerts_queue_while_offline_and_survive_restart(self):
         h = Harness(self.tmp, self.clock, BASE_CONFIG, online=False, fail_send=True); h.start()

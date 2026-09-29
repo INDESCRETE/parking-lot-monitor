@@ -29,6 +29,7 @@ const state = {
 const VIEW_POLL_MS = 400;
 const COUNTS_POLL_MS = 5000;
 const IDLE_FRAME_REFRESH_MS = 2000; // before anything's been analysed
+const PAUSED_FRAME_REFRESH_MS = 1000; // plain live picture while paused
 const HANDLE_RADIUS_SCREEN = 10;
 const CAMERA_STORAGE_KEY = "parkingLotMonitor.lastTrafficCameraId";
 
@@ -48,6 +49,8 @@ const drawLineButton = $("#drawLineButton");
 const cancelDrawButton = $("#cancelDrawButton");
 const showBoxesInput = $("#showBoxesInput");
 const trafficIndicator = $("#trafficIndicator");
+const pausedIndicator = $("#pausedIndicator");
+const pauseButton = $("#pauseButton");
 const lineDialog = $("#lineDialog");
 const lineForm = $("#lineForm");
 const lineDialogTitle = $("#lineDialogTitle");
@@ -404,6 +407,7 @@ async function loadCameras(preferredId) {
   deleteCameraButton.disabled = !state.cameraId;
   drawLineButton.disabled = !state.cameraId;
   downloadButton.disabled = !state.cameraId;
+  pauseButton.disabled = !state.cameraId;
   try {
     if (state.cameraId) localStorage.setItem(CAMERA_STORAGE_KEY, state.cameraId);
   } catch (error) {
@@ -486,7 +490,8 @@ async function pollView() {
     renderCrossings(view.recent_crossings || []);
     const seq = view.frame_seq ?? null;
     const nothingAnalysedYet = seq === null;
-    const due = nothingAnalysedYet && Date.now() - state.lastFrameRequest > IDLE_FRAME_REFRESH_MS;
+    const refreshMs = selectedCamera()?.paused ? PAUSED_FRAME_REFRESH_MS : IDLE_FRAME_REFRESH_MS;
+    const due = nothingAnalysedYet && Date.now() - state.lastFrameRequest > refreshMs;
     if ((seq !== null && seq !== state.frameSeq) || due) {
       state.lastFrameRequest = Date.now();
       await loadFrame(cameraId, view, seq);
@@ -529,6 +534,15 @@ function renderConnection(view) {
   const status = view.status || {};
   let text = "";
   let kind = "";
+  const paused = Boolean(selectedCamera()?.paused);
+  renderPauseButton();
+  if (camera.configured && paused) {
+    const since = selectedCamera().paused_changed_at;
+    connectionStatus.className = "traffic-connection";
+    connectionStatus.textContent = `Counting paused${since ? " since " + formatHour(since) : ""}. The picture stays live, but no vehicles are tracked or counted.`;
+    trafficIndicator.hidden = true;
+    return;
+  }
   if (!camera.configured) {
     kind = "problem";
     text = camera.config_error
@@ -556,6 +570,33 @@ function renderConnection(view) {
   connectionStatus.className = `traffic-connection ${kind}`;
   connectionStatus.innerHTML = text;
   trafficIndicator.hidden = kind !== "ok";
+}
+
+function renderPauseButton() {
+  const paused = Boolean(selectedCamera()?.paused);
+  pauseButton.textContent = paused ? "Resume Counting" : "Pause Counting";
+  pauseButton.classList.toggle("paused", paused);
+  pausedIndicator.hidden = !paused || !state.cameraId;
+}
+
+async function togglePause() {
+  const camera = selectedCamera();
+  if (!camera) return;
+  const paused = !camera.paused;
+  pauseButton.disabled = true;
+  try {
+    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { paused }));
+    Object.assign(camera, payload.camera);
+    state.frameSeq = null; // show the plain picture (or the next analysed one) right away
+    state.lastFrameRequest = 0;
+    setStatus(paused ? "Counting paused." : "Counting resumed.");
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    pauseButton.disabled = false;
+    renderPauseButton();
+    pollView();
+  }
 }
 
 function lineTotals(lineId) {
@@ -796,6 +837,7 @@ $("#confirmCancelButton").addEventListener("click", () => confirmDialog.close("c
 
 drawLineButton.addEventListener("click", () => (state.mode === "drawing" ? cancelDrawing() : startDrawing()));
 cancelDrawButton.addEventListener("click", cancelDrawing);
+pauseButton.addEventListener("click", togglePause);
 showBoxesInput.addEventListener("change", draw);
 
 canvas.addEventListener("mousedown", (event) => {
