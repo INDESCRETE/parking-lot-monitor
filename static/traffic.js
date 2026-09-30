@@ -635,7 +635,7 @@ function lineTotals(lineId) {
   return line ? line.totals : null;
 }
 
-// "IN" / "OUT" tags on a driveway line's two directions.
+// "into lot" / "out of lot" tags on an entrance/exit line's two directions.
 function flowTag(line, direction) {
   if (!line.entry_direction) return "";
   const entering = line.entry_direction === direction;
@@ -673,7 +673,7 @@ lotSelect.addEventListener("change", async () => {
   try {
     const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { lot_id: Number(lotSelect.value) }));
     Object.assign(camera, payload.camera);
-    setStatus(`"${camera.name}" now belongs to ${lotSelect.selectedOptions[0]?.textContent}. Its driveway lines count toward that lot's entries and exits.`);
+    setStatus(`"${camera.name}" now belongs to ${lotSelect.selectedOptions[0]?.textContent}. Its entrance/exit lines count toward that lot's entries and exits.`);
   } catch (error) {
     setStatus(error.message);
     renderLotSelect();
@@ -688,7 +688,7 @@ function renderLines() {
   }
   if (state.lines.length === 0) {
     lineList.innerHTML =
-      '<p class="line-empty">No lines yet. Click <strong>Draw Line</strong>, then click two points across the road or driveway. Each vehicle whose bottom edge crosses it is counted once.</p>';
+      '<p class="line-empty">No lines yet. Click <strong>Draw Line</strong>, then click two points across the road or a lot entrance/exit. Each vehicle whose bottom edge crosses it is counted once.</p>';
     return;
   }
   lineList.innerHTML = "";
@@ -864,7 +864,7 @@ function openLineDialog(line) {
   lineNameInput.select();
 }
 
-// The driveway choices use the direction names typed above them.
+// The entrance/exit choices use the direction names typed above them.
 function updateEntryOptions() {
   const a = forwardLabelInput.value.trim() || "Direction A";
   const b = reverseLabelInput.value.trim() || "Direction B";

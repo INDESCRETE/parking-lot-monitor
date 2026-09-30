@@ -1178,7 +1178,7 @@ body.dashboard-body {
   --warn-text: #fbbf24;
 }
 
-/* Lot driveway lines on the Traffic page */
+/* Lot entrance/exit lines on the Traffic page */
 .traffic-lot-row {
   margin-top: 8px;
 }

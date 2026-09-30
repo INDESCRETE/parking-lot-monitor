@@ -7,9 +7,9 @@ count_lines     one row per line drawn on a traffic camera. Coordinates are
                 fractions of the picture (0-1), so they don't depend on the
                 stream's resolution. forward_label/reverse_label are the names
                 shown for each direction (e.g. "Northbound"/"Southbound").
-                entry_direction marks a lot driveway: "forward" or "reverse"
+                entry_direction marks a lot entrance/exit: "forward" or "reverse"
                 is the direction that goes INTO the lot (the other one is out);
-                NULL means the line isn't a driveway (e.g. a street).
+                NULL means the line isn't one (e.g. a street).
 line_crossings  one row per vehicle crossing a line: when (UTC), which way,
                 and what kind of vehicle.
 traffic_coverage  the stretches of time a traffic camera was actually being
@@ -438,7 +438,7 @@ def counts_csv(report: dict) -> str:
 
 # --- Lot entries and exits ----------------------------------------------------------
 
-# An hour counts toward "average by hour of day" only when every driveway
+# An hour counts toward "average by hour of day" only when every entrance/exit
 # camera in the lot was watched for at least this share of it; a half-missed
 # hour would otherwise drag the average down.
 MIN_HOUR_COVERAGE = 0.5
@@ -446,11 +446,11 @@ MIN_HOUR_COVERAGE = 0.5
 
 def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: datetime) -> Optional[dict]:
     """Vehicles entering and leaving a lot, from the traffic cameras assigned to
-    it and their lines marked as driveways. None when the lot has no driveway
+    it and their lines marked as entrance/exit. None when the lot has no such
     lines (so pages can leave the section out).
 
     Hours and days are local time. Coverage per hour is the lowest of the
-    driveway cameras' (a lot is only fully counted when every entrance is)."""
+    entrance/exit cameras' (a lot is only fully counted when every entrance is)."""
     lines = conn.execute(
         """SELECT count_lines.* FROM count_lines
            JOIN cameras ON cameras.id = count_lines.camera_id
@@ -493,7 +493,7 @@ def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: dateti
         else:
             outs[slot] += 1
 
-    # Seconds watched per slot: the minimum over the driveway cameras.
+    # Seconds watched per slot: the minimum over the entrance/exit cameras.
     watched = [None] * len(slots)
     for camera_id in camera_ids:
         per_slot = [0.0] * len(slots)

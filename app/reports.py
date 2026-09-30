@@ -395,7 +395,7 @@ def _grouped_bar_chart(
 
 
 def _flow_panel(flow: dict[str, Any] | None) -> str:
-    """Entries & exits section, or "" when the lot has no driveway lines."""
+    """Entries & exits section, or "" when the lot has no entrance/exit lines."""
     if not flow:
         return ""
     legend = (
@@ -432,12 +432,12 @@ def _flow_panel(flow: dict[str, Any] | None) -> str:
         f"({busiest['in']:g} in, {busiest['out']:g} out)."
         if busiest else ""
     )
-    coverage_text = f"Driveways were watched {watched}% of this period"
+    coverage_text = f"Entrances/exits were watched {watched}% of this period"
     coverage_text += "; counts don't include vehicles that passed while they weren't." if watched < 95 else "."
     return f"""
   <section class="panel">
     <h2>Entries &amp; Exits</h2>
-    <p class="panel-sub">Vehicles driving into and out of the lot, counted at its driveways.</p>
+    <p class="panel-sub">Vehicles driving into and out of the lot, counted at its entrances and exits.</p>
     <p class="headline"><strong>{flow["totals"]["in"]}</strong> vehicles entered and <strong>{flow["totals"]["out"]}</strong> left.{escape(busiest_text)}</p>
     <div class="subhead">Average by hour of day</div>
     {hour_chart}

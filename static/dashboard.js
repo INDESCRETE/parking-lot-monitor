@@ -334,8 +334,8 @@ function flowLegend(inColor, outColor) {
   return `<div class="flow-legend"><span><i style="background:${inColor}"></i>Entering</span><span><i style="background:${outColor}"></i>Leaving</span></div>`;
 }
 
-/** Entries & exits (lot driveways on the lot's traffic cameras). Hidden when
- * the lot has no driveway lines. */
+/** Entries & exits (lines marked as lot entrance/exit on the lot's traffic
+ * cameras). Hidden when the lot has none. */
 function renderFlow(flow) {
   flowPanel.hidden = !flow;
   if (!flow) return;
@@ -349,8 +349,8 @@ function renderFlow(flow) {
   const lines = flow.lines.map((l) => l.name).join(", ");
   flowSummary.innerHTML =
     `<strong>${flow.totals.in}</strong> entered and <strong>${flow.totals.out}</strong> left.${escapeHtml(busiest)} ` +
-    `<span class="flow-muted">From driveway line${flow.lines.length === 1 ? "" : "s"}: ${escapeHtml(lines)}. ` +
-    `Driveways watched ${escapeHtml(watchedText)} of this range${watchedPct < 95 ? "; vehicles that passed while they weren't watched aren't included" : ""}.</span>`;
+    `<span class="flow-muted">From entrance/exit line${flow.lines.length === 1 ? "" : "s"}: ${escapeHtml(lines)}. ` +
+    `Entrances/exits watched ${escapeHtml(watchedText)} of this range${watchedPct < 95 ? "; vehicles that passed while they weren't watched aren't included" : ""}.</span>`;
   const fmt = (v) => `${Math.round(v * 10) / 10} vehicles`;
   flowHourChart.innerHTML = withFlowLegend(
     groupedBarChartSvg(
