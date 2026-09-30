@@ -9,6 +9,7 @@ and a tiny local web server stands in for a snapshot camera.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -88,6 +89,47 @@ class ConfigTests(unittest.TestCase):
 
 
 # --- snapshot camera ---------------------------------------------------------
+
+class CopyConnectionTests(unittest.TestCase):
+    """Connecting a new app camera to a physical camera another one already uses."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "camera_sources.json"
+        self.path.write_text(json.dumps({
+            "_comment": "keep me",
+            "reolink_live": {"host": "192.168.1.50", "username": "admin", "password": "p@ss", "interval_seconds": 3},
+            "street_traffic": {"type": "rtsp", "rtsp_url": "rtsp://192.168.1.50:554/Preview_01_sub",
+                               "username": "admin", "password": "p@ss", "rtsp_decode": "all", "interval_seconds": 0.2},
+        }))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_traffic_camera_from_reolink_snapshot_uses_the_video_stream(self):
+        entry = live.copy_connection("reolink_live", "gate", "traffic", self.path)
+        self.assertEqual(entry["type"], "rtsp")
+        self.assertEqual(entry["rtsp_url"], "rtsp://192.168.1.50:554/Preview_01_sub")
+        self.assertEqual((entry["rtsp_decode"], entry["interval_seconds"]), ("all", 0.2))
+        saved = json.loads(self.path.read_text())
+        self.assertEqual(saved["_comment"], "keep me")
+        self.assertEqual(live.load_config(self.path)["gate"].password, "p@ss")
+
+    def test_parking_camera_from_traffic_stream_slows_down(self):
+        entry = live.copy_connection("street_traffic", "lot", "parking", self.path)
+        self.assertEqual((entry["rtsp_decode"], entry["interval_seconds"]), ("keyframes", 3))
+
+    def test_refuses_to_overwrite_or_copy_nothing(self):
+        with self.assertRaises(live.LiveConfigError):
+            live.copy_connection("street_traffic", "reolink_live", "traffic", self.path)
+        with self.assertRaises(live.LiveConfigError):
+            live.copy_connection("nope", "gate", "traffic", self.path)
+
+    def test_choices_never_include_the_login(self):
+        choices = live.connection_choices(self.path)
+        self.assertEqual([c["camera_id"] for c in choices], ["reolink_live", "street_traffic"])
+        self.assertNotIn("p@ss", json.dumps(choices))
+
 
 class _SnapshotHandler(BaseHTTPRequestHandler):
     mode = "basic"  # or "digest" / "none"

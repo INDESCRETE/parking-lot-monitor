@@ -36,6 +36,10 @@ const CAMERA_STORAGE_KEY = "parkingLotMonitor.lastTrafficCameraId";
 const $ = (selector) => document.querySelector(selector);
 const cameraSelect = $("#cameraSelect");
 const connectionStatus = $("#connectionStatus");
+const connectPanel = $("#connectPanel");
+const connectFromSelect = $("#connectFromSelect");
+const connectButton = $("#connectButton");
+const connectHint = $("#connectHint");
 const lineList = $("#lineList");
 const crossingList = $("#crossingList");
 const countsRangeLabel = $("#countsRangeLabel");
@@ -563,6 +567,56 @@ function speedNotes(camera, status) {
   return notes;
 }
 
+// --- Connecting a new camera to one that's already set up --------------------
+// The connection details (address and login) are copied on the server, so
+// the password never reaches the browser.
+async function showConnectPanel(show) {
+  if (!show) {
+    connectPanel.hidden = true;
+    return;
+  }
+  if (!connectPanel.hidden && connectPanel.dataset.cameraId === state.cameraId) return;
+  connectPanel.hidden = false;
+  connectPanel.dataset.cameraId = state.cameraId;
+  connectFromSelect.innerHTML = "";
+  let sources = [];
+  try {
+    sources = (await fetchJson("/api/camera-sources")).sources.filter((s) => s.camera_id !== state.cameraId);
+  } catch (error) {
+    sources = [];
+  }
+  for (const source of sources) {
+    const option = document.createElement("option");
+    option.value = source.camera_id;
+    option.textContent = `${source.name} (${source.host})`;
+    connectFromSelect.append(option);
+  }
+  const none = sources.length === 0;
+  connectFromSelect.disabled = none;
+  connectButton.disabled = none;
+  connectHint.textContent = none
+    ? "No other camera is set up yet. A brand-new camera's address and login still have to be added by hand for now."
+    : "Picks up the same physical camera, set up for this page. For a different physical camera, its address and login have to be added by hand for now.";
+}
+
+connectButton.addEventListener("click", async () => {
+  const camera = selectedCamera();
+  const from = connectFromSelect.value;
+  if (!camera || !from) return;
+  connectButton.disabled = true;
+  try {
+    const result = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}/connect`, jsonRequest("POST", { copy_from: from }));
+    setStatus(result.connected ? "Connected. The first picture takes a few seconds." : "Saved, but it didn't start. Check the Health page.");
+    connectPanel.hidden = true;
+    state.lastFrameRequest = 0;
+    pollView();
+  } catch (error) {
+    setStatus(error.message);
+  } finally {
+    connectButton.disabled = false;
+  }
+});
+
 function renderConnection(view) {
   const camera = view.camera || {};
   const status = view.status || {};
@@ -577,11 +631,12 @@ function renderConnection(view) {
     trafficIndicator.hidden = true;
     return;
   }
+  showConnectPanel(!camera.configured && !camera.config_error);
   if (!camera.configured) {
     kind = "problem";
     text = camera.config_error
       ? `Camera settings problem: ${escapeHtml(camera.config_error)}`
-      : `Not connected to a camera yet. Its settings go in <code>data/camera_sources.json</code> under <code>"${escapeHtml(state.cameraId)}"</code>, then restart the server.`;
+      : "Not connected to a camera yet.";
   } else if (camera.last_error && camera.consecutive_failures > 0) {
     kind = "problem";
     text = `Camera problem: ${escapeHtml(camera.last_error)}`;

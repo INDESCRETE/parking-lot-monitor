@@ -347,6 +347,91 @@ def parse_config(raw: Any) -> dict:
     return sources
 
 
+# How pictures are taken for each kind of app camera. Traffic counting follows
+# moving cars (5 pictures a second from the video stream); parking only needs
+# the current state of the spaces every few seconds.
+KIND_STREAM_SETTINGS = {
+    "traffic": {"rtsp_decode": "all", "interval_seconds": 0.2},
+    "parking": {"rtsp_decode": "keyframes", "interval_seconds": 3},
+}
+
+
+def _read_raw_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise LiveConfigError(f"camera_sources.json is not valid JSON (line {exc.lineno}, column {exc.colno}).")
+    if not isinstance(raw, dict):
+        raise LiveConfigError("camera_sources.json must be a JSON object keyed by camera id.")
+    return raw
+
+
+def connection_choices(path: Optional[Path] = None) -> list:
+    """Cameras whose connection settings can be reused for another app camera
+    (id, type and address only -- never the login)."""
+    try:
+        sources = load_config(path)
+    except LiveConfigError:
+        return []
+    return [
+        {"camera_id": cid, "type": src.type, "host": src.host, "enabled": src.enabled}
+        for cid, src in sorted(sources.items())
+    ]
+
+
+def entry_for_kind(entry: dict, kind: str) -> dict:
+    """A copy of one camera's settings, adjusted to how `kind` takes pictures.
+    A Reolink snapshot entry becomes its video stream when used for traffic
+    (snapshots can't come 5 times a second)."""
+    new = {k: v for k, v in entry.items() if not k.startswith("_") and k != "enabled"}
+    camera_type = new.get("type", "reolink")
+    if kind == "traffic" and camera_type == "reolink":
+        port = new.get("rtsp_port", 554)
+        channel = new.get("channel", 0)
+        new = {
+            "type": "rtsp",
+            "rtsp_url": f"rtsp://{new['host']}:{port}/Preview_{channel + 1:02d}_sub",
+            "username": new.get("username", ""),
+            "password": new.get("password", ""),
+        }
+        camera_type = "rtsp"
+    if camera_type == "rtsp":
+        new.update(KIND_STREAM_SETTINGS.get(kind, KIND_STREAM_SETTINGS["parking"]))
+    else:
+        new["interval_seconds"] = max(1, KIND_STREAM_SETTINGS["parking"]["interval_seconds"])
+        new.pop("rtsp_decode", None)
+    return new
+
+
+def copy_connection(from_id: str, to_id: str, kind: str, path: Optional[Path] = None) -> dict:
+    """Gives camera `to_id` the same physical camera as `from_id`, set up for
+    `kind`, and saves it to camera_sources.json (login stays in that file).
+    Raises LiveConfigError with a plain message if it can't."""
+    path = path or CONFIG_PATH
+    raw = _read_raw_config(path)
+    entry = raw.get(from_id)
+    if not isinstance(entry, dict) or from_id.startswith("_"):
+        raise LiveConfigError(f'"{from_id}" has no connection settings to copy.')
+    if to_id in raw:
+        raise LiveConfigError(f'"{to_id}" already has connection settings.')
+    if not _CAMERA_ID_RE.match(to_id):
+        raise LiveConfigError(f'"{to_id}" is not a valid camera id.')
+    updated = dict(raw)
+    updated[to_id] = entry_for_kind(entry, kind)
+    parse_config(updated)  # never save something that won't load
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    temp.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(temp, 0o600)  # it holds camera passwords
+    except OSError:
+        pass
+    os.replace(temp, path)
+    return updated[to_id]
+
+
 def load_config(path: Optional[Path] = None) -> dict:
     """Loads and validates the config. A missing file just means "no live cameras"."""
     path = path or CONFIG_PATH

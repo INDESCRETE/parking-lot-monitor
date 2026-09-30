@@ -1340,6 +1340,15 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "health.html")
         elif path == "/traffic":
             self.serve_file(STATIC_DIR / "traffic.html")
+        elif path == "/api/camera-sources":
+            # Cameras whose connection can be reused by another app camera.
+            names = {camera["id"]: camera["name"] for camera in db.list_cameras()}
+            running = set(live.configured_camera_ids())
+            self.send_json({"sources": [
+                dict(source, name=names[source["camera_id"]], running=source["camera_id"] in running)
+                for source in live.connection_choices()
+                if source["camera_id"] in names
+            ]})
         elif path == "/api/lines":
             camera_id = query.get("camera_id", [""])[0]
             self.send_json({"lines": db.list_count_lines(camera_id)})
@@ -1404,6 +1413,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        connect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/connect", parsed.path)
+        if connect_match:
+            self.handle_camera_connect(connect_match.group(1))
+            return
         detect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/detect", parsed.path)
         if detect_match:
             camera_id = detect_match.group(1)
@@ -1909,6 +1922,26 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def handle_camera_connect(self, camera_id: str) -> None:
+        """Connects an app camera to the same physical camera another one uses
+        (settings copied server side, so the login never reaches the browser)."""
+        camera = db.get_camera(camera_id)
+        if camera is None:
+            self.send_json({"error": f'Camera "{camera_id}" does not exist.'}, HTTPStatus.NOT_FOUND)
+            return
+        payload = self.read_json()
+        copy_from = payload.get("copy_from") or ""
+        if db.get_camera(copy_from) is None:
+            self.send_json({"error": "Pick a camera to copy the connection from."}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            live.copy_connection(copy_from, camera_id, camera.get("kind") or "parking")
+        except live.LiveConfigError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        started = live.start_camera(camera_id, on_frame=on_live_frame)
+        self.send_json({"connected": started, "status": live.get_status(camera_id)})
 
     def handle_traffic_counts(self, query: dict[str, list[str]], as_csv: bool) -> None:
         camera_id = query.get("camera_id", [""])[0]

@@ -48,6 +48,14 @@
             <select id="lotSelect" aria-label="Which lot this camera belongs to"></select>
           </div>
           <p id="connectionStatus" class="traffic-connection" role="status"></p>
+          <div id="connectPanel" class="connect-panel" hidden>
+            <label for="connectFromSelect">Use the same camera as</label>
+            <div class="connect-row">
+              <select id="connectFromSelect"></select>
+              <button type="button" id="connectButton">Connect</button>
+            </div>
+            <p id="connectHint" class="traffic-muted"></p>
+          </div>
         </section>
 
         <section>

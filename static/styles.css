@@ -1292,3 +1292,30 @@ body.dashboard-body {
   font-size: 11px;
   font-weight: 400;
 }
+
+/* Traffic page: connect a new camera to an existing one */
+.connect-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.connect-panel label {
+  margin-bottom: 6px;
+}
+
+.connect-row {
+  display: flex;
+  gap: 8px;
+}
+
+.connect-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.connect-panel .traffic-muted {
+  line-height: 1.4;
+  margin: 8px 0 0;
+}
