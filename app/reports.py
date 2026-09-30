@@ -21,6 +21,10 @@ OCCUPIED = "#dc2626"
 VACANT = "#26a69a"
 MUTED = "#6f7782"
 LINE = "#d8dde5"
+# Entries / exits (validated as a two-colour pair against the light surface,
+# same values as --flow-in / --flow-out in static/styles.css).
+FLOW_IN = "#2563eb"
+FLOW_OUT = "#c2410c"
 
 
 def _format_pct(rate: float | None) -> str:
@@ -329,6 +333,121 @@ def _full_hours_panel(full: dict[str, Any], peak_hours: list[dict[str, Any]]) ->
     return "".join(lines)
 
 
+def _grouped_bar_chart(
+    labels: list[str],
+    series_a: list[float | None],
+    series_b: list[float | None],
+    *,
+    colors: tuple[str, str],
+    names: tuple[str, str],
+    value_formatter,
+    width: int = 760,
+    height: int = 220,
+    label_every: int | None = None,
+    integer_axis: bool = False,
+    empty_note: str = "No data in this range.",
+) -> str:
+    """Two bars per category side by side (2px apart). Mirrors
+    static/dashboard.js's groupedBarChartSvg. None leaves a gap."""
+    if not labels or all(v is None for v in (*series_a, *series_b)):
+        return f'<p class="empty-note">{escape(empty_note)}</p>'
+    padding_left, padding_bottom, padding_top = 42, 28, 12
+    plot_width = width - padding_left - 10
+    plot_height = height - padding_bottom - padding_top
+    n = len(labels)
+    slot = plot_width / n
+    group_width = slot * 0.72
+    bar_width = max(1.5, (group_width - 2) / 2)
+    numeric = [v for v in (*series_a, *series_b) if v is not None]
+    data_max = max(max(numeric) if numeric else 1.0, 1e-9)
+    nice_max, ticks = _nice_ticks(max(data_max, 4.0) if integer_axis else data_max)
+    if integer_axis:
+        ticks = [t for t in ticks if float(t).is_integer()]
+    parts = []
+    for tick in ticks:
+        y = padding_top + plot_height - (tick / nice_max) * plot_height
+        parts.append(f'<line x1="{padding_left}" y1="{y:.1f}" x2="{width - 10}" y2="{y:.1f}" stroke="{LINE}" stroke-width="1"/>')
+        parts.append(
+            f'<text x="{padding_left - 6}" y="{y:.1f}" font-size="10" fill="{MUTED}" text-anchor="end" '
+            f'dominant-baseline="middle">{escape(f"{round(tick, 1):g}")}</text>'
+        )
+    stride = label_every or max(1, n // 12)
+    for i, label in enumerate(labels):
+        group_x = padding_left + i * slot + (slot - group_width) / 2
+        for k, value in enumerate((series_a[i], series_b[i])):
+            if value is None:
+                continue
+            x = group_x + k * (bar_width + 2)
+            h = max(1.5 if value > 0 else 0.0, value / nice_max * plot_height)
+            y = padding_top + plot_height - h
+            title = escape(f"{label} · {names[k]}: {value_formatter(value)}")
+            parts.append(
+                f'<rect x="{x:.1f}" y="{y:.1f}" width="{bar_width:.1f}" height="{h:.1f}" fill="{colors[k]}" rx="1.5">'
+                f"<title>{title}</title></rect>"
+            )
+        last_fits = i == n - 1 and i % stride >= stride / 2
+        if i % stride == 0 or last_fits:
+            parts.append(
+                f'<text x="{group_x + group_width / 2:.1f}" y="{height - 8}" font-size="10" fill="{MUTED}" '
+                f'text-anchor="middle">{escape(label)}</text>'
+            )
+    return f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg" role="img">{"".join(parts)}</svg>'
+
+
+def _flow_panel(flow: dict[str, Any] | None) -> str:
+    """Entries & exits section, or "" when the lot has no driveway lines."""
+    if not flow:
+        return ""
+    legend = (
+        '<div class="legend">'
+        f'<span class="legend-item"><span class="swatch" style="background:{FLOW_IN}"></span>Entering</span>'
+        f'<span class="legend-item"><span class="swatch" style="background:{FLOW_OUT}"></span>Leaving</span>'
+        "</div>"
+    )
+    hour_chart = _grouped_bar_chart(
+        [_format_hour_label(h["hour"]) for h in flow["by_hour"]],
+        [h["in"] for h in flow["by_hour"]],
+        [h["out"] for h in flow["by_hour"]],
+        colors=(FLOW_IN, FLOW_OUT),
+        names=("Entering", "Leaving"),
+        value_formatter=lambda v: f"{v:g} vehicles on average",
+        label_every=2,
+        empty_note="No hour was watched long enough (at least half of it) to show an average.",
+    )
+    day_chart = ""
+    if len(flow["by_day"]) > 1:
+        day_chart = '<div class="subhead">By day</div>' + _grouped_bar_chart(
+            [_format_date_label(d["date"]) for d in flow["by_day"]],
+            [d["in"] if d["monitored_seconds"] > 0 else None for d in flow["by_day"]],
+            [d["out"] if d["monitored_seconds"] > 0 else None for d in flow["by_day"]],
+            colors=(FLOW_IN, FLOW_OUT),
+            names=("Entering", "Leaving"),
+            value_formatter=lambda v: f"{int(v)} vehicles",
+            integer_axis=True,
+        )
+    watched = round(100 * flow["monitored_seconds"] / flow["range_seconds"]) if flow["range_seconds"] else 0
+    busiest = flow.get("busiest_hour")
+    busiest_text = (
+        f" Busiest hour on average: {_format_hour_label(busiest['hour'])} "
+        f"({busiest['in']:g} in, {busiest['out']:g} out)."
+        if busiest else ""
+    )
+    coverage_text = f"Driveways were watched {watched}% of this period"
+    coverage_text += "; counts don't include vehicles that passed while they weren't." if watched < 95 else "."
+    return f"""
+  <section class="panel">
+    <h2>Entries &amp; Exits</h2>
+    <p class="panel-sub">Vehicles driving into and out of the lot, counted at its driveways.</p>
+    <p class="headline"><strong>{flow["totals"]["in"]}</strong> vehicles entered and <strong>{flow["totals"]["out"]}</strong> left.{escape(busiest_text)}</p>
+    <div class="subhead">Average by hour of day</div>
+    {hour_chart}
+    {day_chart}
+    {legend}
+    <p class="panel-sub" style="margin:8px 0 0">{escape(coverage_text)}</p>
+  </section>
+"""
+
+
 def _dwell_bars(dwell_by_space: list[dict[str, Any]], *, width: int = 760) -> str:
     """Horizontal bars, one per space, sorted busiest-first. Built for lots
     with dozens of spaces, where a vertical bar-per-space chart would be
@@ -411,6 +530,7 @@ def render_report_html(
     )
 
     dwell_chart = _dwell_bars(report["dwell_by_space"])
+    flow_panel = _flow_panel(report.get("flow"))
 
     peak_hour_label = (
         _format_hour_label(summary["peak_hour"]) if summary["peak_hour"] is not None else "—"
@@ -563,6 +683,7 @@ def render_report_html(
     {hour_chart}
   </section>
 
+{flow_panel}
   <section class="panel">
     <h2>Average Dwell Time by Space</h2>
     <p class="panel-sub">How long a typical car stays in each space, busiest first.</p>

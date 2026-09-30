@@ -58,6 +58,8 @@ const lineDialogTitle = $("#lineDialogTitle");
 const lineNameInput = $("#lineNameInput");
 const forwardLabelInput = $("#forwardLabelInput");
 const reverseLabelInput = $("#reverseLabelInput");
+const entryDirectionSelect = $("#entryDirectionSelect");
+const lotSelect = $("#lotSelect");
 const forwardArrow = $("#forwardArrow");
 const reverseArrow = $("#reverseArrow");
 const cameraDialog = $("#cameraDialog");
@@ -422,6 +424,7 @@ async function loadCameras(preferredId) {
 
 async function switchCamera() {
   cancelDrawing();
+  renderLotSelect();
   state.view = null;
   state.image = null;
   state.frameSeq = null;
@@ -632,6 +635,51 @@ function lineTotals(lineId) {
   return line ? line.totals : null;
 }
 
+// "IN" / "OUT" tags on a driveway line's two directions.
+function flowTag(line, direction) {
+  if (!line.entry_direction) return "";
+  const entering = line.entry_direction === direction;
+  return ` <span class="flow-tag ${entering ? "flow-in" : "flow-out"}">${entering ? "into lot" : "out of lot"}</span>`;
+}
+
+// --- Which lot the camera belongs to (for the dashboard's entries/exits) ------
+async function loadLots() {
+  try {
+    const payload = await fetchJson("/api/lots");
+    state.lots = payload.lots || [];
+  } catch (error) {
+    state.lots = [];
+  }
+  renderLotSelect();
+}
+
+function renderLotSelect() {
+  const camera = selectedCamera();
+  lotSelect.innerHTML = "";
+  for (const lot of state.lots || []) {
+    const option = document.createElement("option");
+    option.value = String(lot.id);
+    // "Client — Lot", except for the placeholder "Unassigned" client.
+    option.textContent = lot.client_name && lot.client_name !== "Unassigned" ? `${lot.client_name} — ${lot.name}` : lot.name;
+    lotSelect.append(option);
+  }
+  lotSelect.value = camera?.lot_id != null ? String(camera.lot_id) : "";
+  lotSelect.disabled = !camera || (state.lots || []).length === 0;
+}
+
+lotSelect.addEventListener("change", async () => {
+  const camera = selectedCamera();
+  if (!camera) return;
+  try {
+    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { lot_id: Number(lotSelect.value) }));
+    Object.assign(camera, payload.camera);
+    setStatus(`"${camera.name}" now belongs to ${lotSelect.selectedOptions[0]?.textContent}. Its driveway lines count toward that lot's entries and exits.`);
+  } catch (error) {
+    setStatus(error.message);
+    renderLotSelect();
+  }
+});
+
 function renderLines() {
   countsRangeLabel.textContent = "Today";
   if (!state.cameraId) {
@@ -653,11 +701,11 @@ function renderLines() {
     card.innerHTML = `
       <div class="line-card-head">
         <span class="line-card-name" title="${escapeHtml(line.name)}">${escapeHtml(line.name)}</span>
-        <button type="button" class="edit-line">Rename</button>
+        <button type="button" class="edit-line">Edit</button>
         <button type="button" class="delete-line">Delete</button>
       </div>
-      <div class="direction-row dir-a"><span class="direction-arrow">${arrowFor(n.x, n.y)}</span><span class="direction-name">${escapeHtml(line.forward_label)}</span><span class="direction-count">${totals ? totals.forward : "–"}</span></div>
-      <div class="direction-row dir-b"><span class="direction-arrow">${arrowFor(-n.x, -n.y)}</span><span class="direction-name">${escapeHtml(line.reverse_label)}</span><span class="direction-count">${totals ? totals.reverse : "–"}</span></div>
+      <div class="direction-row dir-a"><span class="direction-arrow">${arrowFor(n.x, n.y)}</span><span class="direction-name">${escapeHtml(line.forward_label)}${flowTag(line, "forward")}</span><span class="direction-count">${totals ? totals.forward : "–"}</span></div>
+      <div class="direction-row dir-b"><span class="direction-arrow">${arrowFor(-n.x, -n.y)}</span><span class="direction-name">${escapeHtml(line.reverse_label)}${flowTag(line, "reverse")}</span><span class="direction-count">${totals ? totals.reverse : "–"}</span></div>
     `;
     card.querySelector(".edit-line").addEventListener("click", () => openLineDialog(line));
     card.querySelector(".delete-line").addEventListener("click", () => deleteLine(line));
@@ -766,10 +814,11 @@ function openLineDialog(line) {
   state.editingLineId = line ? line.id : null;
   let p;
   if (line) {
-    lineDialogTitle.textContent = "Rename line";
+    lineDialogTitle.textContent = "Edit line";
     lineNameInput.value = line.name;
     forwardLabelInput.value = line.forward_label;
     reverseLabelInput.value = line.reverse_label;
+    entryDirectionSelect.value = line.entry_direction || "";
     p = state.frameSize ? lineInPixels(line) : line;
   } else {
     const [w, h] = state.frameSize;
@@ -779,21 +828,34 @@ function openLineDialog(line) {
     lineNameInput.value = `Line ${state.lines.length + 1}`;
     forwardLabelInput.value = a;
     reverseLabelInput.value = b;
+    entryDirectionSelect.value = "";
   }
   const n = forwardNormal(p);
   forwardArrow.textContent = arrowFor(n.x, n.y);
   forwardArrow.className = "direction-arrow dir-a";
   reverseArrow.textContent = arrowFor(-n.x, -n.y);
   reverseArrow.className = "direction-arrow dir-b";
+  updateEntryOptions();
   lineDialog.showModal();
   lineNameInput.select();
 }
+
+// The driveway choices use the direction names typed above them.
+function updateEntryOptions() {
+  const a = forwardLabelInput.value.trim() || "Direction A";
+  const b = reverseLabelInput.value.trim() || "Direction B";
+  entryDirectionSelect.options[1].textContent = `Yes: "${a}" goes INTO the lot`;
+  entryDirectionSelect.options[2].textContent = `Yes: "${b}" goes INTO the lot`;
+}
+forwardLabelInput.addEventListener("input", updateEntryOptions);
+reverseLabelInput.addEventListener("input", updateEntryOptions);
 
 async function saveLineDialog() {
   const body = {
     name: lineNameInput.value.trim(),
     forward_label: forwardLabelInput.value.trim(),
     reverse_label: reverseLabelInput.value.trim(),
+    entry_direction: entryDirectionSelect.value || null,
   };
   try {
     if (state.editingLineId !== null) {
@@ -1028,4 +1090,4 @@ countDateInput.value = localDateIso();
 countDateInput.max = localDateIso();
 setInterval(pollView, VIEW_POLL_MS);
 setInterval(loadCounts, COUNTS_POLL_MS);
-loadCameras().catch((error) => setStatus(error.message));
+loadLots().then(() => loadCameras()).catch((error) => setStatus(error.message));

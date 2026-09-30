@@ -186,6 +186,65 @@ class StoreTests(unittest.TestCase):
             traffic_store.counts(self.conn, "street", now - timedelta(hours=1), now, 7)
 
 
+class LotFlowTests(unittest.TestCase):
+    """Entries/exits for a lot, from driveway lines on its traffic cameras."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.conn.execute("ALTER TABLE cameras ADD COLUMN lot_id INTEGER")
+        self.conn.execute("INSERT INTO cameras (id, name, created_at, lot_id, kind) VALUES ('gate', 'Gate', 'x', 7, 'traffic')")
+        self.conn.execute("INSERT INTO cameras (id, name, created_at, lot_id, kind) VALUES ('road', 'Road', 'x', 8, 'traffic')")
+        labels = live_traffic.default_direction_labels
+        self.gate = traffic_store.create_line(
+            self.conn, "gate", {"name": "Main gate", "x1": 0.5, "y1": 0, "x2": 0.5, "y2": 1,
+                                "forward_label": "Leaving", "reverse_label": "Arriving", "entry_direction": "reverse"},
+            labels)
+        self.street = traffic_store.create_line(
+            self.conn, "gate", {"name": "Street", "x1": 0.1, "y1": 0.5, "x2": 0.9, "y2": 0.5}, labels)
+        self.day = datetime(2026, 9, 29, 0, 0).astimezone()  # local midnight
+
+    def cross(self, line, direction, minutes):
+        traffic_store.add_crossings(self.conn, [{
+            "line_id": line["id"], "camera_id": "gate", "crossed_at": (self.day + timedelta(minutes=minutes)).isoformat(),
+            "direction": direction, "vehicle_class": "car", "track_id": minutes}])
+
+    def watch(self, from_min, to_min):
+        c = traffic_store.open_coverage(self.conn, "gate", (self.day + timedelta(minutes=from_min)).isoformat())
+        traffic_store.extend_coverage(self.conn, c, (self.day + timedelta(minutes=to_min)).isoformat())
+
+    def test_no_driveway_lines_means_no_section(self):
+        self.assertIsNone(traffic_store.lot_flow(self.conn, 8, self.day, self.day + timedelta(days=1)))
+
+    def test_entries_exits_by_hour_with_coverage(self):
+        self.watch(8 * 60, 10 * 60 + 10)  # 8:00-10:10 watched; 10:00 hour only 10 min
+        for m in (8 * 60 + 5, 8 * 60 + 20, 9 * 60 + 1):
+            self.cross(self.gate, "reverse", m)  # arriving = in
+        self.cross(self.gate, "forward", 9 * 60 + 30)  # leaving = out
+        self.cross(self.gate, "forward", 10 * 60 + 5)
+        self.cross(self.street, "forward", 8 * 60 + 30)  # not a driveway: ignored
+        flow = traffic_store.lot_flow(self.conn, 7, self.day, self.day + timedelta(days=1))
+        self.assertEqual(flow["totals"], {"in": 3, "out": 2})
+        self.assertEqual(flow["lines"][0]["in_label"], "Arriving")
+        hours = {h["hour"]: h for h in flow["hourly_by_day"][0]["hours"]}
+        self.assertEqual((hours[8]["in"], hours[8]["out"], hours[8]["coverage"]), (2, 0, 1.0))
+        self.assertEqual((hours[9]["in"], hours[9]["out"]), (1, 1))
+        self.assertLess(hours[10]["coverage"], 0.5)
+        by_hour = {h["hour"]: h for h in flow["by_hour"]}
+        self.assertEqual(by_hour[8]["in"], 2)
+        self.assertIsNone(by_hour[10]["in"], "a mostly-missed hour is left out of the average")
+        self.assertEqual(flow["busiest_hour"]["hour"], 8)
+        self.assertEqual(flow["monitored_seconds"], 130 * 60)
+        self.assertEqual(flow["by_day"][0]["in"], 3)
+
+    def test_entry_direction_can_be_changed_and_cleared(self):
+        line = traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": "forward"})
+        self.assertEqual(line["entry_direction"], "forward")
+        line = traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": None})
+        self.assertIsNone(line["entry_direction"])
+        with self.assertRaises(ValueError):
+            traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": "sideways"})
+
+
 class CounterTests(unittest.TestCase):
     """A car box moving left to right across a vertical line in the middle."""
 

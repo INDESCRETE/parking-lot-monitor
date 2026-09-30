@@ -43,6 +43,10 @@
             </div>
           </div>
           <select id="cameraSelect"></select>
+          <div class="camera-setting-row traffic-lot-row">
+            <label for="lotSelect" class="inline-label">Lot</label>
+            <select id="lotSelect" aria-label="Which lot this camera belongs to"></select>
+          </div>
           <p id="connectionStatus" class="traffic-connection" role="status"></p>
         </section>
 
@@ -102,6 +106,12 @@
         <input id="forwardLabelInput" autocomplete="off" maxlength="60" required>
         <label for="reverseLabelInput"><span id="reverseArrow" class="direction-arrow"></span> Direction B name</label>
         <input id="reverseLabelInput" autocomplete="off" maxlength="60" required>
+        <label for="entryDirectionSelect">Lot driveway?</label>
+        <select id="entryDirectionSelect">
+          <option value="">No, just count it (e.g. a street)</option>
+          <option value="forward">Yes: Direction A goes INTO the lot</option>
+          <option value="reverse">Yes: Direction B goes INTO the lot</option>
+        </select>
         <p class="dialog-hint">The arrows on the picture show which way each name counts. Rename them to anything, e.g. Northbound / Southbound or In / Out.</p>
         <div class="dialog-actions">
           <button value="cancel" type="button" id="cancelLineButton">Cancel</button>

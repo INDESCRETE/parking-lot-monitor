@@ -7,6 +7,9 @@ count_lines     one row per line drawn on a traffic camera. Coordinates are
                 fractions of the picture (0-1), so they don't depend on the
                 stream's resolution. forward_label/reverse_label are the names
                 shown for each direction (e.g. "Northbound"/"Southbound").
+                entry_direction marks a lot driveway: "forward" or "reverse"
+                is the direction that goes INTO the lot (the other one is out);
+                NULL means the line isn't a driveway (e.g. a street).
 line_crossings  one row per vehicle crossing a line: when (UTC), which way,
                 and what kind of vehicle.
 traffic_coverage  the stretches of time a traffic camera was actually being
@@ -80,6 +83,9 @@ def migrate(conn: sqlite3.Connection) -> None:
     if "kind" not in columns:
         conn.execute("ALTER TABLE cameras ADD COLUMN kind TEXT NOT NULL DEFAULT 'parking'")
     conn.executescript(SCHEMA)
+    line_columns = {row[1] for row in conn.execute("PRAGMA table_info(count_lines)")}
+    if "entry_direction" not in line_columns:
+        conn.execute("ALTER TABLE count_lines ADD COLUMN entry_direction TEXT")
 
 
 # --- Lines ---------------------------------------------------------------------
@@ -123,24 +129,34 @@ def get_line(conn: sqlite3.Connection, line_id: int) -> Optional[dict]:
     return _line_row(row) if row else None
 
 
+def _clean_entry_direction(value: Any) -> Optional[str]:
+    if value in (None, "", "none"):
+        return None
+    if value not in ("forward", "reverse"):
+        raise ValueError('entry_direction must be "forward", "reverse" or null')
+    return value
+
+
 def create_line(conn: sqlite3.Connection, camera_id: str, payload: dict, default_labels) -> dict:
     x1, y1, x2, y2 = _clean_coords(payload)
+    entry_direction = _clean_entry_direction(payload.get("entry_direction"))
     name = _clean_name(payload.get("name"), "name")
     fwd_default, rev_default = default_labels(x1, y1, x2, y2)
     forward = _clean_name(payload.get("forward_label") or fwd_default, "forward_label")
     reverse = _clean_name(payload.get("reverse_label") or rev_default, "reverse_label")
     now = utc_now()
     cursor = conn.execute(
-        """INSERT INTO count_lines (camera_id, name, x1, y1, x2, y2, forward_label, reverse_label, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-        (camera_id, name, x1, y1, x2, y2, forward, reverse, now, now),
+        """INSERT INTO count_lines (camera_id, name, x1, y1, x2, y2, forward_label, reverse_label,
+                                      entry_direction, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (camera_id, name, x1, y1, x2, y2, forward, reverse, entry_direction, now, now),
     )
     return get_line(conn, cursor.lastrowid)
 
 
 def update_line(conn: sqlite3.Connection, line_id: int, payload: dict) -> Optional[dict]:
-    """Changes any of: name, forward_label, reverse_label, or the points.
-    Moving a line keeps its recorded crossings."""
+    """Changes any of: name, forward_label, reverse_label, entry_direction,
+    or the points. Moving a line keeps its recorded crossings."""
     line = get_line(conn, line_id)
     if line is None:
         return None
@@ -151,6 +167,8 @@ def update_line(conn: sqlite3.Connection, line_id: int, payload: dict) -> Option
         fields["forward_label"] = _clean_name(payload["forward_label"], "forward_label")
     if "reverse_label" in payload:
         fields["reverse_label"] = _clean_name(payload["reverse_label"], "reverse_label")
+    if "entry_direction" in payload:
+        fields["entry_direction"] = _clean_entry_direction(payload["entry_direction"])
     if any(key in payload for key in ("x1", "y1", "x2", "y2")):
         merged = {key: payload.get(key, line[key]) for key in ("x1", "y1", "x2", "y2")}
         fields.update(zip(("x1", "y1", "x2", "y2"), _clean_coords(merged)))
@@ -342,7 +360,8 @@ def counts(
         "end": end.astimezone().isoformat(),
         "bin_minutes": bin_minutes,
         "lines": [
-            {k: line[k] for k in ("id", "name", "forward_label", "reverse_label")} | {"totals": totals[line["id"]]}
+            {k: line.get(k) for k in ("id", "name", "forward_label", "reverse_label", "entry_direction")}
+            | {"totals": totals[line["id"]]}
             for line in lines
         ],
         "bins": bins,
@@ -379,3 +398,124 @@ def counts_csv(report: dict) -> str:
         totals += [line["totals"]["forward"], line["totals"]["reverse"]]
     writer.writerow(["Total", "", "", *totals, sum(totals), round(report.get("monitored_seconds", 0) / 60, 1)])
     return out.getvalue()
+
+
+# --- Lot entries and exits ----------------------------------------------------------
+
+# An hour counts toward "average by hour of day" only when every driveway
+# camera in the lot was watched for at least this share of it; a half-missed
+# hour would otherwise drag the average down.
+MIN_HOUR_COVERAGE = 0.5
+
+
+def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: datetime) -> Optional[dict]:
+    """Vehicles entering and leaving a lot, from the traffic cameras assigned to
+    it and their lines marked as driveways. None when the lot has no driveway
+    lines (so pages can leave the section out).
+
+    Hours and days are local time. Coverage per hour is the lowest of the
+    driveway cameras' (a lot is only fully counted when every entrance is)."""
+    lines = conn.execute(
+        """SELECT count_lines.* FROM count_lines
+           JOIN cameras ON cameras.id = count_lines.camera_id
+           WHERE cameras.lot_id = ? AND cameras.kind = 'traffic' AND count_lines.entry_direction IS NOT NULL
+           ORDER BY count_lines.id""",
+        (lot_id,),
+    ).fetchall()
+    if not lines:
+        return None
+    entry_by_line = {row["id"]: row["entry_direction"] for row in lines}
+    camera_ids = sorted({row["camera_id"] for row in lines})
+
+    now = datetime.now(timezone.utc)
+    stop = min(end, now)
+    # Local hour slots covering the range.
+    hour = timedelta(hours=1)
+    first = start.astimezone().replace(minute=0, second=0, microsecond=0)
+    slots: list = []
+    cursor = first
+    while cursor < stop and len(slots) < 24 * 400:
+        slots.append(cursor)
+        cursor = (cursor.astimezone(timezone.utc) + hour).astimezone()
+    index = {s.astimezone(timezone.utc): i for i, s in enumerate(slots)}
+    ins = [0] * len(slots)
+    outs = [0] * len(slots)
+
+    marks = ",".join("?" for _ in entry_by_line)
+    rows = conn.execute(
+        f"""SELECT line_id, crossed_at, direction FROM line_crossings
+            WHERE line_id IN ({marks}) AND crossed_at >= ? AND crossed_at < ?""",
+        (*entry_by_line, _utc_text(start), _utc_text(end)),
+    ).fetchall()
+    for row in rows:
+        crossed = datetime.fromisoformat(row["crossed_at"]).astimezone()
+        slot = index.get(crossed.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc))
+        if slot is None:
+            continue
+        if row["direction"] == entry_by_line[row["line_id"]]:
+            ins[slot] += 1
+        else:
+            outs[slot] += 1
+
+    # Seconds watched per slot: the minimum over the driveway cameras.
+    watched = [None] * len(slots)
+    for camera_id in camera_ids:
+        per_slot = [0.0] * len(slots)
+        for a, z in _coverage_intervals(conn, camera_id, start, stop):
+            i = max(0, int((a - slots[0]) / hour)) if slots else 0
+            while i < len(slots):
+                s0 = slots[i]
+                s1 = s0 + hour
+                if s0 >= z:
+                    break
+                overlap = (min(z, s1) - max(a, s0)).total_seconds()
+                if overlap > 0:
+                    per_slot[i] += overlap
+                i += 1
+        watched = [v if w is None else min(w, v) for w, v in zip(watched, per_slot)]
+    watched = [w or 0.0 for w in watched]
+
+    def slot_length(i: int) -> float:
+        s0 = slots[i]
+        return (min(s0 + hour, stop) - max(s0, start)).total_seconds()
+
+    days: dict = {}
+    for i, s in enumerate(slots):
+        day = days.setdefault(s.date().isoformat(), {"date": s.date().isoformat(), "in": 0, "out": 0,
+                                                     "monitored_seconds": 0.0, "hours": []})
+        length = max(1.0, slot_length(i))
+        coverage = min(1.0, watched[i] / length)
+        day["in"] += ins[i]
+        day["out"] += outs[i]
+        day["monitored_seconds"] += watched[i]
+        day["hours"].append({"hour": s.hour, "in": ins[i], "out": outs[i], "coverage": round(coverage, 3)})
+
+    by_hour = []
+    for h in range(24):
+        cells = [c for d in days.values() for c in d["hours"] if c["hour"] == h and c["coverage"] >= MIN_HOUR_COVERAGE]
+        n = len(cells)
+        by_hour.append({
+            "hour": h,
+            "days": n,
+            "in": round(sum(c["in"] for c in cells) / n, 2) if n else None,
+            "out": round(sum(c["out"] for c in cells) / n, 2) if n else None,
+        })
+    busiest = max((b for b in by_hour if b["in"] is not None), key=lambda b: b["in"] + b["out"], default=None)
+    total_seconds = sum(slot_length(i) for i in range(len(slots)))
+    monitored = sum(watched)
+    return {
+        "lines": [
+            {"id": row["id"], "camera_id": row["camera_id"], "name": row["name"],
+             "in_label": row["forward_label"] if row["entry_direction"] == "forward" else row["reverse_label"],
+             "out_label": row["reverse_label"] if row["entry_direction"] == "forward" else row["forward_label"]}
+            for row in lines
+        ],
+        "totals": {"in": sum(ins), "out": sum(outs)},
+        "by_day": [{k: d[k] for k in ("date", "in", "out")} | {"monitored_seconds": round(d["monitored_seconds"])}
+                   for d in days.values()],
+        "hourly_by_day": [{"date": d["date"], "hours": d["hours"]} for d in days.values()],
+        "by_hour": by_hour,
+        "busiest_hour": None if busiest is None or (busiest["in"] + busiest["out"]) == 0 else busiest,
+        "monitored_seconds": round(monitored),
+        "range_seconds": round(total_seconds),
+    }

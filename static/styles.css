@@ -922,12 +922,16 @@ body.dashboard-body {
 :root {
   --dir-a: #2563eb;
   --dir-b: #c2410c;
+  --flow-in: #2563eb;
+  --flow-out: #c2410c;
   --line-color: #facc15;
 }
 
 :root[data-theme="dark"] {
-  --dir-a: #60a5fa;
-  --dir-b: #fb923c;
+  --dir-a: #3b82f6;
+  --dir-b: #ea580c;
+  --flow-in: #3b82f6;
+  --flow-out: #ea580c;
   --line-color: #facc15;
 }
 
@@ -1172,4 +1176,70 @@ body.dashboard-body {
 
 :root[data-theme="dark"] .coverage-note.warn {
   --warn-text: #fbbf24;
+}
+
+/* Lot driveway lines on the Traffic page */
+.traffic-lot-row {
+  margin-top: 8px;
+}
+
+.traffic-lot-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.flow-tag {
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 4px;
+  padding: 1px 5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.flow-tag.flow-in,
+.flow-tag.flow-out {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.traffic-lot-row .inline-label {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+/* Dashboard: entries & exits */
+.flow-summary {
+  line-height: 1.5;
+}
+
+.flow-muted {
+  color: var(--muted);
+}
+
+.flow-subtitle {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 14px 0 4px;
+  text-transform: uppercase;
+}
+
+.flow-legend {
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  gap: 14px;
+  margin: 2px 0 4px;
+}
+
+.flow-legend i {
+  border-radius: 2px;
+  display: inline-block;
+  height: 10px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  width: 10px;
 }

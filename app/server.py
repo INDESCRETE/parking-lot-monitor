@@ -1830,6 +1830,9 @@ class Handler(BaseHTTPRequestHandler):
         lot_id, start, end, camera_id = resolved
         with db.connect() as conn:
             report = analytics.compute_lot_report(conn, lot_id, start, end, camera_id)
+            # Entries/exits are lot-wide (from driveway lines on the lot's
+            # traffic cameras), whichever parking camera is picked.
+            report["flow"] = traffic_store.lot_flow(conn, lot_id, start, end)
         self.send_json(report)
 
     def handle_report_export(self, query: dict[str, list[str]]) -> None:
@@ -1841,6 +1844,7 @@ class Handler(BaseHTTPRequestHandler):
         camera = db.get_camera(camera_id) if camera_id else None
         with db.connect() as conn:
             report = analytics.compute_lot_report(conn, lot_id, start, end, camera_id)
+            report["flow"] = traffic_store.lot_flow(conn, lot_id, start, end)
         html = reports.render_report_html(lot, report, camera=camera)
         body = html.encode("utf-8")
         self.send_response(HTTPStatus.OK)
