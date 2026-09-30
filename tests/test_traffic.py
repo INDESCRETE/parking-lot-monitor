@@ -31,7 +31,7 @@ def make_db() -> sqlite3.Connection:
 
 
 class FakeDb:
-    """The two methods TrafficCounter needs, on an in-memory database."""
+    """The methods TrafficCounter needs, on an in-memory database."""
 
     def __init__(self) -> None:
         self.conn = make_db()
@@ -42,6 +42,15 @@ class FakeDb:
     def add_line_crossings(self, rows):
         traffic_store.add_crossings(self.conn, rows)
         self.conn.commit()
+
+    def open_traffic_coverage(self, camera_id, start):
+        return traffic_store.open_coverage(self.conn, camera_id, start)
+
+    def extend_traffic_coverage(self, coverage_id, end):
+        traffic_store.extend_coverage(self.conn, coverage_id, end)
+
+    def coverage(self):
+        return [tuple(r) for r in self.conn.execute("SELECT start_at, end_at FROM traffic_coverage ORDER BY id")]
 
 
 def jpeg(width=400, height=300) -> bytes:
@@ -149,10 +158,27 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(report["peak_hour"]["volume"], 5)
 
         table = list(csv.reader(io.StringIO(traffic_store.counts_csv(report))))
-        self.assertEqual(table[0], ["Date", "Start", "End", "Main St - Westbound", "Main St - Eastbound", "Total"])
-        self.assertEqual(table[1][3:], ["3", "0", "3"])
-        self.assertEqual(table[-1], ["Total", "", "", "3", "2", "5"])
+        self.assertEqual(table[0], ["Date", "Start", "End", "Main St - Westbound", "Main St - Eastbound", "Total",
+                                    "Minutes monitored"])
+        self.assertEqual(table[1][3:], ["3", "0", "3", "0.0"])
+        self.assertEqual(table[-1], ["Total", "", "", "3", "2", "5", "0.0"])
         self.assertEqual(len(table), 1 + 8 + 1)
+
+    def test_counts_report_monitored_time_and_gaps(self):
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        # Watched 20:00-20:10 and 20:13-20:30; a 3-minute outage in between.
+        a = traffic_store.open_coverage(self.conn, "street", start.isoformat())
+        traffic_store.extend_coverage(self.conn, a, (start + timedelta(minutes=10)).isoformat())
+        b = traffic_store.open_coverage(self.conn, "street", (start + timedelta(minutes=13)).isoformat())
+        traffic_store.extend_coverage(self.conn, b, (start + timedelta(minutes=30)).isoformat())
+        report = traffic_store.counts(self.conn, "street", start, start + timedelta(hours=1), 15)
+        self.assertEqual([bin_["monitored_seconds"] for bin_ in report["bins"]], [720.0, 900.0, 0.0, 0.0])
+        self.assertEqual(report["monitored_seconds"], 27 * 60)
+        self.assertEqual(len(report["gaps"]), 1)
+        self.assertEqual(report["gaps"][0]["seconds"], 180)
+        self.assertFalse(report["gaps"][0]["ongoing"])
+        table = list(csv.reader(io.StringIO(traffic_store.counts_csv(report))))
+        self.assertEqual([row[-1] for row in table[1:]], ["12.0", "15.0", "0.0", "0.0", "27.0"])
 
     def test_bad_bin_size(self):
         now = datetime.now(timezone.utc)
@@ -231,6 +257,22 @@ class CounterTests(unittest.TestCase):
         self.assertEqual(view["status"]["frames_processed"], 6)
         # Starts over with a fresh tracker: the same car isn't counted twice.
         self.assertEqual(self.drive([280, 290, 300], start_t=2.0), [])
+
+    def test_paused_camera_frames_are_ignored(self):
+        self.drive([100, 130])
+        self.counter.set_paused("street", True)
+        self.assertEqual(self.drive([160, 190, 220, 250], start_t=0.4), [])
+        self.assertIsNone(self.counter.last_jpeg("street"))
+        self.counter.set_paused("street", False)
+        self.drive([260, 270], start_t=1.2)
+        self.assertIsNotNone(self.counter.last_jpeg("street"))
+
+    def test_coverage_records_watched_time_and_splits_at_outages(self):
+        self.drive([None] * 40)  # 0 .. 7.8 s
+        self.drive([None] * 10, start_t=30.0)  # outage 7.8 -> 30 s
+        self.counter.set_paused("street", True)  # saves the open stretch's end
+        stretches = self.db.coverage()
+        self.assertEqual(stretches, [(iso(0), iso(7.8)), (iso(30.0), iso(31.8))])
 
     def test_forget_camera(self):
         self.drive([100, 130])

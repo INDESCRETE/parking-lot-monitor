@@ -45,6 +45,11 @@ RECENT_CROSSINGS_KEPT = 30
 # tracks would otherwise be matched to unrelated cars after an outage).
 TRACKER_RESET_GAP_SECONDS = 5.0
 FPS_WINDOW_SECONDS = 10.0
+# Coverage (the stretches of time the camera was really watched, see
+# traffic_store): a new stretch starts after a gap this long, and the open
+# stretch's end is saved at least this often.
+COVERAGE_GAP_SECONDS = 5.0
+COVERAGE_SAVE_SECONDS = 5.0
 
 
 def utc_now() -> str:
@@ -103,6 +108,9 @@ class TrafficCounter:
         self._last_jpeg: dict[str, bytes] = {}
         self._recent: dict[str, list] = {}
         self._frame_times: dict[str, list] = {}
+        self._paused: set = set()
+        # camera_id -> {"id", "end", "saved_end"} for the open coverage stretch
+        self._coverage: dict = {}
 
     # -- lifecycle -------------------------------------------------------------
     def start(self) -> None:
@@ -133,6 +141,18 @@ class TrafficCounter:
         with self._lock:
             self._lines_version[camera_id] = self._lines_version.get(camera_id, 0) + 1
 
+    def set_paused(self, camera_id: str, paused: bool) -> None:
+        """Paused cameras' pictures are ignored, including one already
+        queued or being analysed when the pause happened."""
+        with self._lock:
+            if paused:
+                self._paused.add(camera_id)
+            else:
+                self._paused.discard(camera_id)
+        if paused:
+            self._close_coverage(camera_id)
+            self.reset_camera(camera_id)
+
     def reset_camera(self, camera_id: str) -> None:
         """Forget the tracker, last picture and boxes (used when paused). The
         counters in status() and the recent crossings list are kept."""
@@ -142,6 +162,8 @@ class TrafficCounter:
 
     def forget_camera(self, camera_id: str) -> None:
         with self._lock:
+            self._coverage.pop(camera_id, None)
+            self._paused.discard(camera_id)
             for store in (self._cameras, self._lines_version, self._status, self._last_view,
                           self._last_jpeg, self._recent, self._frame_times):
                 store.pop(camera_id, None)
@@ -200,6 +222,37 @@ class TrafficCounter:
                     entry["last_error"] = str(exc)
                     entry["last_error_at"] = utc_now()
 
+    # -- coverage ---------------------------------------------------------------
+    def _note_coverage(self, camera_id: str, now: float) -> None:
+        """Records that this camera was watched up to `now`. Called from the
+        worker thread only; database writes stay small (a few per minute)."""
+        if not hasattr(self._db, "open_traffic_coverage"):
+            return
+        with self._lock:
+            open_stretch = self._coverage.get(camera_id)
+        if open_stretch is None or now - open_stretch["end"] > COVERAGE_GAP_SECONDS or now < open_stretch["end"]:
+            if open_stretch is not None:
+                self._save_coverage_end(open_stretch)
+            coverage_id = self._db.open_traffic_coverage(camera_id, _iso(now))
+            open_stretch = {"id": coverage_id, "end": now, "saved_end": now}
+            with self._lock:
+                self._coverage[camera_id] = open_stretch
+            return
+        open_stretch["end"] = now
+        if now - open_stretch["saved_end"] >= COVERAGE_SAVE_SECONDS:
+            self._save_coverage_end(open_stretch)
+
+    def _save_coverage_end(self, open_stretch: dict) -> None:
+        if open_stretch["end"] > open_stretch["saved_end"]:
+            self._db.extend_traffic_coverage(open_stretch["id"], _iso(open_stretch["end"]))
+            open_stretch["saved_end"] = open_stretch["end"]
+
+    def _close_coverage(self, camera_id: str) -> None:
+        with self._lock:
+            open_stretch = self._coverage.pop(camera_id, None)
+        if open_stretch is not None and hasattr(self._db, "extend_traffic_coverage"):
+            self._save_coverage_end(open_stretch)
+
     def _lines_for(self, camera_id: str, frame_size: tuple) -> list[CountLine]:
         width, height = frame_size
         lines = []
@@ -222,6 +275,9 @@ class TrafficCounter:
         if self._model is None and self._detector is None:
             with self._lock:
                 self._status_entry(camera_id)["model_loading"] = True
+        with self._lock:
+            if camera_id in self._paused:
+                return []
         rgb_image = detection_core.rgb_image_from_bytes(jpeg)
         detections = self._detect(rgb_image)
         now = _epoch(captured_at)
@@ -229,6 +285,8 @@ class TrafficCounter:
 
         with self._lock:
             self._status_entry(camera_id)["model_loading"] = False
+            if camera_id in self._paused:
+                return []  # paused while this picture was being analysed
             version = self._lines_version.get(camera_id, 0)
             state = self._cameras.get(camera_id)
             if state is None:
@@ -284,6 +342,7 @@ class TrafficCounter:
         ]
         if rows:
             self._db.add_line_crossings(rows)
+        self._note_coverage(camera_id, now)
 
         with self._lock:
             entry = self._status_entry(camera_id)

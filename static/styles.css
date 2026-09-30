@@ -1152,3 +1152,24 @@ body.dashboard-body {
   margin: 0 0 10px;
   padding: 8px 10px;
 }
+
+.coverage-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 6px 0 0;
+}
+
+.coverage-note.warn {
+  color: var(--warn-text, #b45309);
+  font-weight: 600;
+}
+
+.coverage-note.problem {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+:root[data-theme="dark"] .coverage-note.warn {
+  --warn-text: #fbbf24;
+}

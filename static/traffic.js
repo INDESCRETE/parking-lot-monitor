@@ -40,6 +40,7 @@ const lineList = $("#lineList");
 const crossingList = $("#crossingList");
 const countsRangeLabel = $("#countsRangeLabel");
 const peakHour = $("#peakHour");
+const coverageNote = $("#coverageNote");
 const canvas = $("#trafficCanvas");
 const ctx = canvas.getContext("2d");
 const canvasWrap = document.querySelector(".canvas-wrap");
@@ -664,7 +665,42 @@ function renderLines() {
   }
 }
 
+function formatSpan(seconds) {
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 1) return `${Math.round(seconds)} s`;
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours} h ${minutes % 60} min`;
+}
+
+// How complete today's counts are: time actually watched, and the stretches
+// when nothing was counted (camera down, program off, paused).
+function renderCoverage() {
+  const report = state.counts;
+  coverageNote.className = "coverage-note";
+  if (!report || !report.monitoring_started) {
+    coverageNote.textContent = "";
+    return;
+  }
+  const gaps = report.gaps || [];
+  const parts = [`Watched ${formatSpan(report.monitored_seconds)} today`];
+  if (gaps.length === 0) {
+    parts.push("no gaps.");
+  } else {
+    const last = gaps[gaps.length - 1];
+    const lastText = last.ongoing
+      ? `not counting since ${formatHour(last.start)}`
+      : `latest ${formatClock(last.start)}–${formatClock(last.end)}`;
+    parts.push(
+      `missed ${formatSpan(report.missed_seconds)} in ${gaps.length} gap${gaps.length === 1 ? "" : "s"} (${lastText}).`,
+    );
+    coverageNote.classList.add(last.ongoing ? "problem" : "warn");
+  }
+  coverageNote.textContent = parts.join(", ");
+}
+
 function renderPeakHour() {
+  renderCoverage();
   const peak = state.counts?.peak_hour;
   peakHour.textContent = peak
     ? `Busiest hour today: ${formatHour(peak.start)}–${formatHour(peak.end)} (${peak.volume} vehicles)`

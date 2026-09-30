@@ -9,6 +9,11 @@ count_lines     one row per line drawn on a traffic camera. Coordinates are
                 shown for each direction (e.g. "Northbound"/"Southbound").
 line_crossings  one row per vehicle crossing a line: when (UTC), which way,
                 and what kind of vehicle.
+traffic_coverage  the stretches of time a traffic camera was actually being
+                watched (pictures analysed). Anything outside them is time
+                nothing was counted -- camera down, program off, paused -- so
+                counts can say how complete they are instead of silently
+                coming out low.
 
 Times are stored in UTC, like everything else in the app; counts are
 grouped into local-time intervals (e.g. 4:00-4:15 PM on the local clock).
@@ -54,6 +59,14 @@ CREATE TABLE IF NOT EXISTS line_crossings (
 );
 CREATE INDEX IF NOT EXISTS idx_line_crossings_camera_time ON line_crossings(camera_id, crossed_at);
 CREATE INDEX IF NOT EXISTS idx_line_crossings_line_time ON line_crossings(line_id, crossed_at);
+
+CREATE TABLE IF NOT EXISTS traffic_coverage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    camera_id TEXT NOT NULL,
+    start_at TEXT NOT NULL,
+    end_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_traffic_coverage_camera_time ON traffic_coverage(camera_id, end_at);
 """
 
 
@@ -160,6 +173,7 @@ def delete_line(conn: sqlite3.Connection, line_id: int) -> Optional[dict]:
 
 def delete_for_camera(conn: sqlite3.Connection, camera_id: str) -> int:
     conn.execute("DELETE FROM line_crossings WHERE camera_id = ?", (camera_id,))
+    conn.execute("DELETE FROM traffic_coverage WHERE camera_id = ?", (camera_id,))
     return conn.execute("DELETE FROM count_lines WHERE camera_id = ?", (camera_id,)).rowcount
 
 
@@ -173,6 +187,42 @@ def add_crossings(conn: sqlite3.Connection, rows: Iterable[dict]) -> None:
            WHERE EXISTS (SELECT 1 FROM count_lines WHERE id = :line_id)""",
         list(rows),
     )
+
+
+# --- Coverage (when the camera was actually being watched) -----------------------
+
+# A gap shorter than this between analysed pictures isn't reported as missed
+# time (pictures come every 0.2 s; a few seconds' hiccup is noise).
+MIN_REPORTED_GAP_SECONDS = 5.0
+# Coverage is saved to the database every few seconds, so "not watched right
+# now" is only claimed once the last saved stretch is older than this.
+ONGOING_GAP_SECONDS = 30.0
+
+
+def open_coverage(conn: sqlite3.Connection, camera_id: str, start: str) -> int:
+    cursor = conn.execute(
+        "INSERT INTO traffic_coverage (camera_id, start_at, end_at) VALUES (?, ?, ?)", (camera_id, start, start)
+    )
+    return int(cursor.lastrowid)
+
+
+def extend_coverage(conn: sqlite3.Connection, coverage_id: int, end: str) -> None:
+    conn.execute("UPDATE traffic_coverage SET end_at = ? WHERE id = ? AND end_at < ?", (end, coverage_id, end))
+
+
+def _coverage_intervals(conn: sqlite3.Connection, camera_id: str, start: datetime, end: datetime) -> list:
+    rows = conn.execute(
+        """SELECT start_at, end_at FROM traffic_coverage
+           WHERE camera_id = ? AND end_at > ? AND start_at < ? ORDER BY start_at""",
+        (camera_id, _utc_text(start), _utc_text(end)),
+    ).fetchall()
+    intervals = []
+    for row in rows:
+        a = max(datetime.fromisoformat(row["start_at"]), start)
+        b = min(datetime.fromisoformat(row["end_at"]), end)
+        if b > a:
+            intervals.append((a, b))
+    return intervals
 
 
 def _utc_text(dt: datetime) -> str:
@@ -238,6 +288,42 @@ def counts(
         by_class = total["by_class"][row["direction"]]
         by_class[row["vehicle_class"]] = by_class.get(row["vehicle_class"], 0) + 1
 
+    # How much of each interval was actually watched.
+    intervals = _coverage_intervals(conn, camera_id, start, end)
+    starts_utc = [datetime.fromisoformat(b["start"]) for b in bins]
+    for b in bins:
+        b["monitored_seconds"] = 0.0
+    if bins:
+        origin = starts_utc[0]
+        for a, z in intervals:
+            i = max(0, int((a - origin) / step))
+            while i < len(bins):
+                b_start = starts_utc[i]
+                b_end = b_start + step
+                if b_start >= z:
+                    break
+                overlap = (min(z, b_end) - max(a, b_start)).total_seconds()
+                if overlap > 0:
+                    bins[i]["monitored_seconds"] += overlap
+                i += 1
+    for b in bins:
+        b["monitored_seconds"] = round(b["monitored_seconds"], 1)
+
+    # Missed stretches between watched ones (and a still-open one at the end
+    # when the camera isn't being watched right now).
+    gaps = []
+    for (a1, z1), (a2, _z2) in zip(intervals, intervals[1:]):
+        if (a2 - z1).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
+            gaps.append({"start": z1.astimezone().isoformat(), "end": a2.astimezone().isoformat(),
+                         "seconds": round((a2 - z1).total_seconds()), "ongoing": False})
+    now = datetime.now(timezone.utc)
+    if intervals and end > now:
+        last_end = intervals[-1][1]
+        if (now - last_end).total_seconds() >= ONGOING_GAP_SECONDS:
+            gaps.append({"start": last_end.astimezone().isoformat(), "end": now.astimezone().isoformat(),
+                         "seconds": round((now - last_end).total_seconds()), "ongoing": True})
+    monitored = sum((z - a).total_seconds() for a, z in intervals)
+
     # The busiest single hour (four consecutive 15-min intervals etc.), the
     # number traffic studies usually ask for.
     per_bin_total = [
@@ -262,6 +348,10 @@ def counts(
         "bins": bins,
         "total": sum(per_bin_total),
         "peak_hour": peak,
+        "monitored_seconds": round(monitored),
+        "monitoring_started": intervals[0][0].astimezone().isoformat() if intervals else None,
+        "gaps": gaps,
+        "missed_seconds": sum(g["seconds"] for g in gaps),
     }
 
 
@@ -276,15 +366,16 @@ def counts_csv(report: dict) -> str:
         for direction, label in (("forward", line["forward_label"]), ("reverse", line["reverse_label"])):
             header.append(f"{line['name']} - {label}")
             columns.append((str(line["id"]), direction))
-    header.append("Total")
+    header += ["Total", "Minutes monitored"]
     writer.writerow(header)
     for b in report["bins"]:
         start = datetime.fromisoformat(b["start"])
         end = datetime.fromisoformat(b["end"])
         values = [b["counts"].get(line_id, {}).get(direction, 0) for line_id, direction in columns]
-        writer.writerow([start.strftime("%Y-%m-%d"), start.strftime("%H:%M"), end.strftime("%H:%M"), *values, sum(values)])
+        minutes = round(b.get("monitored_seconds", 0) / 60, 1)
+        writer.writerow([start.strftime("%Y-%m-%d"), start.strftime("%H:%M"), end.strftime("%H:%M"), *values, sum(values), minutes])
     totals = []
     for line in report["lines"]:
         totals += [line["totals"]["forward"], line["totals"]["reverse"]]
-    writer.writerow(["Total", "", "", *totals, sum(totals)])
+    writer.writerow(["Total", "", "", *totals, sum(totals), round(report.get("monitored_seconds", 0) / 60, 1)])
     return out.getvalue()

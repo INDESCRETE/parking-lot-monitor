@@ -948,6 +948,14 @@ class Database:
         with self.connect() as conn:
             traffic_store.add_crossings(conn, rows)
 
+    def open_traffic_coverage(self, camera_id: str, start: str) -> int:
+        with self.connect() as conn:
+            return traffic_store.open_coverage(conn, camera_id, start)
+
+    def extend_traffic_coverage(self, coverage_id: int, end: str) -> None:
+        with self.connect() as conn:
+            traffic_store.extend_coverage(conn, coverage_id, end)
+
     def traffic_counts(self, camera_id: str, start: datetime, end: datetime, bin_minutes: int) -> dict[str, Any]:
         with self.connect() as conn:
             return traffic_store.counts(conn, camera_id, start, end, bin_minutes)
@@ -1264,6 +1272,7 @@ def health_camera_statuses() -> list[dict[str, Any]]:
                 "camera_id": camera_id,
                 "name": camera.get("name") or camera_id,
                 "grabber": live.get_status(camera_id),
+                "kind": camera.get("kind") or "parking",
                 "paused": bool(camera.get("paused")),
                 "paused_changed_at": camera.get("paused_changed_at"),
                 "detection": (
@@ -1650,10 +1659,10 @@ class Handler(BaseHTTPRequestHandler):
             if camera is None:
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if paused:
-                # Drop the traffic tracker and its last picture/boxes, so the
-                # page shows the plain live picture instead of stale boxes.
-                traffic_counter.reset_camera(camera["id"])
+            if paused is not None:
+                # Pausing also drops the traffic tracker and its last
+                # picture/boxes, so the page shows the plain live picture.
+                traffic_counter.set_paused(camera["id"], bool(camera.get("paused")))
             self.send_json({"camera": camera})
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
@@ -2016,6 +2025,9 @@ def main() -> None:
     SOURCE_VIDEOS_DIR.mkdir(parents=True, exist_ok=True)
     db.sync_images()
     live_detector.start()
+    for camera in db.list_cameras():
+        if camera.get("kind") == "traffic" and camera.get("paused"):
+            traffic_counter.set_paused(camera["id"], True)
     traffic_counter.start()
     live_cameras = live.start_all(
         on_frame=on_live_frame,

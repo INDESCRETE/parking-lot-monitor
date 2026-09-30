@@ -8,7 +8,10 @@ What it watches (a check runs every 30 seconds):
 * The computer sleeping or freezing. If a 30-second check suddenly comes 10 minutes
   late, the computer wasn't running us in between.
 * Each live camera. If one stops sending pictures for ``camera_down_minutes``, you
-  get an alert. When pictures come back, you get a "camera back" alert.
+  get an alert. When pictures come back, you get a "camera back" alert. Traffic
+  cameras are checked every few seconds and alert after only
+  ``traffic_camera_down_seconds`` (30 by default): every second a traffic camera
+  is down, passing vehicles go uncounted.
 * Car detection stalling while pictures still arrive (for example, the model crashed).
 * The internet. If it drops, alerts wait in an outbox on disk and go out when it
   returns, along with an "internet was down from X to Y" note. Counting never stops
@@ -58,6 +61,9 @@ HEALTH_DIR = DATA_DIR / "health"
 BACKUP_DIR = DATA_DIR / "backups"
 
 CHECK_INTERVAL_SECONDS = 30.0
+# Cameras are checked more often than everything else, so a traffic camera's
+# short alert delay actually means something.
+CAMERA_CHECK_INTERVAL_SECONDS = 5.0
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 SEND_RETRY_SECONDS = 30.0
 SEND_TIMEOUT_SECONDS = 10.0
@@ -79,6 +85,8 @@ DEFAULT_CONFIG: dict = {
     },
     "camera_down_minutes": 5,
     "detection_stall_minutes": 10,
+    "traffic_camera_down_seconds": 30,
+    "traffic_detection_stall_seconds": 60,
     "outage_report_minutes": 2,
     "disk_warn_percent": 85,
     "backup_hour": 3,
@@ -89,6 +97,8 @@ DEFAULT_CONFIG: dict = {
 _NUMBER_LIMITS = {
     "camera_down_minutes": (1, 1440),
     "detection_stall_minutes": (1, 1440),
+    "traffic_camera_down_seconds": (10, 3600),
+    "traffic_detection_stall_seconds": (15, 3600),
     "outage_report_minutes": (0.5, 1440),
     "disk_warn_percent": (10, 99),
     "backup_hour": (0, 23),
@@ -546,6 +556,7 @@ class HealthMonitor:
         self._last_tick_wall: Optional[float] = None
         self._last_heartbeat = 0.0
         self._problems: dict = {}  # key -> {"since", "message"}
+        self._camera_check_lock = threading.Lock()
         self._camera_since: dict = {}
         self.internet_online: Optional[bool] = None
         self._offline_since: Optional[datetime] = None
@@ -563,6 +574,7 @@ class HealthMonitor:
         self.notifier.start()
         self._thread = threading.Thread(target=self._run, daemon=True, name="health-monitor")
         self._thread.start()
+        threading.Thread(target=self._run_camera_checks, daemon=True, name="health-cameras").start()
 
     def load_previous_state(self) -> None:
         """Reads what the last run left behind, reports any downtime, and picks up
@@ -638,6 +650,13 @@ class HealthMonitor:
             self.tick()
             self._halt.wait(CHECK_INTERVAL_SECONDS)
 
+    def _run_camera_checks(self) -> None:
+        while not self._halt.wait(CAMERA_CHECK_INTERVAL_SECONDS):
+            try:
+                self._check_cameras()
+            except Exception as exc:
+                self.last_check_error = f"_check_cameras: {exc}"
+
     def tick(self) -> None:
         """One round of checks. Public so tests can drive it directly."""
         steps = (
@@ -703,9 +722,12 @@ class HealthMonitor:
 
     # -- cameras -------------------------------------------------------------
     def _check_cameras(self) -> None:
+        # Runs from both the main loop and the fast camera loop.
+        with self._camera_check_lock:
+            self._check_cameras_locked()
+
+    def _check_cameras_locked(self) -> None:
         now = self.clock()
-        down_after = self.config["camera_down_minutes"] * 60
-        stall_after = self.config["detection_stall_minutes"] * 60
         seen = set()
         for cam in self.camera_statuses():
             camera_id = cam["camera_id"]
@@ -714,6 +736,15 @@ class HealthMonitor:
             grabber = cam.get("grabber") or {}
             if not grabber.get("configured"):
                 continue
+            traffic = cam.get("kind") == "traffic"
+            if traffic:
+                down_after = self.config["traffic_camera_down_seconds"]
+                stall_after = self.config["traffic_detection_stall_seconds"]
+                impact = "Vehicles passing now are NOT being counted."
+            else:
+                down_after = self.config["camera_down_minutes"] * 60
+                stall_after = self.config["detection_stall_minutes"] * 60
+                impact = "Counting for this camera is paused."
             last_frame = parse_iso(grabber.get("last_frame_at"))
             reference = last_frame or parse_iso(grabber.get("started_at")) or self.started_at
             reference = max(reference, self.started_at)  # don't blame the camera for our own downtime
@@ -724,7 +755,7 @@ class HealthMonitor:
                 self._open_problem(
                     key, since, f"Camera '{name}' is down",
                     f"No pictures from camera '{name}' since {fmt_local(since)}. Last error: {error}. "
-                    "Counting for this camera is paused. It will reconnect by itself when the camera is "
+                    f"{impact} It will reconnect by itself when the camera is "
                     "back. If it doesn't, check the camera's cable and power.",
                 )
             elif last_frame is not None:

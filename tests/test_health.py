@@ -197,6 +197,25 @@ class HealthTests(unittest.TestCase):
         h.camera(last_frame_ago_s=2, detect_ago_s=2); h.tick()
         self.assertEqual(h.titles()[-1], "Test Lot: Car detection working again for 'Front lot'")
 
+    def test_traffic_camera_down_alert_after_30_seconds(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=20, detect_ago_s=20)
+        h.cameras[0]["kind"] = "traffic"
+        h.tick()
+        self.assertEqual([t for t in h.titles() if "down" in t], [])
+        h.camera(last_frame_ago_s=35, detect_ago_s=35)
+        h.cameras[0]["kind"] = "traffic"
+        h.tick()
+        self.assertEqual([t for t in h.titles() if "down" in t], ["Test Lot: Camera 'Front lot' is down"])
+        self.assertIn("NOT being counted", h.sent[-1][1])
+        # A parking camera 35 s quiet is not down (5 minutes).
+        (self.tmp / "p").mkdir()
+        h2 = Harness(self.tmp / "p", self.clock, BASE_CONFIG); h2.start()
+        h2.monitor.started_at = self.clock() - timedelta(hours=1)
+        h2.camera(last_frame_ago_s=35, detect_ago_s=35); h2.tick()
+        self.assertEqual([t for t in h2.titles() if "down" in t], [])
+
     def test_paused_camera_is_not_a_detection_stall(self):
         h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
         h.monitor.started_at = self.clock() - timedelta(hours=1)
