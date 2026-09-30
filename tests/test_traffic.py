@@ -414,6 +414,27 @@ class CounterTests(unittest.TestCase):
         self.assertEqual([g["planned"] for g in report["gaps"]], [False, False, True])
         self.assertEqual(report["gaps"][1]["label"], "Camera stopped sending pictures")
 
+    def test_lines_follow_the_zoom_area(self):
+        # The picture is only the right half of the camera's view, so the
+        # middle line (x = 0.5 of the full view) sits at the zoomed picture's
+        # left edge, and a line at x = 0.75 sits in its middle.
+        traffic_store.create_line(
+            self.db.conn, "street", {"name": "Right", "x1": 0.75, "y1": 0.0, "x2": 0.75, "y2": 1.0},
+            live_traffic.default_direction_labels,
+        )
+        focus = {"street": (0.5, 0.0, 0.5, 1.0)}
+        self.counter = live_traffic.TrafficCounter(self.db, detector=lambda image: list(self.boxes),
+                                                   focus_fn=lambda cam: focus.get(cam))
+        saved = self.drive([100, 130, 160, 190, 220, 250, 280])  # crosses x = 200 of 400
+        self.assertEqual([r["line_id"] for r in saved], [self.line["id"] + 1])
+        self.assertEqual(self.counter.view("street")["focus"], {"x": 0.5, "y": 0.0, "w": 0.5, "h": 1.0})
+
+    def test_view_change_is_a_planned_gap(self):
+        self.drive([None] * 5)
+        self.counter.view_changed("street")
+        self.drive([None] * 5, start_t=10.0)
+        self.assertEqual([r[0] for r in self.db.reasons()], ["restart", "reconfigured"])
+
     def test_forget_camera(self):
         self.drive([100, 130])
         self.counter.forget_camera("street")

@@ -100,6 +100,7 @@
         <div class="toolbar">
           <button id="drawLineButton" type="button" title="Shortcut: L">Draw Line (L)</button>
           <button id="cancelDrawButton" type="button" hidden>Cancel</button>
+          <button id="zoomButton" type="button" hidden title="Only analyse part of the picture, e.g. a small area far from the camera">Zoom Area</button>
           <button id="pauseButton" type="button" class="pause-button" title="Stop or restart counting for this camera. The live picture keeps updating either way.">Pause Counting</button>
           <label class="toolbar-check"><input id="showBoxesInput" type="checkbox" checked> Show vehicles</label>
           <span id="trafficIndicator" class="live-feed-indicator" hidden>&#9679; Live</span>
@@ -132,6 +133,25 @@
         <div class="dialog-actions">
           <button value="cancel" type="button" id="cancelLineButton">Cancel</button>
           <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="zoomDialog" class="zoom-dialog">
+      <form method="dialog" id="zoomForm" class="dialog-form">
+        <h2>Zoom area</h2>
+        <p class="dialog-hint">Drag a box around the part of the street or lot to watch. Only that part is analysed, so vehicles in it look bigger to the AI. Leave room around your lines: cars need to be seen a little before and after they cross.</p>
+        <div class="zoom-stage">
+          <canvas id="zoomCanvas"></canvas>
+          <p id="zoomLoading" class="traffic-muted">Getting a full picture from the camera…</p>
+        </div>
+        <label class="toolbar-check" id="fullResolutionRow" hidden><input id="fullResolutionInput" type="checkbox"> Use the camera's full resolution (sharper zoom; more work for this computer)</label>
+        <p id="zoomInfo" class="traffic-muted"></p>
+        <div class="dialog-actions">
+          <button type="button" id="zoomWholeButton">Whole picture</button>
+          <span class="dialog-spacer"></span>
+          <button value="cancel" type="button" id="cancelZoomButton">Cancel</button>
+          <button value="save" type="submit" id="saveZoomButton">Save</button>
         </div>
       </form>
     </dialog>

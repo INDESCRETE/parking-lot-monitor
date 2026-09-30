@@ -131,6 +131,68 @@ class CopyConnectionTests(unittest.TestCase):
         self.assertNotIn("p@ss", json.dumps(choices))
 
 
+class ZoomAreaTests(unittest.TestCase):
+    """The zoom area ("focus") and full-resolution switch for traffic cameras."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "camera_sources.json"
+        self.path.write_text(json.dumps({
+            "street": {"type": "rtsp", "rtsp_url": "rtsp://192.168.1.50:554/Preview_01_sub",
+                       "username": "admin", "password": "pw", "rtsp_decode": "all", "interval_seconds": 0.2},
+            "hik": {"type": "rtsp", "rtsp_url": "rtsp://192.168.1.64:554/Streaming/Channels/101",
+                    "username": "admin", "password": "pw", "rtsp_decode": "all", "interval_seconds": 0.2},
+            "snap": {"host": "192.168.1.50", "username": "admin", "password": "pw"},
+        }))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_focus_crops_before_scaling(self):
+        live.update_view("street", {"x": 0.5, "y": 0.25, "w": 0.3, "h": 0.2}, True, self.path)
+        src = live.load_config(self.path)["street"]
+        self.assertEqual(src.focus, (0.5, 0.25, 0.3, 0.2))
+        self.assertTrue(src.stream_url.endswith("Preview_01_main"))
+        self.assertEqual(src.max_width, live.FULL_RESOLUTION_MAX_WIDTH)
+        self.assertEqual(live.stream_quality(src), {"can_switch": True, "full_resolution": True})
+        command = live.build_rtsp_frame_command(src, src.detection_rtsp_url())
+        vf = command[command.index("-vf") + 1]
+        self.assertEqual(
+            vf,
+            "fps=5,crop=w=trunc(iw*0.3/2)*2:h=trunc(ih*0.2/2)*2:x=trunc(iw*0.5):y=trunc(ih*0.25),"
+            f"scale='min({live.FULL_RESOLUTION_MAX_WIDTH},iw)':-2",
+        )
+
+    def test_whole_picture_and_back_to_small_stream(self):
+        live.update_view("street", {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, True, self.path)
+        live.update_view("street", None, False, self.path)
+        src = live.load_config(self.path)["street"]
+        self.assertIsNone(src.focus)
+        self.assertTrue(src.stream_url.endswith("Preview_01_sub"))
+        self.assertIsNone(src.max_width)
+        command = live.build_rtsp_frame_command(src, src.detection_rtsp_url())
+        self.assertEqual(command[command.index("-vf") + 1], "fps=5")
+        self.assertEqual(json.loads(self.path.read_text())["street"]["password"], "pw")
+
+    def test_non_reolink_can_zoom_but_not_switch_quality(self):
+        live.update_view("hik", {"x": 0, "y": 0, "w": 0.5, "h": 0.5}, None, self.path)
+        self.assertEqual(live.load_config(self.path)["hik"].focus, (0.0, 0.0, 0.5, 0.5))
+        with self.assertRaises(live.LiveConfigError):
+            live.update_view("hik", None, True, self.path)
+
+    def test_bad_zoom_areas(self):
+        for focus in ({"x": 0.9, "y": 0, "w": 0.5, "h": 0.5}, {"x": 0, "y": 0, "w": 0.01, "h": 0.5}, {"x": "a"}):
+            with self.assertRaises(live.LiveConfigError):
+                live.update_view("street", focus, None, self.path)
+        with self.assertRaises(live.LiveConfigError):
+            live.update_view("snap", {"x": 0, "y": 0, "w": 0.5, "h": 0.5}, None, self.path)
+
+    def test_copying_a_camera_does_not_copy_its_zoom(self):
+        live.update_view("street", {"x": 0.1, "y": 0.1, "w": 0.5, "h": 0.5}, None, self.path)
+        entry = live.copy_connection("street", "street2", "traffic", self.path)
+        self.assertNotIn("focus", entry)
+
+
 class _SnapshotHandler(BaseHTTPRequestHandler):
     mode = "basic"  # or "digest" / "none"
     user, password, realm, nonce = "admin", "pw", "cam", "abc123"

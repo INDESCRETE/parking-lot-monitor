@@ -62,6 +62,14 @@ const showBoxesInput = $("#showBoxesInput");
 const trafficIndicator = $("#trafficIndicator");
 const pausedIndicator = $("#pausedIndicator");
 const pauseButton = $("#pauseButton");
+const zoomButton = $("#zoomButton");
+const zoomDialog = $("#zoomDialog");
+const zoomCanvas = $("#zoomCanvas");
+const zoomCtx = zoomCanvas.getContext("2d");
+const zoomLoading = $("#zoomLoading");
+const zoomInfo = $("#zoomInfo");
+const fullResolutionRow = $("#fullResolutionRow");
+const fullResolutionInput = $("#fullResolutionInput");
 const lineDialog = $("#lineDialog");
 const lineForm = $("#lineForm");
 const lineDialogTitle = $("#lineDialogTitle");
@@ -157,12 +165,30 @@ function defaultLabels(dx, dy) {
 
 // --- Geometry ------------------------------------------------------------------
 
-function lineInPixels(line, override) {
+// Lines are stored as fractions of the camera's FULL picture. When the camera
+// is zoomed in (a "focus" area), the picture shown is only that area, so
+// fractions are moved into its pixels and back.
+function currentFocus() {
+  return state.frameFocus || { x: 0, y: 0, w: 1, h: 1 };
+}
+
+function toPx(fx, fy) {
   const [w, h] = state.frameSize;
-  const x1 = override?.end === 1 ? override.point.x : line.x1 * w;
-  const y1 = override?.end === 1 ? override.point.y : line.y1 * h;
-  const x2 = override?.end === 2 ? override.point.x : line.x2 * w;
-  const y2 = override?.end === 2 ? override.point.y : line.y2 * h;
+  const f = currentFocus();
+  return { x: ((fx - f.x) / f.w) * w, y: ((fy - f.y) / f.h) * h };
+}
+
+function toFraction(px, py) {
+  const [w, h] = state.frameSize;
+  const f = currentFocus();
+  const clamp = (v) => Math.min(1, Math.max(0, v));
+  return { x: clamp(f.x + (px / w) * f.w), y: clamp(f.y + (py / h) * f.h) };
+}
+
+function lineInPixels(line, override) {
+  const a = override?.end === 1 ? override.point : toPx(line.x1, line.y1);
+  const b = override?.end === 2 ? override.point : toPx(line.x2, line.y2);
+  const [x1, y1, x2, y2] = [a.x, a.y, b.x, b.y];
   return { x1, y1, x2, y2 };
 }
 
@@ -572,6 +598,7 @@ async function pollView() {
     const view = await fetchJson(`/api/cameras/${encodeURIComponent(cameraId)}/traffic-view`);
     if (cameraId !== state.cameraId) return;
     renderConnection(view);
+    renderZoomButton(view);
     renderCrossings(view.recent_crossings || []);
     const seq = view.frame_seq ?? null;
     const nothingAnalysedYet = seq === null;
@@ -601,6 +628,7 @@ function loadFrame(cameraId, view, seq) {
         state.view = view;
         state.frameSeq = seq;
         state.frameSize = view.frame_size || [img.naturalWidth, img.naturalHeight];
+        state.frameFocus = view.focus || null;
         canvas.style.display = "block";
         emptyState.style.display = "none";
         draw();
@@ -691,6 +719,143 @@ connectButton.addEventListener("click", async () => {
     setStatus(error.message);
   } finally {
     connectButton.disabled = false;
+  }
+});
+
+// --- Zoom area -----------------------------------------------------------------
+// The camera's full picture is shown in a dialog; a dragged box becomes the
+// zoom area. The server cuts every picture to it before the AI sees it.
+const zoom = { image: null, rect: null, dragStart: null, settings: null };
+
+function renderZoomButton(view) {
+  const settings = view.view_settings || {};
+  zoom.settings = settings;
+  zoomButton.hidden = !settings.zoom_supported;
+  zoomButton.classList.toggle("active", Boolean(settings.focus));
+  zoomButton.textContent = settings.focus ? "Zoom Area (on)" : "Zoom Area";
+}
+
+function drawZoom() {
+  if (!zoom.image) return;
+  const { width, height } = zoomCanvas;
+  zoomCtx.clearRect(0, 0, width, height);
+  zoomCtx.drawImage(zoom.image, 0, 0, width, height);
+  if (!zoom.rect) return;
+  const r = zoom.rect;
+  const [x, y, w, h] = [r.x * width, r.y * height, r.w * width, r.h * height];
+  // Dim everything outside the box.
+  zoomCtx.fillStyle = "rgba(0, 0, 0, 0.55)";
+  zoomCtx.fillRect(0, 0, width, y);
+  zoomCtx.fillRect(0, y + h, width, height - y - h);
+  zoomCtx.fillRect(0, y, x, h);
+  zoomCtx.fillRect(x + w, y, width - x - w, h);
+  zoomCtx.strokeStyle = cssVar("--line-color") || "#facc15";
+  zoomCtx.lineWidth = Math.max(2, width / 400);
+  zoomCtx.strokeRect(x, y, w, h);
+  // The counting lines, so the box can be placed around them.
+  zoomCtx.lineWidth = Math.max(2, width / 300);
+  for (const line of state.lines) {
+    zoomCtx.beginPath();
+    zoomCtx.moveTo(line.x1 * width, line.y1 * height);
+    zoomCtx.lineTo(line.x2 * width, line.y2 * height);
+    zoomCtx.stroke();
+  }
+}
+
+function renderZoomInfo() {
+  if (!zoom.rect) {
+    zoomInfo.textContent = "Whole picture: nothing is cut off.";
+    return;
+  }
+  const pct = Math.round(zoom.rect.w * zoom.rect.h * 100);
+  const magnify = Math.max(1, Math.min(1 / zoom.rect.w, 1 / zoom.rect.h));
+  zoomInfo.textContent = `The box is ${pct}% of the picture; vehicles in it will look about ${magnify.toFixed(1)}× bigger to the AI.`;
+}
+
+function zoomPoint(event) {
+  const rect = zoomCanvas.getBoundingClientRect();
+  return {
+    x: Math.min(1, Math.max(0, (event.clientX - rect.left) / rect.width)),
+    y: Math.min(1, Math.max(0, (event.clientY - rect.top) / rect.height)),
+  };
+}
+
+zoomButton.addEventListener("click", async () => {
+  const camera = selectedCamera();
+  if (!camera) return;
+  const settings = zoom.settings || {};
+  zoom.rect = settings.focus ? { ...settings.focus } : null;
+  zoom.image = null;
+  fullResolutionRow.hidden = !settings.can_switch;
+  // Sharper by default when zooming (Rob: no reason to settle for a fuzzy picture).
+  fullResolutionInput.checked = settings.can_switch ? (settings.focus ? Boolean(settings.full_resolution) : true) : false;
+  zoomCanvas.style.display = "none";
+  zoomLoading.hidden = false;
+  zoomLoading.textContent = "Getting a full picture from the camera…";
+  renderZoomInfo();
+  zoomDialog.showModal();
+  const img = new Image();
+  img.onload = () => {
+    zoom.image = img;
+    zoomCanvas.width = img.naturalWidth;
+    zoomCanvas.height = img.naturalHeight;
+    zoomCanvas.style.display = "block";
+    zoomLoading.hidden = true;
+    drawZoom();
+  };
+  img.onerror = () => {
+    zoomLoading.textContent = "Couldn't get a picture from the camera. Check that it's connected, then try again.";
+  };
+  img.src = `/api/cameras/${encodeURIComponent(camera.id)}/full-frame.jpg?t=${Date.now()}`;
+});
+
+zoomCanvas.addEventListener("mousedown", (event) => {
+  zoom.dragStart = zoomPoint(event);
+  event.preventDefault();
+});
+
+window.addEventListener("mousemove", (event) => {
+  if (!zoom.dragStart) return;
+  const a = zoom.dragStart;
+  const b = zoomPoint(event);
+  zoom.rect = { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(b.x - a.x), h: Math.abs(b.y - a.y) };
+  drawZoom();
+  renderZoomInfo();
+});
+
+window.addEventListener("mouseup", () => {
+  if (!zoom.dragStart) return;
+  zoom.dragStart = null;
+  if (zoom.rect && (zoom.rect.w < 0.05 || zoom.rect.h < 0.05)) {
+    zoom.rect = null; // a click, not a box
+    drawZoom();
+  }
+  renderZoomInfo();
+});
+
+$("#zoomWholeButton").addEventListener("click", () => {
+  zoom.rect = null;
+  drawZoom();
+  renderZoomInfo();
+});
+$("#cancelZoomButton").addEventListener("click", () => zoomDialog.close());
+
+$("#zoomForm").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const camera = selectedCamera();
+  if (!camera) return;
+  const body = { focus: zoom.rect };
+  if (zoom.settings?.can_switch) body.full_resolution = zoom.rect ? fullResolutionInput.checked : false;
+  zoomDialog.close();
+  setStatus("Applying the zoom area; the camera reconnects (a few seconds)…");
+  try {
+    const result = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}/view`, jsonRequest("POST", body));
+    zoom.settings = result.view_settings;
+    state.frameSeq = null;
+    state.lastFrameRequest = 0;
+    setStatus(zoom.rect ? "Zoom area saved. Only that part is analysed now." : "Zoom removed. The whole picture is analysed again.");
+  } catch (error) {
+    setStatus(error.message);
   }
 });
 
@@ -978,8 +1143,9 @@ function openLineDialog(line) {
     entryDirectionSelect.value = line.entry_direction || "";
     p = state.frameSize ? lineInPixels(line) : line;
   } else {
-    const [w, h] = state.frameSize;
-    p = { x1: state.pendingLine.x1 * w, y1: state.pendingLine.y1 * h, x2: state.pendingLine.x2 * w, y2: state.pendingLine.y2 * h };
+    const start = toPx(state.pendingLine.x1, state.pendingLine.y1);
+    const end = toPx(state.pendingLine.x2, state.pendingLine.y2);
+    p = { x1: start.x, y1: start.y, x2: end.x, y2: end.y };
     const [a, b] = defaultLabels(p.x2 - p.x1, p.y2 - p.y1);
     lineDialogTitle.textContent = "New counting line";
     lineNameInput.value = `Line ${state.lines.length + 1}`;
@@ -1032,10 +1198,8 @@ async function saveLineDialog() {
 }
 
 async function moveLineEnd(lineId, end, point) {
-  const [w, h] = state.frameSize;
-  const fx = Math.min(1, Math.max(0, point.x / w));
-  const fy = Math.min(1, Math.max(0, point.y / h));
-  const body = end === 1 ? { x1: fx, y1: fy } : { x2: fx, y2: fy };
+  const f = toFraction(point.x, point.y);
+  const body = end === 1 ? { x1: f.x, y1: f.y } : { x2: f.x, y2: f.y };
   try {
     await fetchJson(`/api/lines/${lineId}`, jsonRequest("PATCH", body));
     setStatus("Line moved.");
@@ -1175,7 +1339,9 @@ canvas.addEventListener("click", (event) => {
     setStatus("Too short. Click further away from the first point.");
     return;
   }
-  state.pendingLine = { x1: state.draftStart.x / w, y1: state.draftStart.y / h, x2: point.x / w, y2: point.y / h };
+  const a = toFraction(state.draftStart.x, state.draftStart.y);
+  const b = toFraction(point.x, point.y);
+  state.pendingLine = { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
   state.pointer = point;
   draw();
   openLineDialog(null);

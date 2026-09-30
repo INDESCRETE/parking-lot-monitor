@@ -1362,3 +1362,34 @@ body.dashboard-body {
 :root[data-theme="dark"] .occupancy-warn {
   --warn-text: #fbbf24;
 }
+
+/* Traffic page: zoom area editor */
+.zoom-dialog {
+  width: min(960px, calc(100vw - 32px));
+}
+
+.zoom-stage {
+  background: var(--canvas-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: grid;
+  min-height: 200px;
+  place-items: center;
+}
+
+#zoomCanvas {
+  cursor: crosshair;
+  display: none;
+  max-height: 62vh;
+  max-width: 100%;
+}
+
+.dialog-spacer {
+  flex: 1;
+}
+
+#zoomButton.active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  font-weight: 700;
+}

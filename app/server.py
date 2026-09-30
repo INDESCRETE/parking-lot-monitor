@@ -1247,11 +1247,17 @@ def _camera_last_error(camera_id: str) -> tuple:
     return status.get("last_failure") or status.get("last_error"), status.get("last_error_at")
 
 
+def _camera_focus(camera_id: str):
+    source = live.get_source(camera_id)
+    return source.focus if source else None
+
+
 traffic_counter = live_traffic.TrafficCounter(
     db,
     # health_monitor is created further down; looked up when first needed.
     startup_fn=lambda: health_monitor.startup,
     camera_error_fn=_camera_last_error,
+    focus_fn=_camera_focus,
 )
 
 
@@ -1420,6 +1426,10 @@ class Handler(BaseHTTPRequestHandler):
         connect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/connect", parsed.path)
         if connect_match:
             self.handle_camera_connect(connect_match.group(1))
+            return
+        view_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/view", parsed.path)
+        if view_match:
+            self.handle_camera_view(view_match.group(1))
             return
         occupancy_match = re.fullmatch(r"/api/lots/(\d+)/occupancy", parsed.path)
         if occupancy_match:
@@ -1903,7 +1913,7 @@ class Handler(BaseHTTPRequestHandler):
         """Serves the live-camera routes. Returns False if the path isn't one."""
         path = urlparse(self.path).path
         match = re.fullmatch(
-            r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|live-debug|latest\.jpg|live\.mjpg|traffic-view|traffic-frame\.jpg)",
+            r"/api/cameras/([A-Za-z0-9_.-]+)/(live-status|live-debug|latest\.jpg|live\.mjpg|traffic-view|traffic-frame\.jpg|full-frame\.jpg)",
             path,
         )
         if not match:
@@ -1920,7 +1930,23 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "traffic-view":
             view = traffic_counter.view(camera_id)
             view["camera"] = live.get_status(camera_id)
+            source = live.get_source(camera_id)
+            view["view_settings"] = {
+                "focus": live.focus_dict(source.focus) if source else None,
+                "zoom_supported": bool(source and source.type == "rtsp"),
+                **(live.stream_quality(source) if source else {"can_switch": False, "full_resolution": False}),
+            }
             self.send_json(view)
+        elif action == "full-frame.jpg":
+            # One uncropped picture, for choosing the zoom area.
+            source = live.get_source(camera_id)
+            if source is None:
+                self.send_json({"error": "This camera isn't connected."}, HTTPStatus.NOT_FOUND)
+                return True
+            try:
+                self.send_bytes(live.grab_full_frame(source), "image/jpeg")
+            except live.LiveFrameError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_GATEWAY)
         elif action == "traffic-frame.jpg":
             # The exact picture the boxes in traffic-view were found in.
             body = traffic_counter.last_jpeg(camera_id)
@@ -1944,6 +1970,34 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
             pass
+
+    def handle_camera_view(self, camera_id: str) -> None:
+        """Saves a camera's zoom area ("focus", null = whole picture) and/or
+        stream quality ("full_resolution"), then reconnects it."""
+        if db.get_camera(camera_id) is None:
+            self.send_json({"error": f'Camera "{camera_id}" does not exist.'}, HTTPStatus.NOT_FOUND)
+            return
+        payload = self.read_json()
+        full_resolution = payload.get("full_resolution")
+        if full_resolution is not None and not isinstance(full_resolution, bool):
+            self.send_json({"error": "full_resolution must be true or false"}, HTTPStatus.BAD_REQUEST)
+            return
+        try:
+            live.update_view(camera_id, payload.get("focus"), full_resolution)
+        except live.LiveConfigError as exc:
+            self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        traffic_counter.view_changed(camera_id)
+        running = live.restart_camera(camera_id, on_frame=on_live_frame)
+        source = live.get_source(camera_id)
+        self.send_json({
+            "running": running,
+            "view_settings": {
+                "focus": live.focus_dict(source.focus) if source else None,
+                "zoom_supported": bool(source and source.type == "rtsp"),
+                **(live.stream_quality(source) if source else {"can_switch": False, "full_resolution": False}),
+            },
+        })
 
     def handle_camera_connect(self, camera_id: str) -> None:
         """Connects an app camera to the same physical camera another one uses

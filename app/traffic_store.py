@@ -241,6 +241,7 @@ GAP_LABELS = {
     "stopped": ("Program was stopped", True),
     "first_start": ("Monitoring started", True),
     "paused": ("Paused", True),
+    "reconfigured": ("Camera view changed (zoom or quality)", True),
     "crash": ("Program crashed", False),
     "reboot": ("Computer restarted", False),
     "power": ("Power outage (computer restarted by itself)", False),

@@ -146,6 +146,10 @@ class CameraSource:
     max_width: Optional[int] = None
     # False keeps the camera's settings in the file but doesn't connect to it.
     enabled: bool = True
+    # Video streams only: the part of the picture to keep, as fractions of the
+    # full picture {"x", "y", "w", "h"}; the rest is cut off before anything
+    # is analysed (so a small area gets the model's full attention).
+    focus: Optional[tuple] = None
 
     def snapshot_url(self) -> str:
         if self.type == "http_snapshot":
@@ -322,6 +326,9 @@ def parse_config(raw: Any) -> dict:
             )
         max_width_raw = entry.get("max_width")
         max_width = None if max_width_raw is None else _integer(entry, "max_width", 0, 160, 7680, camera_id)
+        focus = _clean_focus(entry.get("focus"), camera_id)
+        if focus is not None and camera_type != "rtsp":
+            raise LiveConfigError(f'{camera_id}: "focus" (zoom area) needs "type": "rtsp".')
 
         sources[camera_id] = CameraSource(
             camera_id=camera_id,
@@ -343,6 +350,7 @@ def parse_config(raw: Any) -> dict:
             rtsp_decode=decode,
             max_width=max_width,
             enabled=enabled,
+            focus=focus,
         )
     return sources
 
@@ -385,7 +393,8 @@ def entry_for_kind(entry: dict, kind: str) -> dict:
     """A copy of one camera's settings, adjusted to how `kind` takes pictures.
     A Reolink snapshot entry becomes its video stream when used for traffic
     (snapshots can't come 5 times a second)."""
-    new = {k: v for k, v in entry.items() if not k.startswith("_") and k != "enabled"}
+    # The zoom area belongs to one view; a copy starts with the whole picture.
+    new = {k: v for k, v in entry.items() if not k.startswith("_") and k not in ("enabled", "focus")}
     camera_type = new.get("type", "reolink")
     if kind == "traffic" and camera_type == "reolink":
         port = new.get("rtsp_port", 554)
@@ -421,15 +430,123 @@ def copy_connection(from_id: str, to_id: str, kind: str, path: Optional[Path] = 
     updated = dict(raw)
     updated[to_id] = entry_for_kind(entry, kind)
     parse_config(updated)  # never save something that won't load
+    _write_config(path, updated)
+    return updated[to_id]
+
+
+MIN_FOCUS_FRACTION = 0.05
+
+
+def _clean_focus(value: Any, cam: str) -> Optional[tuple]:
+    """(x, y, w, h) fractions of the picture, or None for the whole picture."""
+    if value is None:
+        return None
+    try:
+        x, y, w, h = (float(value[k]) for k in ("x", "y", "w", "h"))
+    except (TypeError, KeyError, ValueError):
+        raise LiveConfigError(f'{cam}: "focus" must look like {{"x": 0.1, "y": 0.2, "w": 0.5, "h": 0.4}}.') from None
+    if not (0 <= x < 1 and 0 <= y < 1 and w >= MIN_FOCUS_FRACTION and h >= MIN_FOCUS_FRACTION
+            and x + w <= 1.0001 and y + h <= 1.0001):
+        raise LiveConfigError(f'{cam}: "focus" must be inside the picture and at least 5% wide and tall.')
+    return (round(x, 4), round(y, 4), round(min(w, 1 - x), 4), round(min(h, 1 - y), 4))
+
+
+def focus_dict(focus: Optional[tuple]) -> Optional[dict]:
+    return None if focus is None else dict(zip(("x", "y", "w", "h"), focus))
+
+
+_REOLINK_STREAM_RE = re.compile(r"(Preview_\d+_)(sub|main)$")
+
+
+def stream_quality(source: "CameraSource") -> dict:
+    """Whether this camera can switch between its small and full-resolution
+    stream from the website (Reolink-style addresses), and which one it uses."""
+    match = _REOLINK_STREAM_RE.search(urllib.parse.urlsplit(source.stream_url or "").path)
+    return {"can_switch": bool(match), "full_resolution": bool(match and match.group(2) == "main")}
+
+
+# Full-resolution pictures are shrunk to at most this width after cropping
+# (a 5 MP picture is far more than the model uses, and slow to pass around).
+FULL_RESOLUTION_MAX_WIDTH = 1280
+
+
+def update_view(camera_id: str, focus: Optional[dict], full_resolution: Optional[bool],
+                path: Optional[Path] = None) -> dict:
+    """Saves a camera's zoom area and stream quality to camera_sources.json.
+    focus None = whole picture. full_resolution None = leave as is."""
+    path = path or CONFIG_PATH
+    raw = _read_raw_config(path)
+    entry = raw.get(camera_id)
+    if not isinstance(entry, dict):
+        raise LiveConfigError(f'"{camera_id}" has no connection settings.')
+    if entry.get("type") != "rtsp":
+        raise LiveConfigError("Zooming needs a camera connected by video stream (RTSP).")
+    entry = dict(entry)
+    cleaned = _clean_focus(focus, camera_id)
+    if cleaned is None:
+        entry.pop("focus", None)
+    else:
+        entry["focus"] = focus_dict(cleaned)
+    if full_resolution is not None:
+        url = entry.get("rtsp_url", "")
+        parts = urllib.parse.urlsplit(url)
+        match = _REOLINK_STREAM_RE.search(parts.path)
+        if match is None:
+            raise LiveConfigError("This camera's stream quality can't be switched from here.")
+        new_path = parts.path[: match.start(2)] + ("main" if full_resolution else "sub")
+        entry["rtsp_url"] = urllib.parse.urlunsplit(parts._replace(path=new_path))
+        if full_resolution:
+            entry["max_width"] = FULL_RESOLUTION_MAX_WIDTH
+        else:
+            entry.pop("max_width", None)
+    updated = dict(raw)
+    updated[camera_id] = entry
+    parse_config(updated)  # never save something that won't load
+    _write_config(path, updated)
+    return entry
+
+
+def _write_config(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(path.name + ".tmp")
-    temp.write_text(json.dumps(updated, indent=2) + "\n", encoding="utf-8")
+    temp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     try:
         os.chmod(temp, 0o600)  # it holds camera passwords
     except OSError:
         pass
     os.replace(temp, path)
-    return updated[to_id]
+
+
+FULL_FRAME_TIMEOUT_SECONDS = 20.0
+
+
+def grab_full_frame(source: "CameraSource") -> bytes:
+    """One uncropped picture from the camera's stream (for choosing a zoom
+    area). Opens a short second connection to the camera."""
+    url = source.detection_rtsp_url()
+    if not url:
+        raise LiveFrameError("this camera has no video stream address")
+    command = [find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if url.startswith(("rtsp://", "rtsps://")):
+        command += ["-rtsp_transport", "tcp"]
+    command += ["-i", url, "-an", "-frames:v", "1", "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+    try:
+        done = subprocess.run(command, capture_output=True, timeout=FULL_FRAME_TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise LiveFrameError("the camera didn't send a picture in time") from None
+    except FileNotFoundError:
+        raise LiveFrameError("ffmpeg is missing") from None
+    if not done.stdout.startswith(b"\xff\xd8"):
+        lines = done.stderr.decode("utf-8", "replace").strip().splitlines()
+        detail = source.scrub(lines[-1] if lines else "")
+        raise LiveFrameError(_rtsp_failure_hint(detail) or f"couldn't get a picture ({detail[-160:]})")
+    return done.stdout
+
+
+def restart_camera(camera_id: str, on_frame: Optional[FrameCallback] = None) -> bool:
+    """Reconnects one camera with its current settings from the file."""
+    stop_camera(camera_id)
+    return start_camera(camera_id, on_frame=on_frame)
 
 
 def load_config(path: Optional[Path] = None) -> dict:
@@ -669,11 +786,19 @@ def build_rtsp_frame_command(source: CameraSource, url: str) -> list:
         # the CPU of decoding every frame of a 5MP stream.
         command += ["-skip_frame", "nokey"]
     command += ["-i", url, "-an"]
+    filters = []
     if source.rtsp_decode == "all":
-        filters = [f"fps={round(1.0 / source.interval_seconds, 4):g}"]
-        if source.max_width:
-            # Only ever shrink; -2 keeps the height even, as JPEG encoders like.
-            filters.append(f"scale='min({source.max_width},iw)':-2")
+        filters.append(f"fps={round(1.0 / source.interval_seconds, 4):g}")
+    if source.focus:
+        # Cut out the zoom area (whole, even-sized pixels).
+        x, y, w, h = source.focus
+        filters.append(
+            f"crop=w=trunc(iw*{w:g}/2)*2:h=trunc(ih*{h:g}/2)*2:x=trunc(iw*{x:g}):y=trunc(ih*{y:g})"
+        )
+    if source.max_width and source.rtsp_decode == "all":
+        # Only ever shrink; -2 keeps the height even, as JPEG encoders like.
+        filters.append(f"scale='min({source.max_width},iw)':-2")
+    if filters:
         command += ["-vf", ",".join(filters)]
     command += _passthrough_flags(ffmpeg)
     command += ["-q:v", "3", "-f", "mpjpeg", "-boundary_tag", "frame", "pipe:1"]

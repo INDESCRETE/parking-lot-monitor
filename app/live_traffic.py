@@ -86,6 +86,7 @@ class _CameraState:
         self.lines_version = lines_version
         self.frame_size: Optional[tuple] = None
         self.last_epoch: Optional[float] = None
+        self.focus: Optional[tuple] = None
 
 
 class TrafficCounter:
@@ -97,8 +98,14 @@ class TrafficCounter:
 
     def __init__(self, db: Any, model_size: str = "medium", detector: Optional[Callable] = None,
                  startup_fn: Optional[Callable[[], dict]] = None,
-                 camera_error_fn: Optional[Callable[[str], tuple]] = None):
+                 camera_error_fn: Optional[Callable[[str], tuple]] = None,
+                 focus_fn: Optional[Callable[[str], Optional[tuple]]] = None):
         self._db = db
+        # camera_id -> the zoom area (x, y, w, h fractions of the full picture)
+        # the pictures were cut to, or None. Lines are stored against the full
+        # picture and moved into the zoomed picture's pixels here.
+        self._focus_fn = focus_fn or (lambda camera_id: None)
+        self._reconfigured: set = set()
         # Why the program last started ({"reason", "detail"}, from the health
         # monitor) -- the cause of the gap before each camera's first stretch.
         self._startup_fn = startup_fn or (lambda: {"reason": "restart", "detail": ""})
@@ -165,6 +172,14 @@ class TrafficCounter:
             self._close_coverage(camera_id)
             self.reset_camera(camera_id)
 
+    def view_changed(self, camera_id: str) -> None:
+        """The camera's zoom area or quality changed (it reconnects): start
+        the tracker fresh, and record the short gap as a planned one."""
+        with self._lock:
+            self._reconfigured.add(camera_id)
+        self._close_coverage(camera_id)
+        self.reset_camera(camera_id)
+
     def reset_camera(self, camera_id: str) -> None:
         """Forget the tracker, last picture and boxes (used when paused). The
         counters in status() and the recent crossings list are kept."""
@@ -176,6 +191,7 @@ class TrafficCounter:
         with self._lock:
             self._coverage.pop(camera_id, None)
             self._paused.discard(camera_id)
+            self._reconfigured.discard(camera_id)
             for store in (self._cameras, self._lines_version, self._status, self._last_view,
                           self._last_jpeg, self._recent, self._frame_times):
                 store.pop(camera_id, None)
@@ -269,6 +285,11 @@ class TrafficCounter:
             return startup.get("reason") or "restart", startup.get("detail") or ""
         if resumed:
             return "paused", ""
+        with self._lock:
+            reconfigured = camera_id in self._reconfigured
+            self._reconfigured.discard(camera_id)
+        if reconfigured:
+            return "reconfigured", ""
         error, error_at = self._camera_error_fn(camera_id)
         if error and error_at and gap_start is not None:
             try:
@@ -290,16 +311,21 @@ class TrafficCounter:
         if open_stretch is not None and hasattr(self._db, "extend_traffic_coverage"):
             self._save_coverage_end(open_stretch)
 
-    def _lines_for(self, camera_id: str, frame_size: tuple) -> list[CountLine]:
+    def _lines_for(self, camera_id: str, frame_size: tuple, focus: Optional[tuple] = None) -> list[CountLine]:
         width, height = frame_size
+        fx, fy, fw, fh = focus or (0.0, 0.0, 1.0, 1.0)
+
+        def to_pixels(x: float, y: float) -> tuple:
+            return ((x - fx) / fw * width, (y - fy) / fh * height)
+
         lines = []
         for row in self._db.list_count_lines(camera_id):
             lines.append(
                 CountLine(
                     line_id=str(row["id"]),
                     name=row["name"],
-                    p1=(row["x1"] * width, row["y1"] * height),
-                    p2=(row["x2"] * width, row["y2"] * height),
+                    p1=to_pixels(row["x1"], row["y1"]),
+                    p2=to_pixels(row["x2"], row["y2"]),
                     forward_label=row["forward_label"],
                     reverse_label=row["reverse_label"],
                 )
@@ -328,6 +354,12 @@ class TrafficCounter:
             state = self._cameras.get(camera_id)
             if state is None:
                 state = self._cameras[camera_id] = _CameraState(-1)
+            focus = self._focus_fn(camera_id)
+            if focus != state.focus:
+                # A different zoom area: same cars, different pixels.
+                state.tracker = VehicleTracker()
+                state.counter = None
+                state.focus = focus
             gap = None if state.last_epoch is None else now - state.last_epoch
             if gap is not None and (gap < 0 or gap > TRACKER_RESET_GAP_SECONDS):
                 # Outage (or a clock jump): start fresh rather than link old
@@ -335,7 +367,7 @@ class TrafficCounter:
                 state.tracker = VehicleTracker()
                 state.counter = None
             if state.counter is None or state.lines_version != version or state.frame_size != frame_size:
-                lines = self._lines_for(camera_id, frame_size)
+                lines = self._lines_for(camera_id, frame_size, state.focus)
                 old = state.counter
                 state.counter = LineCounter(lines)
                 if old is not None:
@@ -395,6 +427,8 @@ class TrafficCounter:
             self._last_view[camera_id] = {
                 "captured_at": captured_at,
                 "frame_size": list(frame_size),
+                # The zoom area this picture was cut to (fractions of the full picture).
+                "focus": None if state.focus is None else dict(zip(("x", "y", "w", "h"), state.focus)),
                 "detections": [
                     {"box": [round(v, 1) for v in d.box], "class": d.class_name, "confidence": round(d.confidence, 3)}
                     for d in detections
