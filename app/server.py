@@ -1340,6 +1340,10 @@ class Handler(BaseHTTPRequestHandler):
             self.serve_file(STATIC_DIR / "health.html")
         elif path == "/traffic":
             self.serve_file(STATIC_DIR / "traffic.html")
+        elif re.fullmatch(r"/api/lots/(\d+)/occupancy", path):
+            lot_id = int(re.fullmatch(r"/api/lots/(\d+)/occupancy", path).group(1))
+            with db.connect() as conn:
+                self.send_json({"occupancy": traffic_store.lot_occupancy(conn, lot_id)})
         elif path == "/api/camera-sources":
             # Cameras whose connection can be reused by another app camera.
             names = {camera["id"]: camera["name"] for camera in db.list_cameras()}
@@ -1416,6 +1420,22 @@ class Handler(BaseHTTPRequestHandler):
         connect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/connect", parsed.path)
         if connect_match:
             self.handle_camera_connect(connect_match.group(1))
+            return
+        occupancy_match = re.fullmatch(r"/api/lots/(\d+)/occupancy", parsed.path)
+        if occupancy_match:
+            # Sets "N vehicles are in the lot right now"; counting continues from there.
+            lot_id = int(occupancy_match.group(1))
+            if db.get_lot(lot_id) is None:
+                self.send_json({"error": f"Lot {lot_id} does not exist."}, HTTPStatus.NOT_FOUND)
+                return
+            try:
+                with db.connect() as conn:
+                    traffic_store.set_lot_count(conn, lot_id, self.read_json().get("count"))
+                    occupancy = traffic_store.lot_occupancy(conn, lot_id)
+            except ValueError as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_json({"occupancy": occupancy}, HTTPStatus.CREATED)
             return
         detect_match = re.fullmatch(r"/api/cameras/([A-Za-z0-9_.-]+)/detect", parsed.path)
         if detect_match:
@@ -1854,9 +1874,11 @@ class Handler(BaseHTTPRequestHandler):
         lot_id, start, end, camera_id = resolved
         with db.connect() as conn:
             report = analytics.compute_lot_report(conn, lot_id, start, end, camera_id)
-            # Entries/exits are lot-wide (from driveway lines on the lot's
+            # Entries/exits are lot-wide (from entrance/exit lines on the lot's
             # traffic cameras), whichever parking camera is picked.
             report["flow"] = traffic_store.lot_flow(conn, lot_id, start, end)
+            if report["flow"] is not None:
+                report["flow"]["occupancy"] = traffic_store.lot_occupancy(conn, lot_id)
         self.send_json(report)
 
     def handle_report_export(self, query: dict[str, list[str]]) -> None:

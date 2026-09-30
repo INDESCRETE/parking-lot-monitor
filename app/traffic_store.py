@@ -12,6 +12,9 @@ count_lines     one row per line drawn on a traffic camera. Coordinates are
                 NULL means the line isn't one (e.g. a street).
 line_crossings  one row per vehicle crossing a line: when (UTC), which way,
                 and what kind of vehicle.
+lot_count_baselines  "there are N vehicles in this lot right now", set by
+                hand (e.g. at night when the lot is empty). The live count is
+                the latest baseline + vehicles in - vehicles out since then.
 traffic_coverage  the stretches of time a traffic camera was actually being
                 watched (pictures analysed). Anything outside them is time
                 nothing was counted -- camera down, program off, paused -- so
@@ -70,6 +73,14 @@ CREATE TABLE IF NOT EXISTS traffic_coverage (
     end_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_traffic_coverage_camera_time ON traffic_coverage(camera_id, end_at);
+
+CREATE TABLE IF NOT EXISTS lot_count_baselines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lot_id INTEGER NOT NULL,
+    count INTEGER NOT NULL,
+    set_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lot_count_baselines_lot_time ON lot_count_baselines(lot_id, set_at);
 """
 
 
@@ -360,21 +371,7 @@ def counts(
 
     # Missed stretches between watched ones (and a still-open one at the end
     # when the camera isn't being watched right now).
-    def gap(a: datetime, z: datetime, reason: Optional[str], detail: Optional[str], ongoing: bool) -> dict:
-        label, planned = gap_label(reason)
-        return {"start": a.astimezone().isoformat(), "end": z.astimezone().isoformat(),
-                "seconds": round((z - a).total_seconds()), "ongoing": ongoing,
-                "reason": reason, "label": label, "planned": planned, "detail": detail or ""}
-
-    gaps = []
-    for (_a1, z1, *_), (a2, _z2, reason, detail) in zip(intervals, intervals[1:]):
-        if (a2 - z1).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
-            gaps.append(gap(z1, a2, reason, detail, False))
-    now = datetime.now(timezone.utc)
-    if intervals and end > now:
-        last_end = intervals[-1][1]
-        if (now - last_end).total_seconds() >= ONGOING_GAP_SECONDS:
-            gaps.append(gap(last_end, now, "ongoing", "", True))
+    gaps = coverage_gaps(conn, camera_id, start, end)
     monitored = sum((z - a).total_seconds() for a, z, *_ in intervals)
 
     # The busiest single hour (four consecutive 15-min intervals etc.), the
@@ -444,6 +441,167 @@ def counts_csv(report: dict) -> str:
 MIN_HOUR_COVERAGE = 0.5
 
 
+def _entrance_lines(conn: sqlite3.Connection, lot_id: int) -> list:
+    return conn.execute(
+        """SELECT count_lines.* FROM count_lines
+           JOIN cameras ON cameras.id = count_lines.camera_id
+           WHERE cameras.lot_id = ? AND cameras.kind = 'traffic' AND count_lines.entry_direction IS NOT NULL
+           ORDER BY count_lines.id""",
+        (lot_id,),
+    ).fetchall()
+
+
+def _lot_moves(conn: sqlite3.Connection, lines: list, start: datetime, end: datetime) -> list:
+    """(time, +1 in / -1 out) for every entrance/exit crossing in (start, end], oldest first."""
+    if not lines:
+        return []
+    entry_by_line = {row["id"]: row["entry_direction"] for row in lines}
+    marks = ",".join("?" for _ in entry_by_line)
+    rows = conn.execute(
+        f"""SELECT line_id, crossed_at, direction FROM line_crossings
+            WHERE line_id IN ({marks}) AND crossed_at > ? AND crossed_at <= ? ORDER BY crossed_at""",
+        (*entry_by_line, _utc_text(start), _utc_text(end)),
+    ).fetchall()
+    return [
+        (datetime.fromisoformat(r["crossed_at"]), 1 if r["direction"] == entry_by_line[r["line_id"]] else -1)
+        for r in rows
+    ]
+
+
+def coverage_gaps(conn: sqlite3.Connection, camera_id: str, start: datetime, end: datetime,
+                  include_leading: bool = False) -> list:
+    """Stretches in [start, end] when the camera wasn't being watched, each
+    with its cause. include_leading: also a gap from `start` to the first
+    watched stretch (or the whole range if nothing was watched)."""
+    intervals = _coverage_intervals(conn, camera_id, start, end)
+    now = datetime.now(timezone.utc)
+
+    def gap(a: datetime, z: datetime, reason: Optional[str], detail: Optional[str], ongoing: bool) -> dict:
+        label, planned = gap_label(reason)
+        return {"camera_id": camera_id, "start": a.astimezone().isoformat(), "end": z.astimezone().isoformat(),
+                "seconds": round((z - a).total_seconds()), "ongoing": ongoing,
+                "reason": reason, "label": label, "planned": planned, "detail": detail or ""}
+
+    gaps = []
+    if include_leading:
+        stop = min(end, now)
+        if not intervals:
+            if (stop - start).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
+                gaps.append(gap(start, stop, "ongoing" if end >= now else None, "", end >= now))
+            return gaps
+        if (intervals[0][0] - start).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
+            gaps.append(gap(start, intervals[0][0], intervals[0][2], intervals[0][3], False))
+    for (_a1, z1, *_), (a2, _z2, reason, detail) in zip(intervals, intervals[1:]):
+        if (a2 - z1).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
+            gaps.append(gap(z1, a2, reason, detail, False))
+    if intervals and end > now:
+        last_end = intervals[-1][1]
+        if (now - last_end).total_seconds() >= ONGOING_GAP_SECONDS:
+            gaps.append(gap(last_end, now, "ongoing", "", True))
+    return gaps
+
+
+# --- Vehicles in the lot (accumulation) ---------------------------------------
+
+
+def set_lot_count(conn: sqlite3.Connection, lot_id: int, count: Any, when: Optional[datetime] = None) -> dict:
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 100000:
+        raise ValueError("count must be a whole number from 0 up")
+    when = when or datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO lot_count_baselines (lot_id, count, set_at) VALUES (?, ?, ?)",
+        (lot_id, count, _utc_text(when)),
+    )
+    return {"lot_id": lot_id, "count": count, "set_at": when.astimezone().isoformat()}
+
+
+def _baselines(conn: sqlite3.Connection, lot_id: int, until: datetime) -> list:
+    rows = conn.execute(
+        "SELECT count, set_at FROM lot_count_baselines WHERE lot_id = ? AND set_at <= ? ORDER BY set_at, id",
+        (lot_id, _utc_text(until)),
+    ).fetchall()
+    return [(datetime.fromisoformat(r["set_at"]), int(r["count"])) for r in rows]
+
+
+def lot_occupancy(conn: sqlite3.Connection, lot_id: int, now: Optional[datetime] = None) -> Optional[dict]:
+    """How many vehicles are in the lot right now: the latest starting count
+    plus entries minus exits since. None when the lot has no entrance/exit
+    lines. Lists every stretch since the starting count when an entrance
+    wasn't watched -- vehicles that passed then aren't in the number."""
+    lines = _entrance_lines(conn, lot_id)
+    if not lines:
+        return None
+    now = now or datetime.now(timezone.utc)
+    baselines = _baselines(conn, lot_id, now)
+    if not baselines:
+        return {"lot_id": lot_id, "started": False, "current": None}
+    set_at, count = baselines[-1]
+    moves = _lot_moves(conn, lines, set_at, now)
+    entered = sum(1 for _, d in moves if d > 0)
+    left = len(moves) - entered
+    gaps = []
+    for camera_id in sorted({row["camera_id"] for row in lines}):
+        gaps += coverage_gaps(conn, camera_id, set_at, now, include_leading=True)
+    gaps.sort(key=lambda g: g["start"])
+    return {
+        "lot_id": lot_id,
+        "started": True,
+        "current": count + entered - left,
+        "starting_count": count,
+        "set_at": set_at.astimezone().isoformat(),
+        "entered": entered,
+        "left": left,
+        "gaps": gaps,
+        "missed_seconds": sum(g["seconds"] for g in gaps),
+        "not_watching_now": any(g["ongoing"] for g in gaps),
+    }
+
+
+def _accumulation(conn: sqlite3.Connection, lot_id: int, lines: list, slots: list, stop: datetime) -> Optional[dict]:
+    """Vehicles inside, per hour slot: the most at any moment in the hour and
+    the number at its end. None for hours before the first starting count."""
+    if not slots:
+        return None
+    baselines = _baselines(conn, lot_id, stop)
+    if not baselines:
+        return None
+    first_slot = slots[0].astimezone(timezone.utc)
+    # Start from the last starting count at or before the range (else the first one in it).
+    earlier = [b for b in baselines if b[0] <= first_slot]
+    begin = earlier[-1][0] if earlier else baselines[0][0]
+    events = [(t, "set", n) for t, n in baselines if t >= begin]
+    events += [(t, "move", d) for t, d in _lot_moves(conn, lines, begin, stop)]
+    events.sort(key=lambda e: (e[0], 0 if e[1] == "set" else 1))
+    hour = timedelta(hours=1)
+    running: Optional[int] = None
+    i = 0
+    hours = []
+    for slot in slots:
+        s0 = slot.astimezone(timezone.utc)
+        s1 = min(s0 + hour, stop)
+        # Everything before the slot.
+        while i < len(events) and events[i][0] < s0:
+            running = events[i][2] if events[i][1] == "set" else (running + events[i][2] if running is not None else None)
+            i += 1
+        peak = running
+        while i < len(events) and events[i][0] < s1:
+            running = events[i][2] if events[i][1] == "set" else (running + events[i][2] if running is not None else None)
+            if running is not None:
+                peak = running if peak is None else max(peak, running)
+            i += 1
+        hours.append({"start": slot.isoformat(), "peak": peak, "end": running})
+    known = [h for h in hours if h["peak"] is not None]
+    if not known:
+        return None
+    top = max(known, key=lambda h: h["peak"])
+    return {
+        "hours": hours,
+        "peak": {"start": top["start"], "count": top["peak"]},
+        "went_negative": any(h["peak"] is not None and min(h["peak"], h["end"] if h["end"] is not None else 0) < 0
+                             for h in hours),
+    }
+
+
 def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: datetime) -> Optional[dict]:
     """Vehicles entering and leaving a lot, from the traffic cameras assigned to
     it and their lines marked as entrance/exit. None when the lot has no such
@@ -451,13 +609,7 @@ def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: dateti
 
     Hours and days are local time. Coverage per hour is the lowest of the
     entrance/exit cameras' (a lot is only fully counted when every entrance is)."""
-    lines = conn.execute(
-        """SELECT count_lines.* FROM count_lines
-           JOIN cameras ON cameras.id = count_lines.camera_id
-           WHERE cameras.lot_id = ? AND cameras.kind = 'traffic' AND count_lines.entry_direction IS NOT NULL
-           ORDER BY count_lines.id""",
-        (lot_id,),
-    ).fetchall()
+    lines = _entrance_lines(conn, lot_id)
     if not lines:
         return None
     entry_by_line = {row["id"]: row["entry_direction"] for row in lines}
@@ -554,4 +706,5 @@ def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: dateti
         "busiest_hour": None if busiest is None or (busiest["in"] + busiest["out"]) == 0 else busiest,
         "monitored_seconds": round(monitored),
         "range_seconds": round(total_seconds),
+        "accumulation": _accumulation(conn, lot_id, lines, slots, stop),
     }

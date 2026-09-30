@@ -1319,3 +1319,46 @@ body.dashboard-body {
   line-height: 1.4;
   margin: 8px 0 0;
 }
+
+/* Traffic page: vehicles in the lot */
+.small-button {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 10px;
+}
+
+.occupancy-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.occupancy-number {
+  font-size: 34px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.occupancy-sub {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 4px 0 0;
+}
+
+.occupancy-warn {
+  color: var(--warn-text, #b45309);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 8px 0 0;
+}
+
+.occupancy-warn.problem {
+  color: var(--danger);
+}
+
+:root[data-theme="dark"] .occupancy-warn {
+  --warn-text: #fbbf24;
+}

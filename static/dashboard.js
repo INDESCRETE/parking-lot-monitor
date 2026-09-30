@@ -73,6 +73,8 @@ const flowSummary = document.querySelector("#flowSummary");
 const flowHourChart = document.querySelector("#flowHourChart");
 const flowDayWrap = document.querySelector("#flowDayWrap");
 const flowDayChart = document.querySelector("#flowDayChart");
+const accumulationSummary = document.querySelector("#accumulationSummary");
+const accumulationChart = document.querySelector("#accumulationChart");
 
 function escapeHtml(value) {
   const div = document.createElement("div");
@@ -367,6 +369,7 @@ function renderFlow(flow) {
     inColor,
     outColor,
   );
+  renderAccumulation(flow);
   const multiDay = flow.by_day.length > 1;
   flowDayWrap.hidden = !multiDay;
   if (multiDay) {
@@ -381,6 +384,63 @@ function renderFlow(flow) {
       outColor,
     );
   }
+}
+
+/** Vehicles inside the lot hour by hour (the most at any moment in each
+ * hour), from the starting count set on the Traffic page. */
+function renderAccumulation(flow) {
+  const acc = flow.accumulation;
+  const occ = flow.occupancy;
+  const parts = [];
+  if (occ && occ.started) {
+    const since = new Date(occ.set_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+    parts.push(`<strong>${occ.current}</strong> inside right now (counting from ${occ.starting_count} on ${escapeHtml(since)}).`);
+    if (occ.gaps && occ.gaps.length) {
+      parts.push(`<span class="flow-muted">Entrances/exits weren't watched for ${escapeHtml(formatDuration(occ.missed_seconds))} since then, so it may be off.</span>`);
+    }
+  }
+  if (acc) {
+    const peakAt = new Date(acc.peak.start);
+    const peakLabel = `${peakAt.toLocaleDateString([], { month: "short", day: "numeric" })}, ${formatHourLabel(peakAt.getHours())}`;
+    parts.push(`Most in this range: <strong>${acc.peak.count}</strong> (${escapeHtml(peakLabel)}).`);
+    if (acc.went_negative) {
+      parts.push('<span class="flow-muted">The count went below zero at some point, so the starting count was too low or exits were double counted.</span>');
+    }
+  }
+  if (!acc && !(occ && occ.started)) {
+    accumulationSummary.innerHTML = '<span class="flow-muted">Set a starting count on the Traffic page ("Vehicles in the lot" → Set count) to track how many vehicles are inside.</span>';
+    accumulationChart.innerHTML = "";
+    return;
+  }
+  accumulationSummary.innerHTML = parts.join(" ");
+  if (!acc) {
+    accumulationChart.innerHTML = "";
+    return;
+  }
+  // One day: hour by hour. Several days: the most inside on each day
+  // (hourly bars across a week are too thin to read).
+  const days = new Map();
+  for (const h of acc.hours) {
+    const day = h.start.slice(0, 10); // local date (the server sends local times)
+    const peaks = days.get(day) || [];
+    if (h.peak !== null) peaks.push(h.peak);
+    days.set(day, peaks);
+  }
+  let labels;
+  let values;
+  if (days.size > 1) {
+    labels = [...days.keys()].map((d) => formatDateLabel(d));
+    values = [...days.values()].map((peaks) => (peaks.length ? Math.max(0, ...peaks) : null));
+  } else {
+    labels = acc.hours.map((h) => formatHourLabel(new Date(h.start).getHours()));
+    values = acc.hours.map((h) => (h.peak === null ? null : Math.max(0, h.peak)));
+  }
+  accumulationChart.innerHTML = barChartSvg(labels, values, {
+    color: cssVar("--accent", ACCENT),
+    valueFormatter: (v) => `${Math.round(v)} inside at most`,
+    axisFormatter: (v) => `${Math.round(v)}`,
+    showZero: true,
+  });
 }
 
 /** Horizontal bars, one per space, busiest first — mirrors

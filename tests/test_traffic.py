@@ -208,12 +208,15 @@ class LotFlowTests(unittest.TestCase):
 
     def cross(self, line, direction, minutes):
         traffic_store.add_crossings(self.conn, [{
-            "line_id": line["id"], "camera_id": "gate", "crossed_at": (self.day + timedelta(minutes=minutes)).isoformat(),
+            # Stored in UTC, like the live counter does.
+            "line_id": line["id"], "camera_id": "gate",
+            "crossed_at": (self.day + timedelta(minutes=minutes)).astimezone(timezone.utc).isoformat(),
             "direction": direction, "vehicle_class": "car", "track_id": minutes}])
 
     def watch(self, from_min, to_min):
-        c = traffic_store.open_coverage(self.conn, "gate", (self.day + timedelta(minutes=from_min)).isoformat())
-        traffic_store.extend_coverage(self.conn, c, (self.day + timedelta(minutes=to_min)).isoformat())
+        utc = lambda m: (self.day + timedelta(minutes=m)).astimezone(timezone.utc).isoformat()
+        c = traffic_store.open_coverage(self.conn, "gate", utc(from_min))
+        traffic_store.extend_coverage(self.conn, c, utc(to_min))
 
     def test_no_driveway_lines_means_no_section(self):
         self.assertIsNone(traffic_store.lot_flow(self.conn, 8, self.day, self.day + timedelta(days=1)))
@@ -238,6 +241,45 @@ class LotFlowTests(unittest.TestCase):
         self.assertEqual(flow["busiest_hour"]["hour"], 8)
         self.assertEqual(flow["monitored_seconds"], 130 * 60)
         self.assertEqual(flow["by_day"][0]["in"], 3)
+
+    def test_vehicles_in_lot_from_starting_count(self):
+        at = lambda m: self.day + timedelta(minutes=m)
+        self.assertEqual(traffic_store.lot_occupancy(self.conn, 7, now=at(60))["started"], False)
+        self.assertIsNone(traffic_store.lot_occupancy(self.conn, 8, now=at(60)), "no entrance/exit lines")
+        self.cross(self.gate, "reverse", 5)  # before the starting count: ignored
+        traffic_store.set_lot_count(self.conn, 7, 10, at(10))
+        self.watch(10, 50)
+        self.watch(55, 120)  # 5-minute gap 50-55
+        for m in (20, 30, 40):
+            self.cross(self.gate, "reverse", m)  # in
+        self.cross(self.gate, "forward", 45)  # out
+        self.cross(self.street, "forward", 46)  # street line: ignored
+        occ = traffic_store.lot_occupancy(self.conn, 7, now=at(60))
+        self.assertEqual((occ["current"], occ["entered"], occ["left"], occ["starting_count"]), (12, 3, 1, 10))
+        self.assertEqual([g["seconds"] for g in occ["gaps"]], [300])
+        with self.assertRaises(ValueError):
+            traffic_store.set_lot_count(self.conn, 7, -1)
+        # A new starting count replaces the old one from then on.
+        traffic_store.set_lot_count(self.conn, 7, 4, at(50))
+        self.assertEqual(traffic_store.lot_occupancy(self.conn, 7, now=at(60))["current"], 4)
+
+    def test_accumulation_by_hour(self):
+        at = lambda m: self.day + timedelta(minutes=m)
+        self.watch(0, 24 * 60)
+        traffic_store.set_lot_count(self.conn, 7, 2, at(8 * 60))
+        for m in (8 * 60 + 10, 8 * 60 + 20, 8 * 60 + 30):
+            self.cross(self.gate, "reverse", m)  # 5 inside by 8:30
+        self.cross(self.gate, "forward", 8 * 60 + 50)  # 4 at the end of 8:00-9:00
+        self.cross(self.gate, "forward", 9 * 60 + 5)  # 3
+        flow = traffic_store.lot_flow(self.conn, 7, self.day, self.day + timedelta(hours=11))
+        acc = flow["accumulation"]
+        by_hour = {datetime.fromisoformat(h["start"]).hour: h for h in acc["hours"]}
+        self.assertIsNone(by_hour[7]["peak"], "no starting count yet")
+        self.assertEqual((by_hour[8]["peak"], by_hour[8]["end"]), (5, 4))
+        self.assertEqual((by_hour[9]["peak"], by_hour[9]["end"]), (4, 3))
+        self.assertEqual((by_hour[10]["peak"], by_hour[10]["end"]), (3, 3))
+        self.assertEqual(acc["peak"]["count"], 5)
+        self.assertFalse(acc["went_negative"])
 
     def test_entry_direction_can_be_changed_and_cleared(self):
         line = traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": "forward"})

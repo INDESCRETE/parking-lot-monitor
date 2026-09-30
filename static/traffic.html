@@ -58,6 +58,14 @@
           </div>
         </section>
 
+        <section id="occupancySection" hidden>
+          <div class="section-title-row">
+            <div class="section-title">Vehicles in the lot</div>
+            <button type="button" id="setCountButton" class="small-button">Set count</button>
+          </div>
+          <div id="occupancyCard" class="occupancy-card"></div>
+        </section>
+
         <section>
           <div class="section-title-row">
             <div class="section-title">Counting lines</div>
@@ -123,6 +131,19 @@
         <p class="dialog-hint">The arrows on the picture show which way each name counts. Rename them to anything, e.g. Northbound / Southbound or In / Out.</p>
         <div class="dialog-actions">
           <button value="cancel" type="button" id="cancelLineButton">Cancel</button>
+          <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="countDialog">
+      <form method="dialog" id="countForm" class="dialog-form">
+        <h2>Vehicles in the lot right now</h2>
+        <label for="countInput">How many are inside?</label>
+        <input id="countInput" type="number" min="0" step="1" inputmode="numeric" required>
+        <p class="dialog-hint">Count them by looking (easiest when the lot is empty or nearly empty, e.g. at night). The app keeps adding vehicles that enter and subtracting ones that leave from this number. Set it again whenever it drifts.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCountButton">Cancel</button>
           <button value="save" type="submit">Save</button>
         </div>
       </form>

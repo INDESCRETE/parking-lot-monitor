@@ -394,6 +394,44 @@ def _grouped_bar_chart(
     return f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" xmlns="http://www.w3.org/2000/svg" role="img">{"".join(parts)}</svg>'
 
 
+def _accumulation_block(acc: dict[str, Any] | None) -> str:
+    """Vehicles inside the lot hour by hour, when a starting count was set."""
+    if not acc:
+        return ""
+    hours = acc["hours"]
+    # One day: hour by hour. Several days: the most inside on each day.
+    days: dict = {}
+    for h in hours:
+        days.setdefault(h["start"][:10], []).extend([] if h["peak"] is None else [h["peak"]])
+    if len(days) > 1:
+        labels = [_format_date_label(d) for d in days]
+        values = [float(max(0, *peaks)) if peaks else None for peaks in days.values()]
+        per = "day"
+    else:
+        labels = [_format_hour_label(datetime.fromisoformat(h["start"]).hour) for h in hours]
+        values = [None if h["peak"] is None else float(max(0, h["peak"])) for h in hours]
+        per = "hour"
+    chart = _bar_chart(
+        labels,
+        values,
+        color=ACCENT,
+        value_formatter=lambda v: f"{int(v)} inside at most",
+        axis_formatter=lambda v: f"{round(v)}",
+    )
+    peak_at = datetime.fromisoformat(acc["peak"]["start"])
+    note = (
+        " The count went below zero at some point, so the starting count was too low or exits were double counted."
+        if acc.get("went_negative") else ""
+    )
+    return (
+        '<div class="subhead">Vehicles in the lot</div>'
+        f'<p class="headline">Most at once: <strong>{acc["peak"]["count"]}</strong> '
+        f'({escape(peak_at.strftime("%b %-d"))}, {_format_hour_label(peak_at.hour)}). '
+        f'<span class="panel-sub">Most vehicles inside at any moment each {per}, from a starting count plus entries minus exits.{escape(note)}</span></p>'
+        f"{chart}"
+    )
+
+
 def _flow_panel(flow: dict[str, Any] | None) -> str:
     """Entries & exits section, or "" when the lot has no entrance/exit lines."""
     if not flow:
@@ -425,6 +463,7 @@ def _flow_panel(flow: dict[str, Any] | None) -> str:
             value_formatter=lambda v: f"{int(v)} vehicles",
             integer_axis=True,
         )
+    accumulation_html = _accumulation_block(flow.get("accumulation"))
     watched = round(100 * flow["monitored_seconds"] / flow["range_seconds"]) if flow["range_seconds"] else 0
     busiest = flow.get("busiest_hour")
     busiest_text = (
@@ -443,6 +482,7 @@ def _flow_panel(flow: dict[str, Any] | None) -> str:
     {hour_chart}
     {day_chart}
     {legend}
+    {accumulation_html}
     <p class="panel-sub" style="margin:8px 0 0">{escape(coverage_text)}</p>
   </section>
 """

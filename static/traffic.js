@@ -36,6 +36,12 @@ const CAMERA_STORAGE_KEY = "parkingLotMonitor.lastTrafficCameraId";
 const $ = (selector) => document.querySelector(selector);
 const cameraSelect = $("#cameraSelect");
 const connectionStatus = $("#connectionStatus");
+const occupancySection = $("#occupancySection");
+const occupancyCard = $("#occupancyCard");
+const setCountButton = $("#setCountButton");
+const countDialog = $("#countDialog");
+const countForm = $("#countForm");
+const countInput = $("#countInput");
 const connectPanel = $("#connectPanel");
 const connectFromSelect = $("#connectFromSelect");
 const connectButton = $("#connectButton");
@@ -429,6 +435,8 @@ async function loadCameras(preferredId) {
 async function switchCamera() {
   cancelDrawing();
   renderLotSelect();
+  state.occupancy = null;
+  occupancySection.hidden = true;
   state.view = null;
   state.image = null;
   state.frameSeq = null;
@@ -485,7 +493,76 @@ async function loadCounts() {
   } catch (error) {
     console.warn(error);
   }
+  loadOccupancy();
 }
+
+// --- Vehicles in the lot (starting count + entered - left) --------------------
+async function loadOccupancy() {
+  const camera = selectedCamera();
+  const lotId = camera?.lot_id;
+  if (lotId == null) {
+    occupancySection.hidden = true;
+    return;
+  }
+  try {
+    const { occupancy } = await fetchJson(`/api/lots/${lotId}/occupancy`);
+    if (selectedCamera()?.lot_id !== lotId) return;
+    state.occupancy = occupancy;
+    renderOccupancy();
+  } catch (error) {
+    console.warn(error);
+  }
+}
+
+function renderOccupancy() {
+  const occ = state.occupancy;
+  // Only for a lot with lines marked as entrance/exit.
+  occupancySection.hidden = !occ;
+  if (!occ) return;
+  if (!occ.started) {
+    occupancyCard.innerHTML =
+      '<p class="line-empty">Not counting yet. Count the vehicles inside (easiest when it\'s empty, e.g. at night) and press <strong>Set count</strong>. From then on, entries are added and exits subtracted.</p>';
+    return;
+  }
+  const since = new Date(occ.set_at).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+  const gaps = occ.gaps || [];
+  let trust = "";
+  if (occ.not_watching_now) {
+    trust = '<p class="occupancy-warn problem">Not watching an entrance/exit right now, so this number isn\'t being updated.</p>';
+  } else if (gaps.length) {
+    trust = `<p class="occupancy-warn">Entrances/exits weren't watched for ${formatSpan(occ.missed_seconds)} since then (${gaps.length} gap${gaps.length === 1 ? "" : "s"}). Vehicles that passed during those aren't in the number; set the count again when you can check it.</p>`;
+  }
+  const negative = occ.current < 0
+    ? '<p class="occupancy-warn problem">Below zero: the starting count was too low or some exits were counted twice. Set the count again.</p>'
+    : "";
+  occupancyCard.innerHTML = `
+    <div class="occupancy-number">${occ.current}</div>
+    <p class="occupancy-sub">Started at ${occ.starting_count} on ${escapeHtml(since)} · <span class="dir-a">+${occ.entered} entered</span> · <span class="dir-b">−${occ.left} left</span></p>
+    ${negative}${trust}`;
+}
+
+setCountButton.addEventListener("click", () => {
+  const occ = state.occupancy;
+  countInput.value = occ && occ.started && occ.current >= 0 ? String(occ.current) : "";
+  countDialog.showModal();
+  countInput.select();
+});
+$("#cancelCountButton").addEventListener("click", () => countDialog.close());
+countForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const camera = selectedCamera();
+  const count = Number(countInput.value);
+  countDialog.close();
+  if (camera?.lot_id == null || !Number.isInteger(count) || count < 0) return;
+  try {
+    const { occupancy } = await fetchJson(`/api/lots/${camera.lot_id}/occupancy`, jsonRequest("POST", { count }));
+    state.occupancy = occupancy;
+    renderOccupancy();
+    setStatus(`Count set to ${count}. Counting from now.`);
+  } catch (error) {
+    setStatus(error.message);
+  }
+});
 
 async function pollView() {
   const cameraId = state.cameraId;
@@ -728,6 +805,7 @@ lotSelect.addEventListener("change", async () => {
   try {
     const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { lot_id: Number(lotSelect.value) }));
     Object.assign(camera, payload.camera);
+    loadOccupancy();
     setStatus(`"${camera.name}" now belongs to ${lotSelect.selectedOptions[0]?.textContent}. Its entrance/exit lines count toward that lot's entries and exits.`);
   } catch (error) {
     setStatus(error.message);
