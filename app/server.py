@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import cgi
 import errno
+import hashlib
 import json
 import mimetypes
 import os
@@ -1261,6 +1262,20 @@ traffic_counter = live_traffic.TrafficCounter(
 )
 
 
+def app_version() -> str:
+    """Changes whenever the program or its pages change, so an open page can
+    tell it's out of date and offer a reload."""
+    digest = hashlib.sha1()
+    for directory, pattern in ((ROOT / "app", "*.py"), (STATIC_DIR, "*")):
+        for path in sorted(directory.glob(pattern)):
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            digest.update(f"{path.name}:{stat.st_mtime_ns}:{stat.st_size};".encode())
+    return digest.hexdigest()[:12]
+
+
 def camera_kind(camera_id: str) -> str:
     camera = db.get_camera(camera_id)
     return (camera or {}).get("kind") or "parking"
@@ -1366,6 +1381,8 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_traffic_counts(query, as_csv=path.endswith(".csv"))
         elif path == "/api/health":
             self.send_json(health_monitor.status())
+        elif path == "/api/version":
+            self.send_json({"version": app_version()})
         elif path == "/api/cameras":
             lot_id_raw = query.get("lot_id", [None])[0]
             if lot_id_raw is None:

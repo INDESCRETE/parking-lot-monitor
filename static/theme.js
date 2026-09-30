@@ -39,3 +39,42 @@
     window.dispatchEvent(new CustomEvent("themechange", { detail: { theme: next } }));
   });
 })();
+
+
+// "The app was updated" banner, shared by every page. The server's version
+// changes whenever the program or these pages change; a page left open from
+// before an update would otherwise keep showing the old buttons and screens.
+(function () {
+  const CHECK_MS = 30000;
+  let loadedVersion = null;
+  let shown = false;
+
+  async function check() {
+    if (shown) return;
+    try {
+      const response = await fetch("/api/version", { cache: "no-store" });
+      if (!response.ok) return;
+      const { version } = await response.json();
+      if (loadedVersion === null) {
+        loadedVersion = version;
+      } else if (version !== loadedVersion) {
+        showBanner();
+      }
+    } catch (error) {
+      // Server restarting or unreachable: try again next time.
+    }
+  }
+
+  function showBanner() {
+    shown = true;
+    const banner = document.createElement("div");
+    banner.className = "update-banner";
+    banner.setAttribute("role", "status");
+    banner.innerHTML = '<span>The app was updated.</span> <button type="button">Reload to see the changes</button>';
+    banner.querySelector("button").addEventListener("click", () => window.location.reload());
+    document.body.prepend(banner);
+  }
+
+  check();
+  setInterval(check, CHECK_MS);
+})();
