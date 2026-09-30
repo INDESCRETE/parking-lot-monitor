@@ -1043,11 +1043,24 @@ function renderCoverage() {
     byCause.set(gap.label, entry);
   }
   const causes = [...byCause.values()].sort((a, b) => Number(a.planned) - Number(b.planned) || b.seconds - a.seconds);
+  // Only gaps nobody chose count as "missed"; pauses, updates and view
+  // changes are listed separately so they don't make the camera look unreliable.
   const problems = gaps.filter((g) => !g.planned && !g.ongoing);
+  const planned = gaps.filter((g) => g.planned);
+  const sum = (list) => list.reduce((total, g) => total + g.seconds, 0);
   const last = gaps[gaps.length - 1];
-  const headline = last.ongoing
-    ? `Not counting since ${formatClock(last.start)}.`
-    : `Watched ${formatSpan(report.monitored_seconds)} today, missed ${formatSpan(report.missed_seconds)} in ${gaps.length} gap${gaps.length === 1 ? "" : "s"}.`;
+  let headline;
+  if (last.ongoing) {
+    headline = `Not counting since ${formatClock(last.start)}.`;
+  } else {
+    headline = `Watched ${formatSpan(report.monitored_seconds)} today, `;
+    headline += problems.length
+      ? `missed ${formatSpan(sum(problems))} in ${problems.length} gap${problems.length === 1 ? "" : "s"}.`
+      : "nothing missed.";
+    if (planned.length) {
+      headline += ` Off on purpose ${formatSpan(sum(planned))} (paused, updates), not counted as missed.`;
+    }
+  }
   coverageNote.classList.add(last.ongoing ? "problem" : problems.length ? "warn" : "planned-only");
   const summary = causes
     .map((c) => `${c.count} × ${escapeHtml(c.label.toLowerCase())} (${formatSpan(c.seconds)})`)

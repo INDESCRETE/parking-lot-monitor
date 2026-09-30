@@ -280,11 +280,13 @@ class TrafficCounter:
             self._started_cameras.add(camera_id)
             resumed = camera_id in self._resumed
             self._resumed.discard(camera_id)
+        # A resume wins over a restart: a camera that stayed paused across
+        # program restarts was off because it was paused, not because of them.
+        if resumed:
+            return "paused", ""
         if first:
             startup = self._startup_fn() or {}
             return startup.get("reason") or "restart", startup.get("detail") or ""
-        if resumed:
-            return "paused", ""
         with self._lock:
             reconfigured = camera_id in self._reconfigured
             self._reconfigured.discard(camera_id)

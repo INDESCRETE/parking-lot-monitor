@@ -435,6 +435,18 @@ class CounterTests(unittest.TestCase):
         self.drive([None] * 5, start_t=10.0)
         self.assertEqual([r[0] for r in self.db.reasons()], ["restart", "reconfigured"])
 
+    def test_resume_after_restarts_is_a_pause_not_an_update(self):
+        # Paused before the program restarted; resumed afterwards.
+        counter = live_traffic.TrafficCounter(
+            self.db, detector=lambda image: list(self.boxes),
+            startup_fn=lambda: {"reason": "update", "detail": "Changed: server.py"},
+        )
+        counter.set_paused("street", True)
+        counter.set_paused("street", False)
+        self.counter = counter
+        self.drive([None] * 3, start_t=100.0)
+        self.assertEqual(self.db.reasons(), [("paused", "")])
+
     def test_forget_camera(self):
         self.drive([100, 130])
         self.counter.forget_camera("street")

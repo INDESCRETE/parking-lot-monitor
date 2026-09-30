@@ -412,6 +412,9 @@ def counts(
         "gaps": gaps,
         "missed_seconds": sum(g["seconds"] for g in gaps),
         "missed_planned_seconds": sum(g["seconds"] for g in gaps if g["planned"]),
+        # Only the gaps nobody chose (camera, crash, power...): the number that
+        # says how reliable the setup is. Pauses and updates aren't in it.
+        "problem_seconds": sum(g["seconds"] for g in gaps if not g["planned"]),
     }
 
 
