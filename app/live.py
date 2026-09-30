@@ -573,8 +573,14 @@ class HttpSnapshotFetcher:
 
 
 RATE_WINDOW_SECONDS = 10.0
-PACED_BACKLOG = 50  # pictures waiting to be handed over ("all" mode); ~10 s at 5/s
+PACED_BACKLOG = 300  # pictures waiting to be handed over ("all" mode); ~60 s at 5/s
 PACED_RESYNC_SECONDS = 1.0
+# Pictures held up (network hiccup) and then arriving in a burst keep their
+# place in the time grid for up to this long; later than that, the grid jumps.
+PACED_MAX_CATCHUP_SECONDS = 60.0
+# A late picture whose lateness isn't shrinking for this many pictures in a
+# row means pictures were really lost, not just delayed: jump the grid.
+PACED_LOST_AFTER = 3
 # e.g. "[info] Stream #0:0 ..." or "[swscaler @ 0x7f..] [warning] deprecated ..."
 _LEVEL_RE = re.compile(
     r"^(\[[^\]]*@[^\]]*\]\s*)?\[(quiet|panic|fatal|error|warning|info|verbose|debug|trace)\]\s*(.*)$"
@@ -715,6 +721,8 @@ class RtspFetcher:
         # eat memory (the oldest are dropped).
         self._pending: "collections.deque" = collections.deque(maxlen=PACED_BACKLOG)
         self._next_time: Optional[float] = None
+        self._last_lag: Optional[float] = None
+        self._steady_late = 0
         self.last_captured_at: Optional[str] = None
 
     # -- process management ------------------------------------------------
@@ -732,6 +740,8 @@ class RtspFetcher:
             self._latest = None
             self._pending.clear()
             self._next_time = None
+            self._last_lag = None
+            self._steady_late = 0
             self._stderr_lines = []
             self._reader_error = None
         threading.Thread(target=self._read_frames, args=(proc,), daemon=True, name=f"rtsp-{self.source.camera_id}").start()
@@ -880,12 +890,38 @@ class RtspFetcher:
     def _paced_time(self, arrived: float) -> float:
         """ffmpeg's fps filter makes pictures exactly interval_seconds apart
         in the camera's own time, so consecutive pictures get consecutive
-        grid times. The grid is re-anchored to the real clock when it drifts
-        more than a second away (a hiccup, or the camera's frame rate
-        differing from what was asked for)."""
+        grid times.
+
+        When the network holds pictures up for a few seconds (Wi-Fi does this
+        now and then) they arrive late, all at once. They were still taken
+        on time, so they keep their grid times: a burst shows up as lateness
+        that shrinks by about one step per picture. Lateness that doesn't
+        shrink means pictures were really lost, and the grid jumps to the
+        clock (leaving an honest gap). The grid also follows the clock when
+        it runs ahead of it (the camera sends fewer pictures than asked)."""
+        step = self.source.interval_seconds
         expected = self._next_time
-        stamp = arrived if expected is None or abs(arrived - expected) > PACED_RESYNC_SECONDS else expected
-        self._next_time = stamp + self.source.interval_seconds
+        if expected is None:
+            stamp = arrived
+            self._last_lag, self._steady_late = None, 0
+        else:
+            lag = arrived - expected
+            if lag < -PACED_RESYNC_SECONDS or lag > PACED_MAX_CATCHUP_SECONDS:
+                stamp = arrived
+                self._last_lag, self._steady_late = None, 0
+            elif lag <= PACED_RESYNC_SECONDS:
+                stamp = expected
+                self._last_lag, self._steady_late = lag, 0
+            else:
+                shrinking = self._last_lag is not None and lag < self._last_lag - step / 2
+                self._steady_late = 0 if shrinking else self._steady_late + 1
+                if self._steady_late >= PACED_LOST_AFTER:
+                    stamp = arrived
+                    self._last_lag, self._steady_late = None, 0
+                else:
+                    stamp = expected
+                    self._last_lag = lag
+        self._next_time = stamp + step
         return stamp
 
     def close(self) -> None:

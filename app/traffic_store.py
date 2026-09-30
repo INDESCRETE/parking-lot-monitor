@@ -276,11 +276,18 @@ def _coverage_intervals(conn: sqlite3.Connection, camera_id: str, start: datetim
            WHERE camera_id = ? AND end_at > ? AND start_at < ? ORDER BY start_at""",
         (camera_id, _utc_text(start), _utc_text(end)),
     ).fetchall()
-    intervals = []
+    intervals: list = []
     for row in rows:
         a = max(datetime.fromisoformat(row["start_at"]), start)
         b = min(datetime.fromisoformat(row["end_at"]), end)
-        if b >= a:  # a just-opened stretch has no length yet but still ends a gap
+        if b < a:
+            continue
+        # Stretches can overlap (pictures that arrived out of order started a
+        # new one); merge them, keeping the cause of the gap before the first.
+        if intervals and a <= intervals[-1][1]:
+            last = intervals[-1]
+            intervals[-1] = (last[0], max(last[1], b), last[2], last[3])
+        else:
             intervals.append((a, b, row["gap_reason"], row["gap_detail"]))
     return intervals
 

@@ -306,6 +306,54 @@ class RtspFetcherTests(unittest.TestCase):
         gaps = [b - a for a, b in zip(stamps, stamps[1:])]
         self.assertTrue(all(abs(g - 0.2) < 0.01 for g in gaps), gaps)
 
+    def _stamps_from(self, producer_body, seconds):
+        import sys
+        from datetime import datetime
+        producer = (
+            "import sys,time\n"
+            "j=b'\\xff\\xd8' + b'x'*50 + b'\\xff\\xd9'\n"
+            "w=sys.stdout.buffer\n"
+            "def emit():\n"
+            "    w.write(b'--frame\\r\\nContent-Type: image/jpeg\\r\\nContent-length: %d\\r\\n\\r\\n' % len(j) + j + b'\\r\\n'); w.flush()\n"
+            + producer_body
+        )
+        src = self.source("all", interval=0.2)
+        fetcher = live.RtspFetcher(src, command=[sys.executable, "-c", producer], first_frame_timeout=10)
+        grabber = live.FrameGrabber(src, None, fetcher=fetcher)
+        stamps = []
+        grabber.on_frame = lambda cam, jpeg, at: stamps.append(datetime.fromisoformat(at).timestamp())
+        grabber.start()
+        try:
+            time.sleep(seconds)
+        finally:
+            grabber.stop()
+        return stamps
+
+    def test_pictures_held_up_then_arriving_at_once_keep_their_times(self):
+        # 2 s steady, then nothing for 3 s, then those 15 pictures at once
+        # (what a Wi-Fi hiccup looks like), then steady again.
+        stamps = self._stamps_from(
+            "for _ in range(10):\n    emit(); time.sleep(0.2)\n"
+            "time.sleep(3)\n"
+            "for _ in range(15):\n    emit()\n"
+            "while True:\n    emit(); time.sleep(0.2)\n",
+            7.0,
+        )
+        self.assertGreaterEqual(len(stamps), 30)
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        self.assertTrue(all(abs(g - 0.2) < 0.01 for g in gaps[:30]), [round(g, 2) for g in gaps[:30]])
+
+    def test_pictures_really_lost_leave_a_gap(self):
+        stamps = self._stamps_from(
+            "for _ in range(10):\n    emit(); time.sleep(0.2)\n"
+            "time.sleep(3)\n"
+            "while True:\n    emit(); time.sleep(0.2)\n",
+            6.5,
+        )
+        gaps = [b - a for a, b in zip(stamps, stamps[1:])]
+        self.assertTrue(any(g > 2.0 for g in gaps), [round(g, 2) for g in gaps])
+        self.assertTrue(all(g > 0 for g in gaps), "times never go backwards")
+
     def test_ffmpeg_stream_description_is_read(self):
         info = live._parse_stream_description(
             "[in#0/rtsp @ 0x1] Stream #0:0: Video: h264 (Main), yuv420p(progressive), 640x480, 10 fps, 10 tbr, 90k tbn"

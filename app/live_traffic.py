@@ -35,10 +35,12 @@ from typing import Any, Callable, Optional
 from app import detection_core
 from app.tracking import CountLine, LineCounter, VehicleTracker, ground_point
 
-# Pictures arrive from the network in small bursts, so the queue must hold a
-# burst (about 2 s at 5 per second) without dropping any. If the computer is
-# genuinely too slow, the oldest waiting picture is dropped.
-MAX_QUEUE_SIZE = 10
+# Pictures arrive from the network in bursts -- after a Wi-Fi hiccup, ten
+# seconds' worth can arrive at once -- and the model takes a while to load at
+# startup, so the queue holds ~30 s (5 per second) and works through the
+# backlog a little late instead of dropping pictures. Only if the computer is
+# genuinely too slow for longer than that is the oldest waiting one dropped.
+MAX_QUEUE_SIZE = 150
 CONFIDENCE = 0.25  # same as scripts/count_traffic.py (validated on real video)
 RECENT_CROSSINGS_KEPT = 30
 # If no picture was analysed for this long, start the tracker fresh (old
@@ -240,6 +242,8 @@ class TrafficCounter:
             return
         with self._lock:
             open_stretch = self._coverage.get(camera_id)
+        if open_stretch is not None and open_stretch["end"] - COVERAGE_GAP_SECONDS <= now <= open_stretch["end"]:
+            return  # a picture slightly out of order: already covered
         if open_stretch is None or now - open_stretch["end"] > COVERAGE_GAP_SECONDS or now < open_stretch["end"]:
             if open_stretch is not None:
                 self._save_coverage_end(open_stretch)

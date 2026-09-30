@@ -183,6 +183,16 @@ class StoreTests(unittest.TestCase):
         table = list(csv.reader(io.StringIO(traffic_store.counts_csv(report))))
         self.assertEqual([row[-1] for row in table[1:]], ["12.0", "15.0", "0.0", "0.0", "27.0"])
 
+    def test_overlapping_coverage_stretches_are_merged(self):
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        t = lambda sec: (start + timedelta(seconds=sec)).isoformat()
+        for a_, z in ((0, 100), (99, 101), (98.5, 1200), (1215, 1800)):  # out-of-order pictures overlap
+            c = traffic_store.open_coverage(self.conn, "street", t(a_), "no_pictures")
+            traffic_store.extend_coverage(self.conn, c, t(z))
+        report = traffic_store.counts(self.conn, "street", start, start + timedelta(hours=1), 15)
+        self.assertEqual([g["seconds"] for g in report["gaps"]], [15])
+        self.assertEqual(report["monitored_seconds"], 1200 + 585)
+
     def test_bad_bin_size(self):
         now = datetime.now(timezone.utc)
         with self.assertRaises(ValueError):
