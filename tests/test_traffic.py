@@ -43,14 +43,17 @@ class FakeDb:
         traffic_store.add_crossings(self.conn, rows)
         self.conn.commit()
 
-    def open_traffic_coverage(self, camera_id, start):
-        return traffic_store.open_coverage(self.conn, camera_id, start)
+    def open_traffic_coverage(self, camera_id, start, reason=None, detail=None):
+        return traffic_store.open_coverage(self.conn, camera_id, start, reason, detail)
 
     def extend_traffic_coverage(self, coverage_id, end):
         traffic_store.extend_coverage(self.conn, coverage_id, end)
 
     def coverage(self):
         return [tuple(r) for r in self.conn.execute("SELECT start_at, end_at FROM traffic_coverage ORDER BY id")]
+
+    def reasons(self):
+        return [tuple(r) for r in self.conn.execute("SELECT gap_reason, gap_detail FROM traffic_coverage ORDER BY id")]
 
 
 def jpeg(width=400, height=300) -> bytes:
@@ -332,6 +335,32 @@ class CounterTests(unittest.TestCase):
         self.counter.set_paused("street", True)  # saves the open stretch's end
         stretches = self.db.coverage()
         self.assertEqual(stretches, [(iso(0), iso(7.8)), (iso(30.0), iso(31.8))])
+
+    def test_gap_causes_are_recorded(self):
+        errors = {"now": (None, None)}
+        self.counter = live_traffic.TrafficCounter(
+            self.db, detector=lambda image: list(self.boxes),
+            startup_fn=lambda: {"reason": "update", "detail": "Changed: server.py"},
+            camera_error_fn=lambda cam: errors["now"],
+        )
+        self.drive([None] * 5)  # first stretch after start -> the startup reason
+        self.drive([None] * 5, start_t=20.0)  # gap, no camera error -> no_pictures
+        errors["now"] = ("no answer from the camera", iso(30.0))
+        self.drive([None] * 5, start_t=40.0)  # gap with a camera error in it -> camera
+        self.counter.set_paused("street", True)
+        self.counter.set_paused("street", False)
+        self.drive([None] * 5, start_t=90.0)  # after a pause -> paused
+        self.assertEqual(self.db.reasons(), [
+            ("update", "Changed: server.py"),
+            ("no_pictures", ""),
+            ("camera", "no answer from the camera"),
+            ("paused", ""),
+        ])
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        report = traffic_store.counts(self.db.conn, "street", start, start + timedelta(hours=1), 15)
+        self.assertEqual([g["reason"] for g in report["gaps"]], ["no_pictures", "camera", "paused"])
+        self.assertEqual([g["planned"] for g in report["gaps"]], [False, False, True])
+        self.assertEqual(report["gaps"][1]["label"], "Camera stopped sending pictures")
 
     def test_forget_camera(self):
         self.drive([100, 130])

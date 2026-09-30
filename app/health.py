@@ -35,6 +35,7 @@ can take down the parking monitor itself.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -55,6 +56,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT / "app"
 DATA_DIR = ROOT / "data"
 CONFIG_PATH = DATA_DIR / "alerts.json"
 HEALTH_DIR = DATA_DIR / "health"
@@ -110,6 +112,31 @@ _NUMBER_LIMITS = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def code_fingerprints(app_dir: Path = APP_DIR) -> dict:
+    """A short hash of each of the program's .py files. Compared with the
+    previous run's at startup: if any changed, the restart was a software
+    update (whoever installed it), not the program or the camera failing."""
+    prints = {}
+    for path in sorted(app_dir.glob("*.py")):
+        try:
+            prints[path.name] = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+        except OSError:
+            pass
+    return prints
+
+
+# Why the program (re)started, as shown next to gaps in the data.
+STARTUP_LABELS = {
+    "first_start": "Monitoring started for the first time",
+    "update": "Software update (program restarted to install it)",
+    "restart": "Program restarted",
+    "stopped": "Program was stopped",
+    "crash": "Program crashed or was force-quit",
+    "reboot": "Computer was restarted",
+    "power": "Computer lost power",
+}
 
 
 def utc_now() -> datetime:
@@ -453,6 +480,19 @@ class Notifier:
         self._wake.set()
         return alert
 
+    def log(self, title: str, message: str, kind: str = "info") -> dict:
+        """Writes to the alert history only: no phone push, no email."""
+        alert = {
+            "id": secrets.token_hex(6),
+            "created_at": self.clock().isoformat(),
+            "kind": kind,
+            "title": f"{self.config.get('site_name') or 'Parking lot monitor'}: {title}",
+            "message": message,
+            "priority": "min",
+        }
+        print(f"[health] {alert['title']} -- {message}", flush=True)
+        return self.history.add(alert)
+
     def pending(self) -> list:
         with self._lock:
             return [dict(a) for a in self._outbox]
@@ -538,8 +578,13 @@ class HealthMonitor:
         senders: Optional[dict] = None,
         internet_check: Optional[Callable[[], bool]] = None,
         clock: Callable[[], datetime] = utc_now,
+        code_fingerprints_fn: Callable[[], dict] = code_fingerprints,
     ):
         self.db_path = db_path
+        self.code_fingerprints_fn = code_fingerprints_fn
+        # Why this run started (set by load_previous_state); see STARTUP_LABELS.
+        self.startup: dict = {"reason": "restart", "label": STARTUP_LABELS["restart"], "detail": "",
+                              "down_since": None, "started_at": None}
         self.camera_statuses = camera_statuses
         self.camera_config_error = config_error_fn
         self.health_dir = health_dir or HEALTH_DIR
@@ -586,8 +631,12 @@ class HealthMonitor:
         if isinstance(saved, dict):
             with self._lock:
                 self._problems = {k: v for k, v in saved.items() if isinstance(v, dict) and "since" in v}
-        self._report_previous_downtime(previous if isinstance(previous, dict) else None)
-        self._state.update(started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid())
+        fingerprints = self.code_fingerprints_fn()
+        self._report_previous_downtime(previous if isinstance(previous, dict) else None, fingerprints)
+        self._state.update(
+            started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid(),
+            code_fingerprints=fingerprints, startup=self.startup,
+        )
         self._save_state()
 
     def stop(self) -> None:
@@ -608,9 +657,19 @@ class HealthMonitor:
             self.last_check_error = f"could not save health state: {exc}"
 
     # -- downtime while we were not running --------------------------------
-    def _report_previous_downtime(self, previous: Optional[dict]) -> None:
+    def _set_startup(self, reason: str, since: Optional[datetime], detail: str = "") -> None:
+        self.startup = {
+            "reason": reason,
+            "label": STARTUP_LABELS.get(reason, reason),
+            "detail": detail,
+            "down_since": since.isoformat() if since else None,
+            "started_at": self.started_at.isoformat(),
+        }
+
+    def _report_previous_downtime(self, previous: Optional[dict], fingerprints: Optional[dict] = None) -> None:
         now = self.clock()
         if previous is None:
+            self._set_startup("first_start", None)
             self.notifier.notify(
                 "Alerts are on",
                 "Monitoring started. This is where alerts will show up if a camera, the internet, "
@@ -620,25 +679,55 @@ class HealthMonitor:
             return
         last_alive = parse_iso(previous.get("last_alive_at"))
         if last_alive is None:
+            self._set_startup("restart", None)
             return
         gap = (now - last_alive).total_seconds()
         clean = bool(previous.get("clean_shutdown"))
         boot = system_boot_time()
         rebooted = boot is not None and last_alive < boot <= now
-        if clean and gap < self.config["outage_report_minutes"] * 60:
-            return  # an ordinary quick restart (e.g. a code update) is not news
+        old_prints = previous.get("code_fingerprints")
+        changed = []
+        if isinstance(old_prints, dict) and fingerprints:
+            changed = sorted(name for name in set(old_prints) | set(fingerprints)
+                             if old_prints.get(name) != fingerprints.get(name))
+        updated = bool(changed) and not rebooted
         if rebooted and not clean:
+            reason = "power"
             cause = "The computer shut off without warning and restarted by itself. This is most likely a power outage."
         elif rebooted:
+            reason = "reboot"
             cause = "The computer was restarted."
+        elif updated:
+            reason = "update"
+            cause = "The program restarted to install a software update" + ("" if clean else ", and didn't shut down cleanly") + "."
         elif not clean:
+            reason = "crash"
             cause = "The monitoring program stopped unexpectedly (a crash or forced quit) and has been restarted."
+        elif gap < self.config["outage_report_minutes"] * 60:
+            reason = "restart"
+            cause = "The monitoring program was restarted."
         else:
+            reason = "stopped"
             cause = "The monitoring program was stopped, then started again."
+        detail = f"Changed: {', '.join(changed)}" if updated else ""
+        self._set_startup(reason, last_alive, detail)
+        quick_and_clean = clean and gap < self.config["outage_report_minutes"] * 60
+        if quick_and_clean:
+            # Not worth a phone alert, but written to the alert history so a
+            # look back at "how often did it go down" can tell our own
+            # restarts (updates) apart from real problems.
+            self.notifier.log(
+                "Restarted for a software update" if updated else "Program restarted",
+                f"Monitoring paused {fmt_span(last_alive, now)} ({fmt_duration(gap)}). {cause}"
+                + (f" {detail}." if detail else ""),
+                "update" if updated else "restart",
+            )
+            return
         self.notifier.notify(
             "Back online",
             f"Monitoring was down {fmt_span(last_alive, now)} ({fmt_duration(gap)}). "
-            f"{cause} Nothing was counted during that time; the reports show it as a gap.",
+            f"{cause} Nothing was counted during that time; the reports show it as a gap."
+            + (f" {detail}." if detail else ""),
             "high" if not clean else "default",
             "white_check_mark",
             "back_online",
@@ -952,6 +1041,7 @@ class HealthMonitor:
         return {
             "ok": not self.problems(),
             "started_at": self.started_at.isoformat(),
+            "startup": self.startup,
             "problems": self.problems(),
             "internet_online": self.internet_online,
             "alert_channels": configured_channels(self.config),

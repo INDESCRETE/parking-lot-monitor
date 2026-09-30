@@ -197,6 +197,32 @@ class HealthTests(unittest.TestCase):
         h.camera(last_frame_ago_s=2, detect_ago_s=2); h.tick()
         self.assertEqual(h.titles()[-1], "Test Lot: Car detection working again for 'Front lot'")
 
+    def test_restart_after_code_change_is_logged_as_an_update_not_pushed(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h.start(); h.tick()
+        h.monitor.mark_clean_shutdown()
+        self.clock.advance(seconds=4)
+        h2 = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h2.monitor.code_fingerprints_fn = lambda: {"server.py": "bbb"}
+        h2.start()
+        self.assertEqual(h2.monitor.startup["reason"], "update")
+        self.assertIn("server.py", h2.monitor.startup["detail"])
+        history = h2.monitor.notifier.history.list()
+        self.assertIn("Restarted for a software update", history[0]["title"])
+        self.assertEqual(h2.monitor.notifier.pending(), [], "an update restart is not pushed to the phone")
+
+    def test_quick_restart_without_code_change_is_a_restart(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h.start(); h.tick()
+        h.monitor.mark_clean_shutdown()
+        self.clock.advance(seconds=4)
+        h2 = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h2.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h2.start()
+        self.assertEqual(h2.monitor.startup["reason"], "restart")
+
     def test_traffic_camera_down_alert_after_30_seconds(self):
         h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
         h.monitor.started_at = self.clock() - timedelta(hours=1)

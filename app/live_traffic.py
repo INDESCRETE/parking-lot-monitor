@@ -93,8 +93,17 @@ class TrafficCounter:
     ``detector`` (tests) replaces the model: detector(rgb_image) -> list of
     detection_core.Detection."""
 
-    def __init__(self, db: Any, model_size: str = "medium", detector: Optional[Callable] = None):
+    def __init__(self, db: Any, model_size: str = "medium", detector: Optional[Callable] = None,
+                 startup_fn: Optional[Callable[[], dict]] = None,
+                 camera_error_fn: Optional[Callable[[str], tuple]] = None):
         self._db = db
+        # Why the program last started ({"reason", "detail"}, from the health
+        # monitor) -- the cause of the gap before each camera's first stretch.
+        self._startup_fn = startup_fn or (lambda: {"reason": "restart", "detail": ""})
+        # camera_id -> (last_error, last_error_at iso) from the camera grabber.
+        self._camera_error_fn = camera_error_fn or (lambda camera_id: (None, None))
+        self._started_cameras: set = set()
+        self._resumed: set = set()
         self._model_size = model_size
         self._detector = detector
         self._model: Any = None
@@ -149,6 +158,7 @@ class TrafficCounter:
                 self._paused.add(camera_id)
             else:
                 self._paused.discard(camera_id)
+                self._resumed.add(camera_id)
         if paused:
             self._close_coverage(camera_id)
             self.reset_camera(camera_id)
@@ -233,7 +243,8 @@ class TrafficCounter:
         if open_stretch is None or now - open_stretch["end"] > COVERAGE_GAP_SECONDS or now < open_stretch["end"]:
             if open_stretch is not None:
                 self._save_coverage_end(open_stretch)
-            coverage_id = self._db.open_traffic_coverage(camera_id, _iso(now))
+            reason, detail = self._gap_cause(camera_id, open_stretch["end"] if open_stretch else None, now)
+            coverage_id = self._db.open_traffic_coverage(camera_id, _iso(now), reason, detail)
             open_stretch = {"id": coverage_id, "end": now, "saved_end": now}
             with self._lock:
                 self._coverage[camera_id] = open_stretch
@@ -241,6 +252,28 @@ class TrafficCounter:
         open_stretch["end"] = now
         if now - open_stretch["saved_end"] >= COVERAGE_SAVE_SECONDS:
             self._save_coverage_end(open_stretch)
+
+    def _gap_cause(self, camera_id: str, gap_start: Optional[float], now: float) -> tuple:
+        """Why the camera wasn't being watched just before `now`."""
+        with self._lock:
+            first = camera_id not in self._started_cameras
+            self._started_cameras.add(camera_id)
+            resumed = camera_id in self._resumed
+            self._resumed.discard(camera_id)
+        if first:
+            startup = self._startup_fn() or {}
+            return startup.get("reason") or "restart", startup.get("detail") or ""
+        if resumed:
+            return "paused", ""
+        error, error_at = self._camera_error_fn(camera_id)
+        if error and error_at and gap_start is not None:
+            try:
+                at = datetime.fromisoformat(error_at).timestamp()
+            except ValueError:
+                at = None
+            if at is not None and gap_start - 1 <= at <= now:
+                return "camera", str(error)[:300]
+        return "no_pictures", ""
 
     def _save_coverage_end(self, open_stretch: dict) -> None:
         if open_stretch["end"] > open_stretch["saved_end"]:

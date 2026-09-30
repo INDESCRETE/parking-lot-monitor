@@ -83,6 +83,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     if "kind" not in columns:
         conn.execute("ALTER TABLE cameras ADD COLUMN kind TEXT NOT NULL DEFAULT 'parking'")
     conn.executescript(SCHEMA)
+    coverage_columns = {row[1] for row in conn.execute("PRAGMA table_info(traffic_coverage)")}
+    if "gap_reason" not in coverage_columns:
+        # Why the gap BEFORE this watched stretch happened (see GAP_LABELS).
+        conn.execute("ALTER TABLE traffic_coverage ADD COLUMN gap_reason TEXT")
+        conn.execute("ALTER TABLE traffic_coverage ADD COLUMN gap_detail TEXT")
     line_columns = {row[1] for row in conn.execute("PRAGMA table_info(count_lines)")}
     if "entry_direction" not in line_columns:
         conn.execute("ALTER TABLE count_lines ADD COLUMN entry_direction TEXT")
@@ -217,9 +222,33 @@ MIN_REPORTED_GAP_SECONDS = 5.0
 ONGOING_GAP_SECONDS = 30.0
 
 
-def open_coverage(conn: sqlite3.Connection, camera_id: str, start: str) -> int:
+# Why nothing was counted during a gap. "planned" gaps are ones we caused on
+# purpose (installing an update, pausing), as opposed to something failing.
+GAP_LABELS = {
+    "update": ("Software update", True),
+    "restart": ("Program restarted", True),
+    "stopped": ("Program was stopped", True),
+    "first_start": ("Monitoring started", True),
+    "paused": ("Paused", True),
+    "crash": ("Program crashed", False),
+    "reboot": ("Computer restarted", False),
+    "power": ("Power outage (computer restarted by itself)", False),
+    "camera": ("Camera stopped sending pictures", False),
+    "no_pictures": ("No pictures arrived (computer asleep or busy?)", False),
+    "ongoing": ("Not counting right now", False),
+}
+
+
+def gap_label(reason: Optional[str]) -> tuple:
+    return GAP_LABELS.get(reason or "", ("Unknown (before causes were recorded)", False))
+
+
+def open_coverage(conn: sqlite3.Connection, camera_id: str, start: str,
+                  gap_reason: Optional[str] = None, gap_detail: Optional[str] = None) -> int:
     cursor = conn.execute(
-        "INSERT INTO traffic_coverage (camera_id, start_at, end_at) VALUES (?, ?, ?)", (camera_id, start, start)
+        """INSERT INTO traffic_coverage (camera_id, start_at, end_at, gap_reason, gap_detail)
+           VALUES (?, ?, ?, ?, ?)""",
+        (camera_id, start, start, gap_reason, gap_detail),
     )
     return int(cursor.lastrowid)
 
@@ -229,8 +258,10 @@ def extend_coverage(conn: sqlite3.Connection, coverage_id: int, end: str) -> Non
 
 
 def _coverage_intervals(conn: sqlite3.Connection, camera_id: str, start: datetime, end: datetime) -> list:
+    """Watched stretches clipped to the range: (start, end, gap_reason,
+    gap_detail), the reason being why the gap BEFORE the stretch happened."""
     rows = conn.execute(
-        """SELECT start_at, end_at FROM traffic_coverage
+        """SELECT start_at, end_at, gap_reason, gap_detail FROM traffic_coverage
            WHERE camera_id = ? AND end_at > ? AND start_at < ? ORDER BY start_at""",
         (camera_id, _utc_text(start), _utc_text(end)),
     ).fetchall()
@@ -238,8 +269,8 @@ def _coverage_intervals(conn: sqlite3.Connection, camera_id: str, start: datetim
     for row in rows:
         a = max(datetime.fromisoformat(row["start_at"]), start)
         b = min(datetime.fromisoformat(row["end_at"]), end)
-        if b > a:
-            intervals.append((a, b))
+        if b >= a:  # a just-opened stretch has no length yet but still ends a gap
+            intervals.append((a, b, row["gap_reason"], row["gap_detail"]))
     return intervals
 
 
@@ -313,7 +344,7 @@ def counts(
         b["monitored_seconds"] = 0.0
     if bins:
         origin = starts_utc[0]
-        for a, z in intervals:
+        for a, z, *_ in intervals:
             i = max(0, int((a - origin) / step))
             while i < len(bins):
                 b_start = starts_utc[i]
@@ -329,18 +360,22 @@ def counts(
 
     # Missed stretches between watched ones (and a still-open one at the end
     # when the camera isn't being watched right now).
+    def gap(a: datetime, z: datetime, reason: Optional[str], detail: Optional[str], ongoing: bool) -> dict:
+        label, planned = gap_label(reason)
+        return {"start": a.astimezone().isoformat(), "end": z.astimezone().isoformat(),
+                "seconds": round((z - a).total_seconds()), "ongoing": ongoing,
+                "reason": reason, "label": label, "planned": planned, "detail": detail or ""}
+
     gaps = []
-    for (a1, z1), (a2, _z2) in zip(intervals, intervals[1:]):
+    for (_a1, z1, *_), (a2, _z2, reason, detail) in zip(intervals, intervals[1:]):
         if (a2 - z1).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
-            gaps.append({"start": z1.astimezone().isoformat(), "end": a2.astimezone().isoformat(),
-                         "seconds": round((a2 - z1).total_seconds()), "ongoing": False})
+            gaps.append(gap(z1, a2, reason, detail, False))
     now = datetime.now(timezone.utc)
     if intervals and end > now:
         last_end = intervals[-1][1]
         if (now - last_end).total_seconds() >= ONGOING_GAP_SECONDS:
-            gaps.append({"start": last_end.astimezone().isoformat(), "end": now.astimezone().isoformat(),
-                         "seconds": round((now - last_end).total_seconds()), "ongoing": True})
-    monitored = sum((z - a).total_seconds() for a, z in intervals)
+            gaps.append(gap(last_end, now, "ongoing", "", True))
+    monitored = sum((z - a).total_seconds() for a, z, *_ in intervals)
 
     # The busiest single hour (four consecutive 15-min intervals etc.), the
     # number traffic studies usually ask for.
@@ -371,6 +406,7 @@ def counts(
         "monitoring_started": intervals[0][0].astimezone().isoformat() if intervals else None,
         "gaps": gaps,
         "missed_seconds": sum(g["seconds"] for g in gaps),
+        "missed_planned_seconds": sum(g["seconds"] for g in gaps if g["planned"]),
     }
 
 
@@ -461,7 +497,7 @@ def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: dateti
     watched = [None] * len(slots)
     for camera_id in camera_ids:
         per_slot = [0.0] * len(slots)
-        for a, z in _coverage_intervals(conn, camera_id, start, stop):
+        for a, z, *_ in _coverage_intervals(conn, camera_id, start, stop):
             i = max(0, int((a - slots[0]) / hour)) if slots else 0
             while i < len(slots):
                 s0 = slots[i]

@@ -851,6 +851,9 @@ class FrameGrabber(threading.Thread):
             "consecutive_failures": 0,
             "last_error": None,
             "last_error_at": None,
+            # The last camera problem, kept after it clears (last_error is
+            # reset on the next good picture) so a gap can be explained later.
+            "last_failure": None,
         }
 
     def stop(self) -> None:
@@ -913,7 +916,8 @@ class FrameGrabber(threading.Thread):
                             self._update(last_error=self.source.scrub(f"frame handler failed: {exc}"), last_error_at=utc_now_iso())
                 except LiveFrameError as exc:
                     failures += 1
-                    self._update(consecutive_failures=failures, last_error=str(exc), last_error_at=utc_now_iso())
+                    self._update(consecutive_failures=failures, last_error=str(exc), last_failure=str(exc),
+                                 last_error_at=utc_now_iso())
                 except Exception as exc:
                     failures += 1
                     self._update(

@@ -731,20 +731,44 @@ function renderCoverage() {
     return;
   }
   const gaps = report.gaps || [];
-  const parts = [`Watched ${formatSpan(report.monitored_seconds)} today`];
   if (gaps.length === 0) {
-    parts.push("no gaps.");
-  } else {
-    const last = gaps[gaps.length - 1];
-    const lastText = last.ongoing
-      ? `not counting since ${formatHour(last.start)}`
-      : `latest ${formatClock(last.start)}–${formatClock(last.end)}`;
-    parts.push(
-      `missed ${formatSpan(report.missed_seconds)} in ${gaps.length} gap${gaps.length === 1 ? "" : "s"} (${lastText}).`,
-    );
-    coverageNote.classList.add(last.ongoing ? "problem" : "warn");
+    coverageNote.textContent = `Watched ${formatSpan(report.monitored_seconds)} today, no gaps.`;
+    return;
   }
-  coverageNote.textContent = parts.join(", ");
+  // Group the gaps by cause, planned ones (our updates, pauses) apart from
+  // real problems, so a look back shows whether anything is unreliable.
+  const byCause = new Map();
+  for (const gap of gaps) {
+    const entry = byCause.get(gap.label) || { label: gap.label, planned: gap.planned, count: 0, seconds: 0 };
+    entry.count += 1;
+    entry.seconds += gap.seconds;
+    byCause.set(gap.label, entry);
+  }
+  const causes = [...byCause.values()].sort((a, b) => Number(a.planned) - Number(b.planned) || b.seconds - a.seconds);
+  const problems = gaps.filter((g) => !g.planned && !g.ongoing);
+  const last = gaps[gaps.length - 1];
+  const headline = last.ongoing
+    ? `Not counting since ${formatClock(last.start)}.`
+    : `Watched ${formatSpan(report.monitored_seconds)} today, missed ${formatSpan(report.missed_seconds)} in ${gaps.length} gap${gaps.length === 1 ? "" : "s"}.`;
+  coverageNote.classList.add(last.ongoing ? "problem" : problems.length ? "warn" : "planned-only");
+  const summary = causes
+    .map((c) => `${c.count} × ${escapeHtml(c.label.toLowerCase())} (${formatSpan(c.seconds)})`)
+    .join(", ");
+  const rows = [...gaps]
+    .reverse()
+    .map((g) => {
+      const when = g.ongoing ? `since ${formatClock(g.start)}` : `${formatClock(g.start)}–${formatClock(g.end)}`;
+      const detail = g.detail ? `<span class="gap-detail">${escapeHtml(g.detail)}</span>` : "";
+      return `<li class="${g.planned ? "gap-planned" : "gap-problem"}"><time>${when}</time> <span>${formatSpan(g.seconds)} · ${escapeHtml(g.label)}</span>${detail}</li>`;
+    })
+    .join("");
+  // Re-rendered every few seconds: keep the list open if it was opened.
+  const wasOpen = Boolean(coverageNote.querySelector("details")?.open);
+  coverageNote.innerHTML = `${escapeHtml(headline)}
+    <details class="gap-details"${wasOpen ? " open" : ""}>
+      <summary>${summary}</summary>
+      <ol class="gap-list">${rows}</ol>
+    </details>`;
 }
 
 function renderPeakHour() {

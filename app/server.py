@@ -948,9 +948,10 @@ class Database:
         with self.connect() as conn:
             traffic_store.add_crossings(conn, rows)
 
-    def open_traffic_coverage(self, camera_id: str, start: str) -> int:
+    def open_traffic_coverage(self, camera_id: str, start: str, gap_reason: str | None = None,
+                              gap_detail: str | None = None) -> int:
         with self.connect() as conn:
-            return traffic_store.open_coverage(conn, camera_id, start)
+            return traffic_store.open_coverage(conn, camera_id, start, gap_reason, gap_detail)
 
     def extend_traffic_coverage(self, coverage_id: int, end: str) -> None:
         with self.connect() as conn:
@@ -1241,7 +1242,17 @@ def detection_from_row(row: sqlite3.Row) -> dict[str, Any]:
 
 db = Database(DB_PATH)
 live_detector = live_detection.LiveDetector(db)
-traffic_counter = live_traffic.TrafficCounter(db)
+def _camera_last_error(camera_id: str) -> tuple:
+    status = live.get_status(camera_id)
+    return status.get("last_failure") or status.get("last_error"), status.get("last_error_at")
+
+
+traffic_counter = live_traffic.TrafficCounter(
+    db,
+    # health_monitor is created further down; looked up when first needed.
+    startup_fn=lambda: health_monitor.startup,
+    camera_error_fn=_camera_last_error,
+)
 
 
 def camera_kind(camera_id: str) -> str:
