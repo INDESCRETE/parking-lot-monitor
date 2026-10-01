@@ -379,7 +379,9 @@ def counts(
 
     # Missed stretches between watched ones (and a still-open one at the end
     # when the camera isn't being watched right now).
-    gaps = coverage_gaps(conn, camera_id, start, end)
+    # The stretch before the first watched one counts too (e.g. the program
+    # was off overnight), unless this camera had never been watched before.
+    gaps = coverage_gaps(conn, camera_id, start, end, include_leading=_watched_before(conn, camera_id, start))
     monitored = sum((z - a).total_seconds() for a, z, *_ in intervals)
 
     # The busiest single hour (four consecutive 15-min intervals etc.), the
@@ -415,6 +417,7 @@ def counts(
         # Only the gaps nobody chose (camera, crash, power...): the number that
         # says how reliable the setup is. Pauses and updates aren't in it.
         "problem_seconds": sum(g["seconds"] for g in gaps if not g["planned"]),
+        "uptime": uptime(monitored, gaps),
     }
 
 
@@ -493,12 +496,20 @@ def coverage_gaps(conn: sqlite3.Connection, camera_id: str, start: datetime, end
                 "seconds": round((z - a).total_seconds()), "ongoing": ongoing,
                 "reason": reason, "label": label, "planned": planned, "detail": detail or ""}
 
+    # A camera paused right now: the open gap at the end is the pause, not
+    # a failure (the next watched stretch would say "paused" once resumed).
+    still_out = "paused" if _is_paused(conn, camera_id) else "ongoing"
+
     gaps = []
     if include_leading:
         stop = min(end, now)
         if not intervals:
             if (stop - start).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
-                gaps.append(gap(start, stop, "ongoing" if end >= now else None, "", end >= now))
+                if end >= now:
+                    gaps.append(gap(start, stop, still_out, "", True))
+                else:
+                    reason, detail = _next_gap_reason(conn, camera_id, end)
+                    gaps.append(gap(start, stop, reason, detail, False))
             return gaps
         if (intervals[0][0] - start).total_seconds() >= MIN_REPORTED_GAP_SECONDS:
             gaps.append(gap(start, intervals[0][0], intervals[0][2], intervals[0][3], False))
@@ -508,8 +519,58 @@ def coverage_gaps(conn: sqlite3.Connection, camera_id: str, start: datetime, end
     if intervals and end > now:
         last_end = intervals[-1][1]
         if (now - last_end).total_seconds() >= ONGOING_GAP_SECONDS:
-            gaps.append(gap(last_end, now, "ongoing", "", True))
+            gaps.append(gap(last_end, now, still_out, "", True))
     return gaps
+
+
+def _is_paused(conn: sqlite3.Connection, camera_id: str) -> bool:
+    try:
+        row = conn.execute("SELECT paused FROM cameras WHERE id = ?", (camera_id,)).fetchone()
+    except sqlite3.OperationalError:  # no cameras table (traffic store used on its own)
+        return False
+    return bool(row and row[0])
+
+
+def _next_gap_reason(conn: sqlite3.Connection, camera_id: str, after: datetime) -> tuple:
+    """Cause of a gap that covers a whole past range: the reason recorded on
+    the next watched stretch after it (e.g. "paused" when it was resumed later)."""
+    row = conn.execute(
+        """SELECT gap_reason, gap_detail FROM traffic_coverage
+           WHERE camera_id = ? AND start_at >= ? ORDER BY start_at LIMIT 1""",
+        (camera_id, _utc_text(after)),
+    ).fetchone()
+    return (row[0], row[1] or "") if row else (None, "")
+
+
+def _watched_before(conn: sqlite3.Connection, camera_id: str, when: datetime) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM traffic_coverage WHERE camera_id = ? AND start_at < ? LIMIT 1",
+        (camera_id, _utc_text(when)),
+    ).fetchone()
+    return row is not None
+
+
+# Uptime: share of the time the camera was supposed to be counting (anything
+# but paused) that it actually was. Target from common traffic-count practice:
+# a day with more than about 1% missing is one an engineer starts to question,
+# and under 95% (over an hour a day) it's usually thrown out or re-counted.
+UPTIME_TARGET_PERCENT = 99.0
+UPTIME_FLOOR_PERCENT = 95.0
+UPTIME_EXCLUDED_REASONS = {"paused"}
+
+
+def uptime(monitored_seconds: float, gaps: list) -> dict:
+    down = sum(g["seconds"] for g in gaps if g["reason"] not in UPTIME_EXCLUDED_REASONS)
+    paused = sum(g["seconds"] for g in gaps if g["reason"] in UPTIME_EXCLUDED_REASONS)
+    expected = monitored_seconds + down
+    return {
+        "percent": round(100 * monitored_seconds / expected, 2) if expected > 0 else None,
+        "down_seconds": round(down),
+        "paused_seconds": round(paused),
+        "expected_seconds": round(expected),
+        "target_percent": UPTIME_TARGET_PERCENT,
+        "floor_percent": UPTIME_FLOOR_PERCENT,
+    }
 
 
 # --- Vehicles in the lot (accumulation) ---------------------------------------

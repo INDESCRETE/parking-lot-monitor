@@ -520,6 +520,62 @@ async function loadCounts() {
     console.warn(error);
   }
   loadOccupancy();
+  loadWeekUptime();
+}
+
+// --- Uptime: share of un-paused time the camera was actually counting ---------
+const WEEK_UPTIME_REFRESH_MS = 60000;
+const uptimeCard = document.getElementById("uptimeCard");
+
+async function loadWeekUptime() {
+  const cameraId = state.cameraId;
+  if (!cameraId) return;
+  const fresh = state.weekUptime?.cameraId === cameraId && Date.now() - state.weekUptime.at < WEEK_UPTIME_REFRESH_MS;
+  if (fresh) {
+    renderUptime();
+    return;
+  }
+  const end = new Date(todayRange().end);
+  const start = new Date(end);
+  start.setDate(start.getDate() - 7);
+  try {
+    const report = await fetchJson(
+      `/api/traffic/counts?camera_id=${encodeURIComponent(cameraId)}&start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(end.toISOString())}&bin_minutes=60`,
+    );
+    if (cameraId !== state.cameraId) return;
+    state.weekUptime = { cameraId, at: Date.now(), uptime: report.uptime };
+  } catch (error) {
+    console.warn(error);
+  }
+  renderUptime();
+}
+
+function uptimeClass(u) {
+  if (u?.percent == null) return "none";
+  if (u.percent >= u.target_percent) return "good";
+  return u.percent >= u.floor_percent ? "warn" : "bad";
+}
+
+function uptimeCell(label, u) {
+  const value = u?.percent == null ? "—" : `${u.percent.toFixed(u.percent >= 99.95 || u.percent < 10 ? 1 : 2).replace(/\.?0+$/, "")}%`;
+  const down = u?.percent == null ? "no data" : u.down_seconds ? `down ${formatSpan(u.down_seconds)}` : "never down";
+  return `<div class="uptime-cell ${uptimeClass(u)}"><span class="uptime-label">${label}</span><strong>${value}</strong><span class="uptime-sub">${down}</span></div>`;
+}
+
+function renderUptime() {
+  const today = state.counts?.uptime;
+  const week = state.weekUptime?.cameraId === state.cameraId ? state.weekUptime.uptime : null;
+  if (!today && !week) {
+    uptimeCard.hidden = true;
+    return;
+  }
+  const target = (today || week).target_percent;
+  const floor = (today || week).floor_percent;
+  uptimeCard.hidden = false;
+  uptimeCard.title = `Share of the time this camera should have been counting that it actually was. Paused time is left out; updates, restarts, camera drops and the computer being off all count as down. Target ${target}%; under ${floor}% a traffic engineer would likely reject the day.`;
+  uptimeCard.innerHTML = `
+    <div class="uptime-head"><span>Uptime</span><span class="uptime-target">target ${target}%</span></div>
+    <div class="uptime-row">${uptimeCell("Today", today)}${uptimeCell("Last 7 days", week)}</div>`;
 }
 
 // --- Vehicles in the lot (starting count + entered - left) --------------------
@@ -1051,7 +1107,9 @@ function renderCoverage() {
   const last = gaps[gaps.length - 1];
   let headline;
   if (last.ongoing) {
-    headline = `Not counting since ${formatClock(last.start)}.`;
+    headline = last.reason === "paused"
+      ? `Paused since ${formatClock(last.start)}.`
+      : `Not counting since ${formatClock(last.start)}.`;
   } else {
     headline = `Watched ${formatSpan(report.monitored_seconds)} today, `;
     headline += problems.length
@@ -1061,7 +1119,7 @@ function renderCoverage() {
       headline += ` Off on purpose ${formatSpan(sum(planned))} (paused, updates), not counted as missed.`;
     }
   }
-  coverageNote.classList.add(last.ongoing ? "problem" : problems.length ? "warn" : "planned-only");
+  coverageNote.classList.add(last.ongoing && !last.planned ? "problem" : last.ongoing ? "planned-only" : problems.length ? "warn" : "planned-only");
   const summary = causes
     .map((c) => `${c.count} × ${escapeHtml(c.label.toLowerCase())} (${formatSpan(c.seconds)})`)
     .join(", ");

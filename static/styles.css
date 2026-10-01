@@ -1419,3 +1419,55 @@ body.dashboard-body {
   font-weight: 700;
   min-height: 30px;
 }
+
+/* Traffic page: uptime (for checking the software, not for clients) */
+.uptime-card {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+}
+
+.uptime-head {
+  align-items: baseline;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  font-weight: 600;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.uptime-target {
+  font-weight: 400;
+}
+
+.uptime-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.uptime-cell {
+  display: flex;
+  flex-direction: column;
+}
+
+.uptime-cell strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.uptime-label,
+.uptime-sub {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.uptime-cell.good strong { color: var(--accent); }
+.uptime-cell.warn strong { color: var(--warn-text, #b45309); }
+.uptime-cell.bad strong { color: var(--danger); }
+.uptime-cell.none strong { color: var(--muted); }
+:root[data-theme="dark"] .uptime-cell.warn strong { color: #fbbf24; }

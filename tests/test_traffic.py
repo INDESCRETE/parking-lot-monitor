@@ -193,6 +193,58 @@ class StoreTests(unittest.TestCase):
         self.assertEqual([g["seconds"] for g in report["gaps"]], [15])
         self.assertEqual(report["monitored_seconds"], 1200 + 585)
 
+    def _stretch(self, start, a_min, z_min, reason=None):
+        c = traffic_store.open_coverage(self.conn, "street", (start + timedelta(minutes=a_min)).isoformat(), reason)
+        traffic_store.extend_coverage(self.conn, c, (start + timedelta(minutes=z_min)).isoformat())
+
+    def test_uptime_leaves_out_pauses_but_counts_everything_else(self):
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        self._stretch(start, 0, 20)
+        self._stretch(start, 30, 40, "paused")      # 10 min paused: not down
+        self._stretch(start, 42, 50, "update")      # 2 min update: down
+        self._stretch(start, 51, 60, "camera")      # 1 min camera drop: down
+        report = traffic_store.counts(self.conn, "street", start, start + timedelta(hours=1), 15)
+        u = report["uptime"]
+        self.assertEqual(u["paused_seconds"], 600)
+        self.assertEqual(u["down_seconds"], 180)
+        self.assertAlmostEqual(u["percent"], round(100 * 47 / 50, 2))
+        self.assertEqual(u["target_percent"], 99.0)
+
+    def test_time_off_before_the_first_stretch_counts_when_watched_before(self):
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        self._stretch(start, -30, -20)             # watched yesterday-ish
+        self._stretch(start, 10, 60, "crash")      # program crashed, back at 20:10
+        report = traffic_store.counts(self.conn, "street", start, start + timedelta(hours=1), 15)
+        self.assertEqual([(g["reason"], g["seconds"]) for g in report["gaps"]], [("crash", 600)])
+        self.assertAlmostEqual(report["uptime"]["percent"], round(100 * 50 / 60, 2))
+
+    def test_brand_new_camera_has_no_leading_gap(self):
+        start = datetime(2026, 9, 29, 20, 0, tzinfo=timezone.utc)
+        self._stretch(start, 10, 60, "first_start")
+        report = traffic_store.counts(self.conn, "street", start, start + timedelta(hours=1), 15)
+        self.assertEqual(report["gaps"], [])
+        self.assertEqual(report["uptime"]["percent"], 100.0)
+
+    def test_open_gap_while_paused_is_a_pause(self):
+        now = datetime.now(timezone.utc)
+        self._stretch(now, -30, -10)
+        self.conn.execute("ALTER TABLE cameras ADD COLUMN paused INTEGER NOT NULL DEFAULT 0")
+        self.conn.execute("INSERT INTO cameras (id, name, created_at, paused) VALUES ('street', 'Street', '2026-09-01', 1)")
+        report = traffic_store.counts(self.conn, "street", now - timedelta(hours=1), now + timedelta(hours=1), 15)
+        last = report["gaps"][-1]
+        self.assertTrue(last["ongoing"])
+        self.assertEqual(last["reason"], "paused")
+        self.assertTrue(last["planned"])
+        self.assertEqual(report["uptime"]["percent"], 100.0)
+        self.assertEqual(report["problem_seconds"], 0)
+
+    def test_open_gap_when_not_paused_is_down(self):
+        now = datetime.now(timezone.utc)
+        self._stretch(now, -30, -10)
+        report = traffic_store.counts(self.conn, "street", now - timedelta(hours=1), now + timedelta(hours=1), 15)
+        self.assertEqual(report["gaps"][-1]["reason"], "ongoing")
+        self.assertLess(report["uptime"]["percent"], 100.0)
+
     def test_bad_bin_size(self):
         now = datetime.now(timezone.utc)
         with self.assertRaises(ValueError):
