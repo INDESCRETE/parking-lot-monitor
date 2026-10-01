@@ -170,6 +170,24 @@
       </form>
     </dialog>
 
+    <dialog id="lotDialog">
+      <form method="dialog" id="lotForm" class="dialog-form">
+        <h2>New lot</h2>
+        <label for="lotNameInput">Lot name</label>
+        <input id="lotNameInput" autocomplete="off" placeholder="e.g. Cul-de-sac" required maxlength="80">
+        <label for="lotClientInput">Client (optional)</label>
+        <input id="lotClientInput" list="clientOptions" autocomplete="off" placeholder="e.g. City of Provo" maxlength="80">
+        <datalist id="clientOptions"></datalist>
+        <label for="lotAddressInput">Address (optional)</label>
+        <input id="lotAddressInput" autocomplete="off" maxlength="200">
+        <p class="dialog-hint">This camera moves into the new lot. "Vehicles in the lot" adds up the entrance/exit lines of every camera in the same lot, so give each real lot its own.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelLotButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
     <dialog id="cameraDialog">
       <form method="dialog" id="cameraForm" class="dialog-form">
         <h2>Add traffic camera</h2>

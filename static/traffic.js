@@ -1016,23 +1016,98 @@ function renderLotSelect() {
     option.textContent = lot.client_name && lot.client_name !== "Unassigned" ? `${lot.client_name} — ${lot.name}` : lot.name;
     lotSelect.append(option);
   }
+  const add = document.createElement("option");
+  add.value = NEW_LOT_VALUE;
+  add.textContent = "+ New lot…";
+  lotSelect.append(add);
   lotSelect.value = camera?.lot_id != null ? String(camera.lot_id) : "";
-  lotSelect.disabled = !camera || (state.lots || []).length === 0;
+  lotSelect.disabled = !camera;
 }
+
+const NEW_LOT_VALUE = "__new__";
+const lotDialog = $("#lotDialog");
+const lotNameInput = $("#lotNameInput");
+const lotClientInput = $("#lotClientInput");
+const lotAddressInput = $("#lotAddressInput");
+
+async function openLotDialog() {
+  lotNameInput.value = "";
+  lotClientInput.value = "";
+  lotAddressInput.value = "";
+  try {
+    const { clients } = await fetchJson("/api/clients");
+    state.clients = clients || [];
+  } catch (error) {
+    state.clients = [];
+  }
+  const options = $("#clientOptions");
+  options.innerHTML = "";
+  for (const client of state.clients) {
+    if (client.name === "Unassigned") continue;
+    const option = document.createElement("option");
+    option.value = client.name;
+    options.append(option);
+  }
+  lotDialog.showModal();
+}
+
+async function createLot() {
+  const camera = selectedCamera();
+  const name = lotNameInput.value.trim();
+  const clientName = lotClientInput.value.trim() || "Unassigned";
+  if (!camera || !name) return;
+  try {
+    // Reuse a client with the same name (any capitalisation), else create it.
+    let client = (state.clients || []).find((c) => c.name.toLowerCase() === clientName.toLowerCase());
+    if (!client) {
+      client = (await fetchJson("/api/clients", jsonRequest("POST", { name: clientName }))).client;
+    }
+    const { lot } = await fetchJson(
+      "/api/lots",
+      jsonRequest("POST", { name, client_id: client.id, address: lotAddressInput.value.trim() || null }),
+    );
+    state.lots = [...(state.lots || []), lot];
+    lotSelect.value = String(lot.id);
+    await moveCameraToLot(camera, lot.id);
+  } catch (error) {
+    setStatus(error.message);
+    renderLotSelect();
+  }
+}
+
+$("#cancelLotButton").addEventListener("click", () => {
+  lotDialog.close();
+  renderLotSelect();
+});
+lotDialog.addEventListener("cancel", () => renderLotSelect());
+$("#lotForm").addEventListener("submit", (event) => {
+  event.preventDefault();
+  lotDialog.close();
+  createLot();
+});
 
 lotSelect.addEventListener("change", async () => {
   const camera = selectedCamera();
   if (!camera) return;
+  if (lotSelect.value === NEW_LOT_VALUE) {
+    openLotDialog();
+    return;
+  }
+  await moveCameraToLot(camera, Number(lotSelect.value));
+});
+
+async function moveCameraToLot(camera, lotId) {
   try {
-    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { lot_id: Number(lotSelect.value) }));
+    const payload = await fetchJson(`/api/cameras/${encodeURIComponent(camera.id)}`, jsonRequest("PATCH", { lot_id: lotId }));
     Object.assign(camera, payload.camera);
+    renderLotSelect();
     loadOccupancy();
     setStatus(`"${camera.name}" now belongs to ${lotSelect.selectedOptions[0]?.textContent}. Its entrance/exit lines count toward that lot's entries and exits.`);
   } catch (error) {
     setStatus(error.message);
     renderLotSelect();
   }
-});
+}
 
 function renderLines() {
   countsRangeLabel.textContent = "Today";
