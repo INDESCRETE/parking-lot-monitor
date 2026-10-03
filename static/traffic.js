@@ -684,7 +684,10 @@ function loadFrame(cameraId, view, seq) {
         state.view = view;
         state.frameSeq = seq;
         state.frameSize = view.frame_size || [img.naturalWidth, img.naturalHeight];
-        state.frameFocus = view.focus || null;
+        // Which zoom area this picture was cut to. Before anything has been
+        // analysed (e.g. paused since a restart) the picture is the camera's
+        // latest one, cut to the camera's current zoom area.
+        state.frameFocus = (view.frame_size ? view.focus : view.view_settings?.focus) || null;
         canvas.style.display = "block";
         emptyState.style.display = "none";
         draw();
