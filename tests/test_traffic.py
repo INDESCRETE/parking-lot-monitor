@@ -343,6 +343,30 @@ class LotFlowTests(unittest.TestCase):
         self.assertEqual(acc["peak"]["count"], 5)
         self.assertFalse(acc["went_negative"])
 
+    def test_street_traffic_uses_only_non_driveway_lines(self):
+        self.assertIsNone(traffic_store.lot_street_traffic(self.conn, 8, self.day, self.day + timedelta(days=1)))
+        self.watch(8 * 60, 10 * 60 + 10)  # 10:00 hour only 10 min watched
+        self.cross(self.street, "forward", 8 * 60 + 5)
+        self.cross(self.street, "forward", 8 * 60 + 40)
+        self.cross(self.street, "reverse", 9 * 60 + 15)
+        self.cross(self.street, "reverse", 10 * 60 + 2)
+        self.cross(self.gate, "reverse", 8 * 60 + 30)  # driveway: not street traffic
+        street = traffic_store.lot_street_traffic(self.conn, 7, self.day, self.day + timedelta(days=1))
+        self.assertEqual([l["name"] for l in street["lines"]], ["Street"])
+        line = street["lines"][0]
+        self.assertEqual(line["totals"], {"forward": 2, "reverse": 2})
+        self.assertEqual(street["total"], 4)
+        by_hour = {h["hour"]: h for h in line["by_hour"]}
+        self.assertEqual((by_hour[8]["forward"], by_hour[8]["reverse"]), (2, 0))
+        self.assertEqual((by_hour[9]["forward"], by_hour[9]["reverse"]), (0, 1))
+        self.assertIsNone(by_hour[10]["forward"], "a mostly-missed hour is left out of the average")
+        self.assertEqual(line["busiest_hour"]["hour"], 8)
+        self.assertEqual(line["monitored_seconds"], 130 * 60)
+        self.assertEqual(line["by_day"][0]["reverse"], 2)
+        # Marking it as an entrance moves it out of street traffic.
+        traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": "forward"})
+        self.assertIsNone(traffic_store.lot_street_traffic(self.conn, 7, self.day, self.day + timedelta(days=1)))
+
     def test_entry_direction_can_be_changed_and_cleared(self):
         line = traffic_store.update_line(self.conn, self.street["id"], {"entry_direction": "forward"})
         self.assertEqual(line["entry_direction"], "forward")

@@ -1471,3 +1471,47 @@ body.dashboard-body {
 .uptime-cell.bad strong { color: var(--danger); }
 .uptime-cell.none strong { color: var(--muted); }
 :root[data-theme="dark"] .uptime-cell.warn strong { color: #fbbf24; }
+
+/* Dashboard: Parking / Entrances & Exits / Street Traffic tabs */
+.dashboard-tabs {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  overflow-x: auto;
+}
+
+.dashboard-tab {
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: -1px;
+  padding: 10px 14px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dashboard-tab:hover {
+  color: var(--text);
+}
+
+.dashboard-tab.active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.empty-panel {
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 18px;
+  padding: 20px 24px;
+}
+
+.street-stats {
+  grid-template-columns: repeat(4, 1fr);
+}

@@ -75,6 +75,39 @@ const flowDayWrap = document.querySelector("#flowDayWrap");
 const flowDayChart = document.querySelector("#flowDayChart");
 const accumulationSummary = document.querySelector("#accumulationSummary");
 const accumulationChart = document.querySelector("#accumulationChart");
+const flowEmpty = document.querySelector("#flowEmpty");
+const streetEmpty = document.querySelector("#streetEmpty");
+const streetContent = document.querySelector("#streetContent");
+const cameraFilterWrap = document.querySelector("#cameraFilterWrap");
+const tabLinks = [...document.querySelectorAll(".dashboard-tab")];
+const tabPages = [...document.querySelectorAll(".dashboard-page")];
+
+// --- Tabs: Parking / Entrances & Exits / Street Traffic --------------------
+// One page per kind of data, sharing the Client, Lot and Range controls. The
+// tab lives in the URL hash (#parking, #entries, #street) so it survives a
+// reload and can be bookmarked. The Camera filter only applies to Parking
+// (it picks parking cameras), so it's hidden on the other two.
+const TABS = ["parking", "entries", "street"];
+
+function currentTab() {
+  const tab = window.location.hash.replace("#", "");
+  return TABS.includes(tab) ? tab : "parking";
+}
+
+function showTab() {
+  const tab = currentTab();
+  for (const link of tabLinks) {
+    const active = link.dataset.tab === tab;
+    link.classList.toggle("active", active);
+    link.setAttribute("aria-selected", active ? "true" : "false");
+  }
+  for (const page of tabPages) {
+    page.hidden = page.dataset.page !== tab;
+  }
+  cameraFilterWrap.hidden = tab !== "parking";
+}
+
+window.addEventListener("hashchange", showTab);
 
 function escapeHtml(value) {
   const div = document.createElement("div");
@@ -340,6 +373,7 @@ function flowLegend(inColor, outColor) {
  * cameras). Hidden when the lot has none. */
 function renderFlow(flow) {
   flowPanel.hidden = !flow;
+  flowEmpty.hidden = Boolean(flow);
   if (!flow) return;
   const inColor = cssVar("--flow-in", "#2563eb");
   const outColor = cssVar("--flow-out", "#c2410c");
@@ -384,6 +418,72 @@ function renderFlow(flow) {
       outColor,
     );
   }
+}
+
+/** Street traffic: every counting line on the lot's traffic cameras that
+ * isn't a lot entrance/exit, one panel per line in its own direction names
+ * (e.g. Northbound / Southbound). Mirrors renderFlow's charts. */
+function renderStreet(street) {
+  streetEmpty.hidden = Boolean(street);
+  if (!street) {
+    streetContent.innerHTML = "";
+    return;
+  }
+  const colorA = cssVar("--dir-a", "#7c3aed");
+  const colorB = cssVar("--dir-b", "#0d9488");
+  const fmt = (v) => `${Math.round(v * 10) / 10} vehicles`;
+  const panels = [];
+  if (street.lines.length > 1) {
+    panels.push(
+      `<div class="stat-grid street-stats">` +
+      `<div class="stat-card"><div class="label">Vehicles Passing</div><div class="value">${street.total}</div><div class="sub">all street lines, both directions</div></div>` +
+      `</div>`,
+    );
+  }
+  for (const line of street.lines) {
+    const names = [line.forward_label, line.reverse_label];
+    const legend = `<div class="flow-legend"><span><i style="background:${colorA}"></i>${escapeHtml(names[0])}</span><span><i style="background:${colorB}"></i>${escapeHtml(names[1])}</span></div>`;
+    const withLegend = (html) => (html.startsWith("<svg") ? legend + html : html);
+    const watchedPct = line.range_seconds ? Math.round((line.monitored_seconds / line.range_seconds) * 100) : 0;
+    const total = line.totals.forward + line.totals.reverse;
+    const busiest = line.busiest_hour
+      ? ` Busiest hour on average: ${formatHourLabel(line.busiest_hour.hour)} (${line.busiest_hour.forward} ${names[0]}, ${line.busiest_hour.reverse} ${names[1]}).`
+      : "";
+    const summary =
+      `<strong>${total}</strong> vehicles passed: <strong>${line.totals.forward}</strong> ${escapeHtml(names[0])} and ` +
+      `<strong>${line.totals.reverse}</strong> ${escapeHtml(names[1])}.${escapeHtml(busiest)} ` +
+      `<span class="flow-muted">Camera: ${escapeHtml(line.camera_name)}. Watched ${escapeHtml(formatDuration(line.monitored_seconds))} (${watchedPct}%) of this range` +
+      `${watchedPct < 95 ? "; vehicles that passed while it wasn't watched aren't included" : ""}.</span>`;
+    const hourChartHtml = withLegend(groupedBarChartSvg(
+      line.by_hour.map((h) => formatHourLabel(h.hour)),
+      line.by_hour.map((h) => h.forward),
+      line.by_hour.map((h) => h.reverse),
+      {
+        colors: [colorA, colorB],
+        names,
+        valueFormatter: (v) => `${fmt(v)} on average`,
+        emptyNote: "No hour has been watched long enough yet (at least half of it) to show an average.",
+      },
+    ));
+    let dayHtml = "";
+    if (line.by_day.length > 1) {
+      dayHtml = `<h3 class="flow-subtitle">By day</h3>` + withLegend(groupedBarChartSvg(
+        line.by_day.map((d) => formatDateLabel(d.date)),
+        line.by_day.map((d) => (d.monitored_seconds > 0 ? d.forward : null)),
+        line.by_day.map((d) => (d.monitored_seconds > 0 ? d.reverse : null)),
+        { colors: [colorA, colorB], names, valueFormatter: (v) => `${Math.round(v)} vehicles`, integerAxis: true },
+      ));
+    }
+    panels.push(
+      `<section class="chart-panel">` +
+      `<h2>${escapeHtml(line.name)}</h2>` +
+      `<p class="panel-sub">Vehicles passing by in each direction on this counting line (not counted as entering or leaving the lot).</p>` +
+      `<p class="flow-summary">${summary}</p>` +
+      `<h3 class="flow-subtitle">Average by hour of day</h3>${hourChartHtml}${dayHtml}` +
+      `</section>`,
+    );
+  }
+  streetContent.innerHTML = panels.join("");
 }
 
 /** Vehicles inside the lot hour by hour (the most at any moment in each
@@ -685,6 +785,7 @@ function renderReport(report) {
 
   dwellChart.innerHTML = dwellBarsSvg(report.dwell_by_space);
   renderFlow(report.flow);
+  renderStreet(report.street);
 }
 
 /** Start/end timestamps for one local calendar day. For today the end is
@@ -851,4 +952,5 @@ setInterval(() => {
   }
 }, 60000);
 
+showTab();
 loadClients();

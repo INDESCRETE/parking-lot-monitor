@@ -1906,6 +1906,9 @@ class Handler(BaseHTTPRequestHandler):
             report["flow"] = traffic_store.lot_flow(conn, lot_id, start, end)
             if report["flow"] is not None:
                 report["flow"]["occupancy"] = traffic_store.lot_occupancy(conn, lot_id)
+            # Street traffic: the other (non entrance/exit) lines on the lot's
+            # traffic cameras, shown on the dashboard's Street Traffic tab.
+            report["street"] = traffic_store.lot_street_traffic(conn, lot_id, start, end)
         self.send_json(report)
 
     def handle_report_export(self, query: dict[str, list[str]]) -> None:

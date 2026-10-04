@@ -780,3 +780,132 @@ def lot_flow(conn: sqlite3.Connection, lot_id: int, start: datetime, end: dateti
         "range_seconds": round(total_seconds),
         "accumulation": _accumulation(conn, lot_id, lines, slots, stop),
     }
+
+
+# --- Street traffic (lines not marked as a lot entrance/exit) -------------------------
+
+def _street_lines(conn: sqlite3.Connection, lot_id: int) -> list:
+    return conn.execute(
+        """SELECT count_lines.*, cameras.name AS camera_name FROM count_lines
+           JOIN cameras ON cameras.id = count_lines.camera_id
+           WHERE cameras.lot_id = ? AND cameras.kind = 'traffic' AND count_lines.entry_direction IS NULL
+           ORDER BY count_lines.id""",
+        (lot_id,),
+    ).fetchall()
+
+
+def _hour_slots(start: datetime, stop: datetime) -> list:
+    """Local-time hour starts covering [start, stop)."""
+    hour = timedelta(hours=1)
+    slots: list = []
+    cursor = start.astimezone().replace(minute=0, second=0, microsecond=0)
+    while cursor < stop and len(slots) < 24 * 400:
+        slots.append(cursor)
+        cursor = (cursor.astimezone(timezone.utc) + hour).astimezone()
+    return slots
+
+
+def _watched_per_slot(conn: sqlite3.Connection, camera_id: str, slots: list, start: datetime, stop: datetime) -> list:
+    hour = timedelta(hours=1)
+    per_slot = [0.0] * len(slots)
+    if not slots:
+        return per_slot
+    for a, z, *_ in _coverage_intervals(conn, camera_id, start, stop):
+        i = max(0, int((a - slots[0]) / hour))
+        while i < len(slots):
+            s0 = slots[i]
+            if s0 >= z:
+                break
+            overlap = (min(z, s0 + hour) - max(a, s0)).total_seconds()
+            if overlap > 0:
+                per_slot[i] += overlap
+            i += 1
+    return per_slot
+
+
+def lot_street_traffic(conn: sqlite3.Connection, lot_id: int, start: datetime, end: datetime) -> Optional[dict]:
+    """Vehicles passing by in each direction, from the counting lines on the
+    lot's traffic cameras that are NOT marked as a lot entrance/exit (the
+    street out front, a drive aisle...). None when the lot has no such lines.
+
+    Each line keeps its own direction names and its own camera's coverage.
+    Hours and days are local time; an hour counts toward "average by hour of
+    day" only when it was watched for at least MIN_HOUR_COVERAGE of it."""
+    lines = _street_lines(conn, lot_id)
+    if not lines:
+        return None
+    now = datetime.now(timezone.utc)
+    stop = min(end, now)
+    slots = _hour_slots(start, stop)
+    index = {s.astimezone(timezone.utc): i for i, s in enumerate(slots)}
+    hour = timedelta(hours=1)
+
+    def slot_length(i: int) -> float:
+        s0 = slots[i]
+        return max(1.0, (min(s0 + hour, stop) - max(s0, start)).total_seconds())
+
+    counts_by_line = {row["id"]: ([0] * len(slots), [0] * len(slots)) for row in lines}
+    marks = ",".join("?" for _ in counts_by_line)
+    rows = conn.execute(
+        f"""SELECT line_id, crossed_at, direction FROM line_crossings
+            WHERE line_id IN ({marks}) AND crossed_at >= ? AND crossed_at < ?""",
+        (*counts_by_line, _utc_text(start), _utc_text(end)),
+    ).fetchall()
+    for row in rows:
+        crossed = datetime.fromisoformat(row["crossed_at"]).astimezone()
+        slot = index.get(crossed.replace(minute=0, second=0, microsecond=0).astimezone(timezone.utc))
+        if slot is None:
+            continue
+        fwd, rev = counts_by_line[row["line_id"]]
+        (fwd if row["direction"] == "forward" else rev)[slot] += 1
+
+    watched_by_camera = {
+        camera_id: _watched_per_slot(conn, camera_id, slots, start, stop)
+        for camera_id in {row["camera_id"] for row in lines}
+    }
+    total_seconds = sum(slot_length(i) for i in range(len(slots)))
+
+    out_lines = []
+    for row in lines:
+        fwd, rev = counts_by_line[row["id"]]
+        watched = watched_by_camera[row["camera_id"]]
+        days: dict = {}
+        for i, s in enumerate(slots):
+            key = s.date().isoformat()
+            day = days.setdefault(key, {"date": key, "forward": 0, "reverse": 0, "monitored_seconds": 0.0, "cells": []})
+            day["forward"] += fwd[i]
+            day["reverse"] += rev[i]
+            day["monitored_seconds"] += watched[i]
+            day["cells"].append((s.hour, fwd[i], rev[i], min(1.0, watched[i] / slot_length(i))))
+        by_hour = []
+        for h in range(24):
+            cells = [c for d in days.values() for c in d["cells"] if c[0] == h and c[3] >= MIN_HOUR_COVERAGE]
+            n = len(cells)
+            by_hour.append({
+                "hour": h,
+                "days": n,
+                "forward": round(sum(c[1] for c in cells) / n, 2) if n else None,
+                "reverse": round(sum(c[2] for c in cells) / n, 2) if n else None,
+            })
+        busiest = max((b for b in by_hour if b["forward"] is not None),
+                      key=lambda b: b["forward"] + b["reverse"], default=None)
+        out_lines.append({
+            "id": row["id"],
+            "name": row["name"],
+            "camera_id": row["camera_id"],
+            "camera_name": row["camera_name"],
+            "forward_label": row["forward_label"],
+            "reverse_label": row["reverse_label"],
+            "totals": {"forward": sum(fwd), "reverse": sum(rev)},
+            "by_hour": by_hour,
+            "by_day": [{"date": d["date"], "forward": d["forward"], "reverse": d["reverse"],
+                        "monitored_seconds": round(d["monitored_seconds"])} for d in days.values()],
+            "busiest_hour": None if busiest is None or busiest["forward"] + busiest["reverse"] == 0 else busiest,
+            "monitored_seconds": round(sum(watched)),
+            "range_seconds": round(total_seconds),
+        })
+    return {
+        "lines": out_lines,
+        "total": sum(l["totals"]["forward"] + l["totals"]["reverse"] for l in out_lines),
+        "range_seconds": round(total_seconds),
+    }
