@@ -5,6 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Parking Lot Monitor POC</title>
     <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      // Applied here (before the page paints) so switching pages or reloading
+      // never shows a flash of the wrong theme. theme.js (loaded later, at
+      // the bottom of the page) handles the toggle button itself.
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          // Storage blocked (e.g. private browsing) -- just fall back to light.
+        }
+      })();
+    </script>
   </head>
   <body>
     <header class="topbar">
@@ -12,17 +28,50 @@
         <h1>Parking Lot Monitor</h1>
         <p>Camera space annotation harness</p>
       </div>
-      <form id="uploadForm" class="upload-form">
-        <input id="uploadInput" type="file" name="image" accept="image/*">
-        <button type="submit">Upload Image</button>
-      </form>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/health">Health</a>
+        <form id="uploadForm" class="upload-form">
+          <input id="uploadInput" type="file" name="image" accept="image/*">
+          <button type="submit">Upload Image</button>
+        </form>
+      </div>
     </header>
 
     <main class="layout">
       <aside class="sidebar">
         <section>
-          <label for="cameraSelect">Camera</label>
+          <div class="section-title-row">
+            <label for="cameraSelect" class="section-title">Camera</label>
+            <div class="camera-buttons">
+              <button type="button" id="addCameraButton" class="add-camera-button">+ Add Camera</button>
+              <button type="button" id="deleteCameraButton" class="delete-camera-button" title="Delete the selected camera">Delete</button>
+            </div>
+          </div>
           <select id="cameraSelect"></select>
+          <div class="camera-setting-row">
+            <label for="minOccupiedInput" class="inline-label">Min. parked time to count (sec)</label>
+            <input id="minOccupiedInput" type="number" min="0" step="1" placeholder="10">
+            <span id="minOccupiedStatus" class="setting-status" role="status"></span>
+          </div>
+        </section>
+
+        <section>
+          <div class="section-title">Import Video</div>
+          <form id="videoUploadForm" class="video-upload-form">
+            <input id="videoUploadInput" type="file" name="video" accept="video/*" required>
+            <div class="video-upload-row">
+              <label for="videoIntervalInput" class="inline-label">Every</label>
+              <input id="videoIntervalInput" type="number" min="1" step="1" value="5" title="Seconds between frames">
+              <span class="inline-label">sec</span>
+            </div>
+            <div class="video-upload-row">
+              <label for="videoEndInput" class="inline-label">Stop at</label>
+              <input id="videoEndInput" type="text" placeholder="mm:ss (optional)">
+            </div>
+            <button type="submit">Extract Frames</button>
+          </form>
         </section>
 
         <section class="image-section">
@@ -34,21 +83,38 @@
           <div class="section-title">Spaces</div>
           <div id="spaceList" class="space-list"></div>
         </section>
+
+        <section class="status-section">
+          <div class="section-title-row">
+            <div class="section-title">Live Status</div>
+            <select id="statusSortSelect" title="Sort spaces">
+              <option value="label">Sort: Space</option>
+              <option value="duration">Sort: Duration</option>
+            </select>
+          </div>
+          <div id="statusList" class="status-list"></div>
+        </section>
       </aside>
 
       <section class="workspace">
         <div class="toolbar">
-          <button id="markSpaceButton" type="button">Mark Space</button>
+          <button id="markSpaceButton" type="button" title="Shortcut: M">Mark Space (M)</button>
           <button id="undoPointButton" type="button" disabled>Undo Point</button>
           <button id="clearDraftButton" type="button" disabled>Clear</button>
+          <button id="runDetectionButton" type="button">Run Detection</button>
+          <button id="liveViewButton" type="button" hidden>Live View</button>
+          <button id="liveFeedButton" type="button" hidden>Back to Live Feed</button>
           <a id="configLink" href="/api/config/camera_1" target="_blank">View Config JSON</a>
+          <span id="detectionStatus" class="detection-status" role="status"></span>
+          <span id="liveFeedIndicator" class="live-feed-indicator" role="status" hidden>&#9679; Live feed</span>
           <span id="status" role="status"></span>
         </div>
 
         <div class="canvas-wrap">
           <canvas id="annotationCanvas"></canvas>
           <div id="emptyState" class="empty-state">
-            Add images to <code>data/images/camera_1</code> or upload one to begin.
+            <span id="emptyStateDefault">Add images to <code id="emptyStatePath">data/images/camera_1</code> or upload/import a video to begin.</span>
+            <span id="emptyStateNoCamera" hidden>No cameras yet. Click "+ Add Camera" to create one.</span>
           </div>
         </div>
       </section>
@@ -66,6 +132,56 @@
       </form>
     </dialog>
 
+    <dialog id="cameraDialog">
+      <form method="dialog" id="cameraForm">
+        <h2>Add Camera</h2>
+        <label for="cameraNameInput">Camera name</label>
+        <input id="cameraNameInput" name="cameraName" autocomplete="off" placeholder="e.g. North Entrance" required>
+        <p class="dialog-hint">Its own separate set of images and marked spaces — nothing on your other cameras is affected.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCameraButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirmDialog">
+      <div class="confirm-panel">
+        <h2 id="confirmTitle">Are you sure?</h2>
+        <p id="confirmMessage" class="confirm-message"></p>
+        <p id="confirmDetail" class="dialog-hint" hidden></p>
+        <div class="dialog-actions">
+          <button type="button" id="confirmCancelButton">Cancel</button>
+          <button type="button" id="confirmOkButton" class="danger-button">Delete</button>
+        </div>
+      </div>
+    </dialog>
+
+    <dialog id="historyDialog">
+      <div class="history-panel">
+        <div class="history-header">
+          <h2 id="historyTitle">History</h2>
+          <button type="button" id="closeHistoryButton" aria-label="Close">&times;</button>
+        </div>
+        <div id="historyList" class="history-list"></div>
+      </div>
+    </dialog>
+
+    <dialog id="liveDialog">
+      <div class="live-panel">
+        <div class="history-header">
+          <h2 id="liveTitle">Live View</h2>
+          <button type="button" id="closeLiveButton" aria-label="Close">&times;</button>
+        </div>
+        <div class="live-frame-wrap">
+          <img id="liveImage" alt="Live camera view" hidden>
+          <div id="liveMessage" class="live-message" hidden></div>
+        </div>
+        <div id="liveStatusLine" class="live-status-line" role="status"></div>
+      </div>
+    </dialog>
+
+    <script src="/static/theme.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

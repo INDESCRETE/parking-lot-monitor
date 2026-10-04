@@ -1,0 +1,42 @@
+{
+  "_comment": "Copy this file to camera_sources.json (same folder) and fill in your camera. camera_sources.json is gitignored because it holds the camera password. Each key below must match a camera id in the app (see the Camera dropdown / + Add Camera). Test a camera first with: python3 scripts/test_camera.py <address> --user <name>  (and --brands for common addresses).",
+  "camera_1": {
+    "host": "192.168.1.50",
+    "username": "admin",
+    "password": "CHANGE_ME",
+    "interval_seconds": 3,
+    "live_fps": 2,
+    "frame_policy": "none"
+  },
+  "_examples": {
+    "_comment": "Not used as-is: copy one out to the top level and rename it to your camera's id.",
+    "hikvision_or_nvr_channel": {
+      "type": "rtsp",
+      "rtsp_url": "rtsp://192.168.1.64:554/Streaming/Channels/101",
+      "live_rtsp_url": "rtsp://192.168.1.64:554/Streaming/Channels/102",
+      "username": "admin",
+      "password": "CHANGE_ME",
+      "interval_seconds": 5
+    },
+    "dahua_amcrest_lorex": {
+      "type": "rtsp",
+      "rtsp_url": "rtsp://192.168.1.108:554/cam/realmonitor?channel=1&subtype=0",
+      "live_rtsp_url": "rtsp://192.168.1.108:554/cam/realmonitor?channel=1&subtype=1",
+      "username": "admin",
+      "password": "CHANGE_ME"
+    },
+    "snapshot_only_recorder": {
+      "type": "http_snapshot",
+      "snapshot_url": "http://192.168.1.64/ISAPI/Streaming/channels/101/picture",
+      "username": "admin",
+      "password": "CHANGE_ME"
+    },
+    "_options": {
+      "type": "reolink (default if left out) | rtsp | http_snapshot",
+      "rtsp_url": "the camera's full-resolution stream; a login typed into it is moved out automatically",
+      "live_rtsp_url": "optional smaller stream just for the Live View popup",
+      "rtsp_decode": "keyframes (default: light on CPU, a picture every 1-4 s) | all (use if the camera sends key frames rarely)",
+      "interval_seconds": "how often to check the spaces (default 3)"
+    }
+  }
+}

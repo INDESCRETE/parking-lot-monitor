@@ -3,46 +3,78 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
-from dataclasses import dataclass
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from ultralytics import YOLO
+from rfdetr import RFDETRLarge, RFDETRMedium, RFDETRNano, RFDETRSmall
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# This file is run directly (python scripts/detect_occupancy.py), which puts only
+# scripts/ on sys.path -- so add the project root to import the shared app package.
+sys.path.insert(0, str(ROOT))
+from app.detection_core import (  # noqa: E402  (must come after the sys.path line above)
+    Detection,
+    assign_detections_to_spaces,
+    box_to_json,
+    detect_vehicles,
+    load_rgb_image,
+    scale_polygon,
+)
+from app.intervals import (  # noqa: E402
+    DEFAULT_MIN_OCCUPIED_SECONDS,
+    _run_duration_seconds,
+    recompute_space_intervals,
+)
 DB_PATH = ROOT / "data" / "db" / "parking_lot.sqlite"
 IMAGES_DIR = ROOT / "data" / "images"
-VEHICLE_CLASS_IDS = {2, 3, 5, 7}
 
 
-@dataclass
-class Detection:
-    class_id: int
-    class_name: str
-    confidence: float
-    box: tuple[float, float, float, float]
+MODEL_SIZES = {
+    "nano": RFDETRNano,
+    "small": RFDETRSmall,
+    "medium": RFDETRMedium,
+    "large": RFDETRLarge,
+}
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run YOLO vehicle detection and infer per-space occupancy."
+        description="Run RF-DETR vehicle detection and infer per-space occupancy."
     )
     parser.add_argument("--camera-id", default="camera_1")
-    parser.add_argument("--model", default="yolov8n.pt")
+    parser.add_argument(
+        "--model-size",
+        choices=sorted(MODEL_SIZES),
+        default="medium",
+        help="RF-DETR model size. Larger is more accurate but slower to run.",
+    )
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument(
         "--anchor-y-ratio",
         type=float,
         default=0.9,
-        help="Vertical position inside the YOLO box used as the vehicle ground anchor.",
+        help="Vertical position inside the detection box used as the vehicle ground anchor.",
     )
     parser.add_argument(
         "--fallback-overlap-threshold",
         type=float,
         default=0.7,
         help="Only use bbox overlap when no anchor lands inside a space and overlap is very strong.",
+    )
+    parser.add_argument(
+        "--min-occupied-seconds",
+        type=float,
+        default=DEFAULT_MIN_OCCUPIED_SECONDS,
+        help=(
+            "An occupied reading shorter than this (flanked by vacant frames on "
+            "both sides) is treated as a vehicle passing through, not parking, "
+            "and folded back into vacant time instead of counting as an arrival. "
+            "Set to 0 to disable and count every occupied reading as a session."
+        ),
     )
     return parser.parse_args()
 
@@ -85,6 +117,27 @@ def init_tables(conn: sqlite3.Connection) -> None:
             FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
             FOREIGN KEY(detection_id) REFERENCES detections(id)
         );
+
+        CREATE TABLE IF NOT EXISTS space_state_intervals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parking_space_id INTEGER NOT NULL,
+            occupied INTEGER NOT NULL,
+            start_image_id INTEGER,
+            start_captured_at TEXT NOT NULL,
+            end_image_id INTEGER,
+            end_captured_at TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(parking_space_id) REFERENCES parking_spaces(id),
+            FOREIGN KEY(start_image_id) REFERENCES images(id),
+            FOREIGN KEY(end_image_id) REFERENCES images(id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_intervals_space_current
+            ON space_state_intervals(parking_space_id, is_current);
+        CREATE INDEX IF NOT EXISTS idx_intervals_space_start
+            ON space_state_intervals(parking_space_id, start_captured_at);
         """
     )
 
@@ -106,7 +159,7 @@ def load_images(conn: sqlite3.Connection, camera_id: str) -> list[sqlite3.Row]:
 def load_spaces(conn: sqlite3.Connection, camera_id: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, label, polygon_json
+        SELECT id, label, polygon_json, reference_width, reference_height
         FROM parking_spaces
         WHERE camera_id = ?
         ORDER BY id
@@ -118,30 +171,11 @@ def load_spaces(conn: sqlite3.Connection, camera_id: str) -> list[dict[str, Any]
             "id": row["id"],
             "label": row["label"],
             "polygon": json.loads(row["polygon_json"]),
+            "reference_width": row["reference_width"],
+            "reference_height": row["reference_height"],
         }
         for row in rows
     ]
-
-
-def run_yolo(model: YOLO, image_path: Path, confidence: float) -> list[Detection]:
-    results = model.predict(str(image_path), conf=confidence, verbose=False)
-    detections: list[Detection] = []
-    names = model.names
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls.item())
-            if class_id not in VEHICLE_CLASS_IDS:
-                continue
-            x1, y1, x2, y2 = box.xyxy[0].tolist()
-            detections.append(
-                Detection(
-                    class_id=class_id,
-                    class_name=str(names[class_id]),
-                    confidence=float(box.conf.item()),
-                    box=(x1, y1, x2, y2),
-                )
-            )
-    return detections
 
 
 def store_detections(
@@ -182,10 +216,20 @@ def store_occupancy(
     stored_detections: list[tuple[int, Detection]],
     anchor_y_ratio: float,
     fallback_overlap_threshold: float,
+    image_size: tuple[int, int],
 ) -> None:
     now = utc_now()
+    scaled_spaces = [
+        {
+            "id": space["id"],
+            "polygon": scale_polygon(
+                space["polygon"], (space.get("reference_width"), space.get("reference_height")), image_size
+            ),
+        }
+        for space in spaces
+    ]
     occupied_by_space_id = assign_detections_to_spaces(
-        spaces,
+        scaled_spaces,
         stored_detections,
         anchor_y_ratio,
         fallback_overlap_threshold,
@@ -210,184 +254,10 @@ def store_occupancy(
         )
 
 
-def assign_detections_to_spaces(
-    spaces: list[dict[str, Any]],
-    stored_detections: list[tuple[int, Detection]],
-    anchor_y_ratio: float,
-    fallback_overlap_threshold: float,
-) -> dict[int, dict[str, float | int]]:
-    candidates_by_space_id: dict[int, list[dict[str, float | int]]] = {
-        space["id"]: [] for space in spaces
-    }
-
-    for detection_id, detection in stored_detections:
-        anchor = box_anchor(detection.box, anchor_y_ratio)
-        containing_spaces = [
-            space
-            for space in spaces
-            if point_in_polygon(anchor, space["polygon"])
-        ]
-        if containing_spaces:
-            best_space = max(
-                containing_spaces,
-                key=lambda space: occupancy_overlap_score(space["polygon"], detection.box),
-            )
-            candidates_by_space_id[best_space["id"]].append(
-                {
-                    "detection_id": detection_id,
-                    "score": 1.0,
-                    "confidence": detection.confidence,
-                }
-            )
-            continue
-
-        fallback_space = None
-        fallback_score = 0.0
-        for space in spaces:
-            score = occupancy_overlap_score(space["polygon"], detection.box)
-            if score > fallback_score:
-                fallback_space = space
-                fallback_score = score
-        if fallback_space and fallback_score >= fallback_overlap_threshold:
-            candidates_by_space_id[fallback_space["id"]].append(
-                {
-                    "detection_id": detection_id,
-                    "score": fallback_score,
-                    "confidence": detection.confidence,
-                }
-            )
-
-    occupied_by_space_id = {}
-    for space_id, candidates in candidates_by_space_id.items():
-        if candidates:
-            occupied_by_space_id[space_id] = max(
-                candidates,
-                key=lambda candidate: (candidate["score"], candidate["confidence"]),
-            )
-    return occupied_by_space_id
-
-
-def box_to_json(box: tuple[float, float, float, float]) -> dict[str, float]:
-    x1, y1, x2, y2 = box
-    return {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-
-
-def occupancy_overlap_score(
-    polygon: list[dict[str, float]],
-    box: tuple[float, float, float, float],
-) -> float:
-    clipped = clip_polygon_to_box(polygon, box)
-    return polygon_area(clipped) / max(polygon_area(polygon), 1.0)
-
-
-def box_anchor(box: tuple[float, float, float, float], y_ratio: float) -> dict[str, float]:
-    x1, y1, x2, y2 = box
-    clamped_ratio = max(0.0, min(1.0, y_ratio))
-    return {
-        "x": (x1 + x2) / 2,
-        "y": y1 + (y2 - y1) * clamped_ratio,
-    }
-
-
-def box_center(box: tuple[float, float, float, float]) -> dict[str, float]:
-    return box_anchor(box, 0.5)
-
-
-def polygon_area(points: list[dict[str, float]]) -> float:
-    if len(points) < 3:
-        return 0.0
-    total = 0.0
-    for index, point in enumerate(points):
-        next_point = points[(index + 1) % len(points)]
-        total += point["x"] * next_point["y"] - next_point["x"] * point["y"]
-    return abs(total) / 2
-
-
-def clip_polygon_to_box(
-    polygon: list[dict[str, float]],
-    box: tuple[float, float, float, float],
-) -> list[dict[str, float]]:
-    x1, y1, x2, y2 = box
-    clipped = polygon
-    for edge in (
-        ("left", x1),
-        ("right", x2),
-        ("top", y1),
-        ("bottom", y2),
-    ):
-        clipped = clip_against_edge(clipped, edge)
-        if not clipped:
-            break
-    return clipped
-
-
-def clip_against_edge(
-    points: list[dict[str, float]],
-    edge: tuple[str, float],
-) -> list[dict[str, float]]:
-    if not points:
-        return []
-    output = []
-    previous = points[-1]
-    for current in points:
-        if inside_edge(current, edge):
-            if not inside_edge(previous, edge):
-                output.append(intersection(previous, current, edge))
-            output.append(current)
-        elif inside_edge(previous, edge):
-            output.append(intersection(previous, current, edge))
-        previous = current
-    return output
-
-
-def inside_edge(point: dict[str, float], edge: tuple[str, float]) -> bool:
-    name, value = edge
-    if name == "left":
-        return point["x"] >= value
-    if name == "right":
-        return point["x"] <= value
-    if name == "top":
-        return point["y"] >= value
-    return point["y"] <= value
-
-
-def intersection(
-    start: dict[str, float],
-    end: dict[str, float],
-    edge: tuple[str, float],
-) -> dict[str, float]:
-    name, value = edge
-    dx = end["x"] - start["x"]
-    dy = end["y"] - start["y"]
-    if name in {"left", "right"}:
-        t = 0 if dx == 0 else (value - start["x"]) / dx
-        return {"x": value, "y": start["y"] + t * dy}
-    t = 0 if dy == 0 else (value - start["y"]) / dy
-    return {"x": start["x"] + t * dx, "y": value}
-
-
-def point_in_polygon(point: dict[str, float], polygon: list[dict[str, float]]) -> bool:
-    inside = False
-    previous = polygon[-1]
-    for current in polygon:
-        intersects = (
-            (current["y"] > point["y"]) != (previous["y"] > point["y"])
-            and point["x"]
-            < (previous["x"] - current["x"])
-            * (point["y"] - current["y"])
-            / (previous["y"] - current["y"])
-            + current["x"]
-        )
-        if intersects:
-            inside = not inside
-        previous = current
-    return inside
-
-
 def main() -> None:
     args = parse_args()
-    model = YOLO(args.model)
-    model_name = Path(args.model).name
+    model = MODEL_SIZES[args.model_size]()
+    model_name = f"rfdetr-{args.model_size}"
 
     with connect() as conn:
         init_tables(conn)
@@ -398,9 +268,16 @@ def main() -> None:
         if not spaces:
             raise RuntimeError(f"No parking spaces found for {args.camera_id}")
 
-        for image in images:
+        for index, image in enumerate(images):
             image_path = IMAGES_DIR / image["camera_id"] / image["filename"]
-            detections = run_yolo(model, image_path, args.confidence)
+            rgb_image = load_rgb_image(image_path)
+            polygons = [
+                scale_polygon(
+                    space["polygon"], (space.get("reference_width"), space.get("reference_height")), rgb_image.size
+                )
+                for space in spaces
+            ]
+            detections = detect_vehicles(model, rgb_image, args.confidence, polygons)
             stored_detections = store_detections(conn, image["id"], model_name, detections)
             store_occupancy(
                 conn,
@@ -409,6 +286,7 @@ def main() -> None:
                 stored_detections,
                 args.anchor_y_ratio,
                 args.fallback_overlap_threshold,
+                rgb_image.size,
             )
             occupied_count = conn.execute(
                 """
@@ -419,6 +297,29 @@ def main() -> None:
                 (image["id"],),
             ).fetchone()[0]
             print(f"{image['filename']}: {len(detections)} vehicles, {occupied_count}/{len(spaces)} occupied")
+            # Machine-parseable progress marker, one per completed image, read
+            # live by app/server.py's detection worker (it runs this script as
+            # a subprocess and streams stdout) to drive a progress indicator in
+            # the UI. flush=True matters: without it, Python buffers stdout in
+            # full blocks when not attached to a terminal (i.e. when piped to a
+            # subprocess), so the parent wouldn't see this until the process
+            # exits -- defeating the point of a live progress marker.
+            print(f"PROGRESS {index + 1} {len(images)}", flush=True)
+
+        # Per-image detection is done, but there's a second step left --
+        # rebuilding every space's occupied/vacant timeline from the results
+        # -- that has no per-item progress of its own but can still take a
+        # real few seconds for a lot with many spaces. Without a distinct
+        # marker for it, the UI has nothing to show here except a stale
+        # "100%" for however long this takes, which reads as finished (or
+        # stuck) when it's actually still working.
+        print("PHASE finalizing", flush=True)
+        for space in spaces:
+            recompute_space_intervals(conn, space["id"], args.min_occupied_seconds)
+        print(
+            f"Rebuilt occupancy timelines for {len(spaces)} space(s) "
+            f"(min_occupied_seconds={args.min_occupied_seconds})."
+        )
 
 
 if __name__ == "__main__":

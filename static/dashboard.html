@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Lot Monitor — Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      // Applied here (before the page paints) so switching pages or reloading
+      // never shows a flash of the wrong theme. theme.js (loaded later, at
+      // the bottom of the page) handles the toggle button itself.
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          // Storage blocked (e.g. private browsing) -- just fall back to light.
+        }
+      })();
+    </script>
+  </head>
+  <body class="dashboard-body">
+    <header class="topbar">
+      <div>
+        <h1>Dashboard</h1>
+        <p>Occupancy analytics across clients and lots</p>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/">Annotation View</a>
+      </div>
+    </header>
+
+    <main class="dashboard-main">
+      <div class="controls-bar">
+        <label class="control">
+          <span class="control-label">Client</span>
+          <select id="clientSelect">
+            <option value="">Loading…</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Lot</span>
+          <select id="lotSelect" disabled>
+            <option value="">Select a client first</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Camera</span>
+          <select id="cameraFilterSelect" disabled>
+            <option value="">All cameras</option>
+          </select>
+        </label>
+        <label class="control">
+          <span class="control-label">Range</span>
+          <select id="rangeSelect">
+            <option value="7">Last 7 days</option>
+            <option value="30">Last 30 days</option>
+            <option value="90">Last 90 days</option>
+            <option value="custom">Custom range</option>
+          </select>
+        </label>
+        <label class="control custom-range" id="customStartWrap" hidden>
+          <span class="control-label">Start</span>
+          <input type="date" id="startDateInput">
+        </label>
+        <label class="control custom-range" id="customEndWrap" hidden>
+          <span class="control-label">End</span>
+          <input type="date" id="endDateInput">
+        </label>
+        <button type="button" id="downloadReportButton" disabled>Download Report</button>
+      </div>
+
+      <div id="dashboardStatus" class="dashboard-status">Loading clients…</div>
+
+      <div id="dashboardContent" class="dashboard-content" hidden>
+        <div class="stat-grid">
+          <div class="stat-card">
+            <div class="label">Occupancy Rate</div>
+            <div class="value" id="statOccupancy">—</div>
+            <div class="sub">of monitored time</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Total Arrivals</div>
+            <div class="value" id="statArrivals">—</div>
+            <div class="sub">parking events</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Avg. Dwell Time</div>
+            <div class="value" id="statDwell">—</div>
+            <div class="sub">per parking event</div>
+          </div>
+          <div class="stat-card">
+            <div class="label">Peak / Quietest Hour</div>
+            <div class="value" id="statPeak">—</div>
+            <div class="sub" id="statPeakSub">—</div>
+          </div>
+        </div>
+
+        <section class="chart-panel">
+          <h2>Occupancy Rate Over Time</h2>
+          <p class="panel-sub">% of monitored time each day the lot was occupied, across all spaces.</p>
+          <div id="occupancyChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Turnover</h2>
+          <p class="panel-sub">Number of distinct parking events (arrivals) per day.</p>
+          <div id="turnoverChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <div class="panel-header">
+            <div>
+              <h2>Hour by Hour: <span id="dayChartTitle">Today</span></h2>
+              <p class="panel-sub">How full the lot was during each hour of one single day. Use the arrows to step through past days (this chart ignores the Range setting).</p>
+            </div>
+            <div class="day-nav" role="group" aria-label="Choose a day">
+              <button type="button" id="dayPrevButton" title="Previous day" aria-label="Previous day">&#9664;</button>
+              <button type="button" id="dayNextButton" title="Next day" aria-label="Next day">&#9654;</button>
+            </div>
+          </div>
+          <div id="dayHourChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Average by Hour of Day</h2>
+          <p class="panel-sub">Typical occupancy for each hour, averaged across every day in the selected range. Use this to spot peak and off-peak times.</p>
+          <div id="hourChart" class="chart-svg-wrap"></div>
+        </section>
+
+        <section class="chart-panel">
+          <h2>Average Dwell Time by Space</h2>
+          <p class="panel-sub">How long a typical car stays in each space, busiest first.</p>
+          <div id="dwellChart" class="chart-svg-wrap"></div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/static/theme.js"></script>
+    <script src="/static/dashboard.js"></script>
+  </body>
+</html>

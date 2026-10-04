@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>System Health</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {}
+      })();
+    </script>
+    <style>
+      .health-main { max-width: 760px; margin: 24px auto; padding: 0 16px; display: grid; gap: 16px; }
+      .health-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px; }
+      .health-card h2 { margin: 0 0 10px; font-size: 16px; }
+      .health-banner { font-size: 18px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+      .dot { width: 12px; height: 12px; border-radius: 50%; background: var(--vacant); flex: none; }
+      .dot.bad { background: var(--occupied); }
+      .health-list { margin: 0; padding-left: 18px; display: grid; gap: 6px; }
+      .muted { color: var(--muted); }
+      .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; }
+      .kv dt { color: var(--muted); }
+      .kv dd { margin: 0; overflow-wrap: anywhere; }
+      code { background: var(--panel-alt); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+      .alert-row { border-top: 1px solid var(--line); padding: 8px 0; }
+      .alert-row:first-child { border-top: none; }
+      .alert-time { color: var(--muted); font-size: 12px; }
+      #testResult { margin-left: 10px; }
+      .alerts-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+      .alerts-head h2 { margin: 0; }
+      .alert-filter { display: inline-flex; gap: 6px; }
+      .alert-filter button { font-size: 13px; padding: 4px 10px; }
+      .alert-filter button.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+      .alert-row { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; align-items: start; }
+      .alert-body { min-width: 0; }
+      .alert-keep { color: var(--muted); font-size: 12px; margin-top: 3px; }
+      .alert-keep.soon { color: var(--danger); }
+      .save-btn { font-size: 12px; padding: 4px 10px; white-space: nowrap; }
+      .save-btn.saved { border-color: var(--accent); background: var(--accent); color: #fff; }
+    </style>
+  </head>
+  <body class="dashboard-body">
+    <header class="topbar">
+      <div>
+        <h1>System Health</h1>
+        <p>Alerts, cameras, internet, disk and backups</p>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/">Cameras</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+      </div>
+    </header>
+    <main class="health-main">
+      <section class="health-card">
+        <div class="health-banner"><span id="overallDot" class="dot"></span><span id="overallText">Loading…</span></div>
+        <ul id="problemList" class="health-list" style="margin-top:10px"></ul>
+      </section>
+
+      <section class="health-card">
+        <h2>Where alerts go</h2>
+        <div id="channels"></div>
+        <p style="margin:12px 0 0">
+          <button type="button" id="testButton">Send test alert</button>
+          <span id="testResult" class="muted"></span>
+        </p>
+      </section>
+
+      <section class="health-card">
+        <h2>Status</h2>
+        <dl class="kv" id="statusList"></dl>
+      </section>
+
+      <section class="health-card">
+        <div class="alerts-head">
+          <h2>Alerts</h2>
+          <div class="alert-filter" role="group" aria-label="Show">
+            <button type="button" data-filter="all" class="active" aria-pressed="true">All <span id="countAll"></span></button>
+            <button type="button" data-filter="saved" aria-pressed="false">Saved <span id="countSaved"></span></button>
+          </div>
+        </div>
+        <p class="muted" id="keepNote" style="margin:0 0 8px">Alerts are deleted after 30 days unless you save them.</p>
+        <div id="alertList" class="muted">None yet.</div>
+      </section>
+    </main>
+    <script>
+      function el(tag, text, cls) {
+        var node = document.createElement(tag);
+        if (text != null) node.textContent = text;
+        if (cls) node.className = cls;
+        return node;
+      }
+      function when(iso) {
+        if (!iso) return "—";
+        return new Date(iso).toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      }
+      function render(h) {
+        var problems = h.problems || [];
+        document.getElementById("overallDot").className = problems.length ? "dot bad" : "dot";
+        document.getElementById("overallText").textContent = problems.length
+          ? problems.length + (problems.length === 1 ? " problem right now" : " problems right now")
+          : "Everything is working";
+        var list = document.getElementById("problemList");
+        list.replaceChildren();
+        problems.forEach(function (p) { list.appendChild(el("li", p.title + " (since " + when(p.since) + ")")); });
+
+        var ch = document.getElementById("channels");
+        ch.replaceChildren();
+        if ((h.alert_channels || []).indexOf("push") >= 0) {
+          var p1 = el("p", null); p1.style.margin = "0 0 6px";
+          p1.append("Phone: install the free ntfy app, tap +, and subscribe to ");
+          p1.appendChild(el("code", h.ntfy_topic));
+          p1.append(". Keep this name private: anyone who has it can read your alerts.");
+          ch.appendChild(p1);
+        } else {
+          ch.appendChild(el("p", "Phone alerts are off (no ntfy_topic in data/alerts.json).", "muted"));
+        }
+        ch.appendChild(el("p", (h.alert_channels || []).indexOf("email") >= 0
+          ? "Email: on." : "Email: off (optional; set it up in data/alerts.json).", "muted"));
+        ch.appendChild(el("p", h.heartbeat_configured
+          ? "Outside watchdog: on. You'll be told even if this computer loses power or internet."
+          : "Outside watchdog: off. Add a heartbeat_url (e.g. from healthchecks.io) to be told about power or internet outages while they're happening.",
+          "muted"));
+        if (h.config_error) ch.appendChild(el("p", "Settings problem: " + h.config_error));
+
+        var s = document.getElementById("statusList");
+        s.replaceChildren();
+        var rows = [
+          ["Running since", when(h.started_at)],
+          ["Internet", h.internet_online == null ? "Checking…" : (h.internet_online ? "Connected" : "Down (alerts will send when it's back)")],
+          ["Alerts waiting to send", String(h.alerts_waiting_to_send)],
+          ["Disk", h.disk.percent_used + "% full, " + h.disk.free_gb + " GB free"],
+          ["Database", h.disk.database_mb + " MB"],
+          ["Last backup", h.last_backup || "None yet (runs nightly)"],
+        ];
+        if (h.last_send_error) rows.push(["Last send error", h.last_send_error]);
+        rows.forEach(function (r) { s.appendChild(el("dt", r[0])); s.appendChild(el("dd", r[1])); });
+
+        lastHealth = h;
+        renderAlerts();
+      }
+      var lastHealth = null;
+      var alertFilter = "all";
+      function keepText(al) {
+        if (al.saved) return { text: "Saved. Kept until you unsave it.", soon: false };
+        var ms = new Date(al.delete_at) - Date.now();
+        var hours = Math.max(0, Math.round(ms / 3600000));
+        var suffix = al.unsaved_at ? " unless saved again" : "";
+        if (ms < 48 * 3600000) return { text: "Deletes in " + (hours < 1 ? "under an hour" : hours + (hours === 1 ? " hour" : " hours")) + suffix, soon: true };
+        return { text: "Deletes " + new Date(al.delete_at).toLocaleDateString([], { month: "short", day: "numeric" }) + suffix, soon: false };
+      }
+      function renderAlerts() {
+        var h = lastHealth;
+        if (!h) return;
+        var all = h.recent_alerts || [];
+        var counts = h.alert_counts || { total: all.length, saved: 0 };
+        document.getElementById("countAll").textContent = "(" + counts.total + ")";
+        document.getElementById("countSaved").textContent = "(" + counts.saved + ")";
+        if (h.alert_keep_days) {
+          document.getElementById("keepNote").textContent = "Alerts are deleted after " + h.alert_keep_days +
+            " days unless you save them. Unsaving an older alert gives you " + h.alert_unsave_grace_hours + " hours to change your mind.";
+        }
+        var shown = alertFilter === "saved" ? all.filter(function (al) { return al.saved; }) : all;
+        var a = document.getElementById("alertList");
+        a.replaceChildren();
+        if (!shown.length) {
+          a.textContent = alertFilter === "saved" ? "No saved alerts. Press Save on an alert to keep it." : "None yet.";
+          a.className = "muted";
+          return;
+        }
+        a.className = "";
+        shown.forEach(function (al) {
+          var row = el("div", null, "alert-row");
+          var body = el("div", null, "alert-body");
+          body.appendChild(el("div", when(al.created_at), "alert-time"));
+          body.appendChild(el("strong", al.title));
+          body.appendChild(el("div", al.message));
+          var keep = keepText(al);
+          body.appendChild(el("div", keep.text, "alert-keep" + (keep.soon ? " soon" : "")));
+          row.appendChild(body);
+          var btn = el("button", al.saved ? "Saved" : "Save", "save-btn" + (al.saved ? " saved" : ""));
+          btn.type = "button";
+          btn.setAttribute("aria-pressed", al.saved ? "true" : "false");
+          btn.title = al.saved ? "Unsave (it will then be deleted on the normal schedule)" : "Keep this alert until you unsave it";
+          btn.addEventListener("click", function () { toggleSaved(al, btn); });
+          row.appendChild(btn);
+          a.appendChild(row);
+        });
+      }
+      function toggleSaved(al, btn) {
+        btn.disabled = true;
+        fetch("/api/health/alerts/" + al.id + "/saved", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ saved: !al.saved }),
+        }).then(function (r) { return r.json(); }).then(refresh).catch(function () { btn.disabled = false; });
+      }
+      document.querySelectorAll(".alert-filter button").forEach(function (b) {
+        b.addEventListener("click", function () {
+          alertFilter = b.getAttribute("data-filter");
+          document.querySelectorAll(".alert-filter button").forEach(function (x) {
+            var on = x === b;
+            x.classList.toggle("active", on);
+            x.setAttribute("aria-pressed", on ? "true" : "false");
+          });
+          renderAlerts();
+        });
+      });
+      function refresh() {
+        fetch("/api/health").then(function (r) { return r.json(); }).then(render).catch(function () {
+          document.getElementById("overallDot").className = "dot bad";
+          document.getElementById("overallText").textContent = "Can't reach the monitoring program";
+        });
+      }
+      document.getElementById("testButton").addEventListener("click", function () {
+        var out = document.getElementById("testResult");
+        out.textContent = "Sending…";
+        fetch("/api/health/test-alert", { method: "POST" }).then(function (r) { return r.json(); }).then(function (res) {
+          out.textContent = res.channels.length ? "Sent. Check your phone in a few seconds." : "Logged, but no alert channel is set up.";
+          setTimeout(refresh, 3000);
+        }).catch(function () { out.textContent = "Couldn't send."; });
+      });
+      refresh();
+      setInterval(refresh, 10000);
+    </script>
+    <script src="/static/theme.js"></script>
+  </body>
+</html>

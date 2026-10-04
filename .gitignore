@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 .pip-cache/
 *.pt
+*.pth
+.cache/
 
 data/db/*.sqlite
 data/db/*.sqlite-*
@@ -13,3 +15,15 @@ data/images/**/*
 !data/images/.gitkeep
 !data/images/*/
 !data/images/*/.gitkeep
+
+# Live camera: credentials, and the single newest frame per camera
+data/camera_sources.json
+data/live/
+
+# Health monitor: alert settings (may hold an email password), state, outbox, backups
+data/alerts.json
+data/health/
+data/backups/
+
+# Traffic counting runs (preview videos, CSVs)
+data/traffic_runs/

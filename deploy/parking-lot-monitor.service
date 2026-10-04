@@ -1,0 +1,22 @@
+# systemd service for the lot computer (Ubuntu). Starts the monitor at boot and
+# restarts it within seconds if it ever crashes. See deploy/README.md.
+[Unit]
+Description=Parking lot monitor
+After=network-online.target
+Wants=network-online.target
+# Never give up restarting, however many times it fails in a row.
+StartLimitIntervalSec=0
+
+[Service]
+User=parking
+WorkingDirectory=/opt/parking-lot-monitor
+ExecStart=/opt/parking-lot-monitor/.venv/bin/python -m app.server
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+# SIGTERM lets the app record a clean shutdown, so planned restarts don't raise an alert.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
