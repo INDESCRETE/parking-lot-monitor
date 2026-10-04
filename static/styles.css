@@ -874,3 +874,644 @@ body.dashboard-body {
   border-color: var(--danger);
   filter: brightness(0.92);
 }
+
+/* --- Add Camera: parking or traffic ------------------------------------ */
+.kind-choice {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 10px 10px;
+}
+
+.kind-choice legend {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 0 4px;
+  text-transform: uppercase;
+}
+
+.kind-option {
+  align-items: flex-start;
+  color: var(--text);
+  cursor: pointer;
+  display: flex;
+  font-size: 13px;
+  font-weight: 400;
+  gap: 8px;
+  margin: 0;
+  text-transform: none;
+}
+
+.kind-option input {
+  margin-top: 3px;
+}
+
+.kind-option span {
+  color: var(--muted);
+  line-height: 1.35;
+}
+
+.kind-option strong {
+  color: var(--text);
+}
+
+/* --- Traffic page --------------------------------------------------------- */
+:root {
+  --dir-a: #2563eb;
+  --dir-b: #c2410c;
+  --flow-in: #2563eb;
+  --flow-out: #c2410c;
+  --line-color: #facc15;
+}
+
+:root[data-theme="dark"] {
+  --dir-a: #3b82f6;
+  --dir-b: #ea580c;
+  --flow-in: #3b82f6;
+  --flow-out: #ea580c;
+  --line-color: #facc15;
+}
+
+.dialog-form {
+  display: grid;
+  gap: 10px;
+  padding: 18px;
+}
+
+.dialog-form h2 {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.dialog-form label {
+  margin-bottom: 0;
+}
+
+.dialog-form input[type="text"],
+.dialog-form input:not([type]) {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text);
+  min-height: 36px;
+  padding: 0 10px;
+}
+
+.confirm-message {
+  margin: 0;
+  line-height: 1.45;
+}
+
+.traffic-muted {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.traffic-connection {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 10px 0 0;
+}
+
+.traffic-connection.ok {
+  color: var(--accent-strong);
+}
+
+.traffic-connection.problem {
+  color: var(--danger);
+}
+
+.traffic-connection code {
+  font-size: 12px;
+}
+
+.line-list {
+  display: grid;
+  gap: 10px;
+}
+
+.line-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+}
+
+.line-card-head {
+  align-items: center;
+  display: flex;
+  gap: 6px;
+}
+
+.line-card-name {
+  flex: 1;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.line-card-head button {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.line-card-head .delete-line {
+  color: var(--danger);
+}
+
+.direction-row {
+  align-items: baseline;
+  display: flex;
+  font-size: 13px;
+  gap: 8px;
+}
+
+.direction-row .direction-name {
+  flex: 1;
+}
+
+.direction-row .direction-count {
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+}
+
+.direction-arrow {
+  display: inline-block;
+  font-weight: 700;
+  width: 1.1em;
+}
+
+.dir-a {
+  color: var(--dir-a);
+}
+
+.dir-b {
+  color: var(--dir-b);
+}
+
+.line-empty {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.traffic-download {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+}
+
+.traffic-download input,
+.traffic-download select {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--text);
+  min-height: 36px;
+  min-width: 0;
+  padding: 0 6px;
+}
+
+#peakHour {
+  margin: 8px 0 0;
+}
+
+.crossing-list {
+  display: grid;
+  font-size: 13px;
+  gap: 4px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.crossing-list li {
+  display: flex;
+  gap: 8px;
+}
+
+.crossing-list time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-width: 70px;
+}
+
+.toolbar-check {
+  align-items: center;
+  color: var(--text);
+  display: flex;
+  font-size: 13px;
+  font-weight: 400;
+  gap: 6px;
+  margin: 0;
+  text-transform: none;
+}
+
+#drawLineButton.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+#trafficCanvas {
+  background: var(--canvas-bg);
+  border: 1px solid var(--line);
+  display: none;
+  /* Display size is set by traffic.js to fit the space without scrolling. */
+}
+
+#trafficCanvas.drawing {
+  cursor: crosshair;
+}
+
+/* --- Pause / resume live detection ---------------------------------------- */
+.pause-button.paused {
+  background: var(--draft);
+  border-color: var(--draft);
+  color: #1f1300;
+  font-weight: 700;
+}
+
+.paused-indicator {
+  color: var(--draft);
+  font-weight: 700;
+}
+
+.paused-notice {
+  background: color-mix(in srgb, var(--draft) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--draft) 45%, transparent);
+  border-radius: 6px;
+  font-size: 13px;
+  line-height: 1.4;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+}
+
+.coverage-note {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+  margin: 6px 0 0;
+}
+
+.coverage-note.warn {
+  color: var(--warn-text, #b45309);
+  font-weight: 600;
+}
+
+.coverage-note.problem {
+  color: var(--danger);
+  font-weight: 700;
+}
+
+:root[data-theme="dark"] .coverage-note.warn {
+  --warn-text: #fbbf24;
+}
+
+/* Lot entrance/exit lines on the Traffic page */
+.traffic-lot-row {
+  margin-top: 8px;
+}
+
+.traffic-lot-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.flow-tag {
+  border-radius: 4px;
+  font-size: 10px;
+  font-weight: 700;
+  margin-left: 4px;
+  padding: 1px 5px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.flow-tag.flow-in,
+.flow-tag.flow-out {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+
+.traffic-lot-row .inline-label {
+  flex: 0 0 auto;
+  margin: 0;
+}
+
+/* Dashboard: entries & exits */
+.flow-summary {
+  line-height: 1.5;
+}
+
+.flow-muted {
+  color: var(--muted);
+}
+
+.flow-subtitle {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+  margin: 14px 0 4px;
+  text-transform: uppercase;
+}
+
+.flow-legend {
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  gap: 14px;
+  margin: 2px 0 4px;
+}
+
+.flow-legend i {
+  border-radius: 2px;
+  display: inline-block;
+  height: 10px;
+  margin-right: 5px;
+  vertical-align: -1px;
+  width: 10px;
+}
+
+/* Traffic page: gaps and their causes */
+.coverage-note.planned-only {
+  color: var(--muted);
+}
+
+.gap-details {
+  color: var(--muted);
+  font-weight: 400;
+  margin-top: 4px;
+}
+
+.gap-details summary {
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.gap-list {
+  display: grid;
+  gap: 4px;
+  list-style: none;
+  margin: 6px 0 0;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 0;
+}
+
+.gap-list li {
+  color: var(--text);
+}
+
+.gap-list li.gap-planned {
+  color: var(--muted);
+}
+
+.gap-list li.gap-problem span {
+  font-weight: 600;
+}
+
+.gap-list time {
+  font-variant-numeric: tabular-nums;
+}
+
+.gap-detail {
+  color: var(--muted);
+  display: block;
+  font-size: 11px;
+  font-weight: 400;
+}
+
+/* Traffic page: connect a new camera to an existing one */
+.connect-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 10px;
+}
+
+.connect-panel label {
+  margin-bottom: 6px;
+}
+
+.connect-row {
+  display: flex;
+  gap: 8px;
+}
+
+.connect-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+.connect-panel .traffic-muted {
+  line-height: 1.4;
+  margin: 8px 0 0;
+}
+
+/* Traffic page: vehicles in the lot */
+.small-button {
+  font-size: 12px;
+  min-height: 28px;
+  padding: 0 10px;
+}
+
+.occupancy-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.occupancy-number {
+  font-size: 34px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.occupancy-sub {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+  margin: 4px 0 0;
+}
+
+.occupancy-warn {
+  color: var(--warn-text, #b45309);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 8px 0 0;
+}
+
+.occupancy-warn.problem {
+  color: var(--danger);
+}
+
+:root[data-theme="dark"] .occupancy-warn {
+  --warn-text: #fbbf24;
+}
+
+/* Traffic page: zoom area editor */
+.zoom-dialog {
+  width: min(960px, calc(100vw - 32px));
+}
+
+.zoom-stage {
+  background: var(--canvas-bg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: grid;
+  min-height: 200px;
+  place-items: center;
+}
+
+#zoomCanvas {
+  cursor: crosshair;
+  display: none;
+  max-height: 62vh;
+  max-width: 100%;
+}
+
+.dialog-spacer {
+  flex: 1;
+}
+
+#zoomButton.active {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+  font-weight: 700;
+}
+
+/* "The app was updated" banner (theme.js) */
+.update-banner {
+  align-items: center;
+  background: var(--accent);
+  border-radius: 10px;
+  bottom: 20px;
+  box-shadow: 0 10px 30px rgba(20, 24, 30, 0.3);
+  color: #fff;
+  display: flex;
+  font-weight: 600;
+  gap: 12px;
+  left: 50%;
+  padding: 10px 14px 10px 18px;
+  position: fixed;
+  transform: translateX(-50%);
+  z-index: 1000;
+}
+
+.update-banner button {
+  background: #fff;
+  border-color: #fff;
+  color: var(--accent-strong);
+  font-weight: 700;
+  min-height: 30px;
+}
+
+/* Traffic page: uptime (for checking the software, not for clients) */
+.uptime-card {
+  background: var(--panel-alt);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  margin-top: 10px;
+  padding: 8px 10px;
+}
+
+.uptime-head {
+  align-items: baseline;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  font-weight: 600;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.uptime-target {
+  font-weight: 400;
+}
+
+.uptime-row {
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr 1fr;
+}
+
+.uptime-cell {
+  display: flex;
+  flex-direction: column;
+}
+
+.uptime-cell strong {
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.uptime-label,
+.uptime-sub {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.uptime-cell.good strong { color: var(--accent); }
+.uptime-cell.warn strong { color: var(--warn-text, #b45309); }
+.uptime-cell.bad strong { color: var(--danger); }
+.uptime-cell.none strong { color: var(--muted); }
+:root[data-theme="dark"] .uptime-cell.warn strong { color: #fbbf24; }
+
+/* Dashboard: Parking / Entrances & Exits / Street Traffic tabs */
+.dashboard-tabs {
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  gap: 4px;
+  margin-bottom: 20px;
+  overflow-x: auto;
+}
+
+.dashboard-tab {
+  border-bottom: 2px solid transparent;
+  color: var(--muted);
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: -1px;
+  padding: 10px 14px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.dashboard-tab:hover {
+  color: var(--text);
+}
+
+.dashboard-tab.active {
+  border-bottom-color: var(--accent);
+  color: var(--text);
+}
+
+.empty-panel {
+  background: var(--panel);
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 18px;
+  padding: 20px 24px;
+}
+
+.street-stats {
+  grid-template-columns: repeat(4, 1fr);
+}

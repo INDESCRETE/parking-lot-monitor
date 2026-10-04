@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Parking Lot Monitor — Traffic</title>
+    <link rel="stylesheet" href="/static/styles.css">
+    <script>
+      // Same early theme switch as the other pages (no flash of the wrong theme).
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme = stored === "dark" || stored === "light"
+            ? stored
+            : (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Traffic Counting</h1>
+        <p>Vehicles crossing counting lines</p>
+      </div>
+      <div class="topbar-actions">
+        <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/">Parking</a>
+        <a class="nav-link" href="/dashboard">Dashboard</a>
+        <a class="nav-link" href="/health">Health</a>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside class="sidebar">
+        <section>
+          <div class="section-title-row">
+            <label for="cameraSelect" class="section-title">Camera</label>
+            <div class="camera-buttons">
+              <button type="button" id="addCameraButton" class="add-camera-button">+ Add Camera</button>
+              <button type="button" id="deleteCameraButton" class="delete-camera-button" title="Delete the selected camera">Delete</button>
+            </div>
+          </div>
+          <select id="cameraSelect"></select>
+          <div class="camera-setting-row traffic-lot-row">
+            <label for="lotSelect" class="inline-label">Lot</label>
+            <select id="lotSelect" aria-label="Which lot this camera belongs to"></select>
+          </div>
+          <p id="connectionStatus" class="traffic-connection" role="status"></p>
+          <div id="connectPanel" class="connect-panel" hidden>
+            <label for="connectFromSelect">Use the same camera as</label>
+            <div class="connect-row">
+              <select id="connectFromSelect"></select>
+              <button type="button" id="connectButton">Connect</button>
+            </div>
+            <p id="connectHint" class="traffic-muted"></p>
+          </div>
+        </section>
+
+        <section id="occupancySection" hidden>
+          <div class="section-title-row">
+            <div class="section-title">Vehicles in the lot</div>
+            <button type="button" id="setCountButton" class="small-button">Set count</button>
+          </div>
+          <div id="occupancyCard" class="occupancy-card"></div>
+        </section>
+
+        <section>
+          <div class="section-title-row">
+            <div class="section-title">Counting lines</div>
+            <span id="countsRangeLabel" class="traffic-muted">Today</span>
+          </div>
+          <div id="lineList" class="line-list"></div>
+        </section>
+
+        <section>
+          <div class="section-title">Download counts</div>
+          <div class="traffic-download">
+            <input id="countDateInput" type="date" aria-label="Day to download">
+            <select id="binSelect" aria-label="Interval length">
+              <option value="15" selected>15 min</option>
+              <option value="5">5 min</option>
+              <option value="30">30 min</option>
+              <option value="60">1 hour</option>
+            </select>
+            <button type="button" id="downloadButton">CSV</button>
+          </div>
+          <p id="peakHour" class="traffic-muted"></p>
+          <p id="coverageNote" class="coverage-note"></p>
+          <div id="uptimeCard" class="uptime-card" hidden></div>
+        </section>
+
+        <section class="status-section">
+          <div class="section-title">Latest crossings</div>
+          <ol id="crossingList" class="crossing-list"></ol>
+        </section>
+      </aside>
+
+      <section class="workspace">
+        <div class="toolbar">
+          <button id="drawLineButton" type="button" title="Shortcut: L">Draw Line (L)</button>
+          <button id="cancelDrawButton" type="button" hidden>Cancel</button>
+          <button id="zoomButton" type="button" hidden title="Only analyse part of the picture, e.g. a small area far from the camera">Zoom Area</button>
+          <button id="pauseButton" type="button" class="pause-button" title="Stop or restart counting for this camera. The live picture keeps updating either way.">Pause Counting</button>
+          <label class="toolbar-check"><input id="showBoxesInput" type="checkbox" checked> Show vehicles</label>
+          <span id="trafficIndicator" class="live-feed-indicator" hidden>&#9679; Live</span>
+          <span id="pausedIndicator" class="paused-indicator" hidden>&#10074;&#10074; Paused</span>
+          <span id="status" role="status"></span>
+        </div>
+        <div class="canvas-wrap">
+          <canvas id="trafficCanvas"></canvas>
+          <div id="emptyState" class="empty-state"></div>
+        </div>
+      </section>
+    </main>
+
+    <dialog id="lineDialog">
+      <form method="dialog" id="lineForm" class="dialog-form">
+        <h2 id="lineDialogTitle">New counting line</h2>
+        <label for="lineNameInput">Line name</label>
+        <input id="lineNameInput" autocomplete="off" placeholder="e.g. Main St" required maxlength="60">
+        <label for="forwardLabelInput"><span id="forwardArrow" class="direction-arrow"></span> Direction A name</label>
+        <input id="forwardLabelInput" autocomplete="off" maxlength="60" required>
+        <label for="reverseLabelInput"><span id="reverseArrow" class="direction-arrow"></span> Direction B name</label>
+        <input id="reverseLabelInput" autocomplete="off" maxlength="60" required>
+        <label for="entryDirectionSelect">Lot entrance/exit?</label>
+        <select id="entryDirectionSelect">
+          <option value="">No, just count it (e.g. a street)</option>
+          <option value="forward">Yes: Direction A goes INTO the lot</option>
+          <option value="reverse">Yes: Direction B goes INTO the lot</option>
+        </select>
+        <p class="dialog-hint">The arrows on the picture show which way each name counts. Rename them to anything, e.g. Northbound / Southbound or In / Out.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelLineButton">Cancel</button>
+          <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="zoomDialog" class="zoom-dialog">
+      <form method="dialog" id="zoomForm" class="dialog-form">
+        <h2>Zoom area</h2>
+        <p class="dialog-hint">Drag a box around the part of the street or lot to watch. Only that part is analysed, so vehicles in it look bigger to the AI. Leave room around your lines: cars need to be seen a little before and after they cross.</p>
+        <div class="zoom-stage">
+          <canvas id="zoomCanvas"></canvas>
+          <p id="zoomLoading" class="traffic-muted">Getting a full picture from the camera…</p>
+        </div>
+        <label class="toolbar-check" id="fullResolutionRow" hidden><input id="fullResolutionInput" type="checkbox"> Use the camera's full resolution (sharper zoom; more work for this computer)</label>
+        <p id="zoomInfo" class="traffic-muted"></p>
+        <div class="dialog-actions">
+          <button type="button" id="zoomWholeButton">Whole picture</button>
+          <span class="dialog-spacer"></span>
+          <button value="cancel" type="button" id="cancelZoomButton">Cancel</button>
+          <button value="save" type="submit" id="saveZoomButton">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="countDialog">
+      <form method="dialog" id="countForm" class="dialog-form">
+        <h2>Vehicles in the lot right now</h2>
+        <label for="countInput">How many are inside?</label>
+        <input id="countInput" type="number" min="0" step="1" inputmode="numeric" required>
+        <p class="dialog-hint">Count them by looking (easiest when the lot is empty or nearly empty, e.g. at night). The app keeps adding vehicles that enter and subtracting ones that leave from this number. Set it again whenever it drifts.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCountButton">Cancel</button>
+          <button value="save" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="lotDialog">
+      <form method="dialog" id="lotForm" class="dialog-form">
+        <h2>New lot</h2>
+        <label for="lotNameInput">Lot name</label>
+        <input id="lotNameInput" autocomplete="off" placeholder="e.g. Cul-de-sac" required maxlength="80">
+        <label for="lotClientInput">Client (optional)</label>
+        <input id="lotClientInput" list="clientOptions" autocomplete="off" placeholder="e.g. City of Provo" maxlength="80">
+        <datalist id="clientOptions"></datalist>
+        <label for="lotAddressInput">Address (optional)</label>
+        <input id="lotAddressInput" autocomplete="off" maxlength="200">
+        <p class="dialog-hint">This camera moves into the new lot. "Vehicles in the lot" adds up the entrance/exit lines of every camera in the same lot, so give each real lot its own.</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelLotButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="cameraDialog">
+      <form method="dialog" id="cameraForm" class="dialog-form">
+        <h2>Add traffic camera</h2>
+        <label for="cameraNameInput">Camera name</label>
+        <input id="cameraNameInput" autocomplete="off" placeholder="e.g. State St northbound" required>
+        <p class="dialog-hint">To connect it to a real camera, its settings go in data/camera_sources.json under the camera's id (shown after it's created).</p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="cancelCameraButton">Cancel</button>
+          <button value="save" type="submit">Create</button>
+        </div>
+      </form>
+    </dialog>
+
+    <dialog id="confirmDialog">
+      <form method="dialog" class="dialog-form">
+        <h2 id="confirmTitle"></h2>
+        <p id="confirmMessage" class="confirm-message"></p>
+        <div class="dialog-actions">
+          <button value="cancel" type="button" id="confirmCancelButton">Cancel</button>
+          <button value="ok" type="submit" id="confirmOkButton" class="danger-button">Delete</button>
+        </div>
+      </form>
+    </dialog>
+
+    <script src="/static/theme.js"></script>
+    <script src="/static/traffic.js"></script>
+  </body>
+</html>

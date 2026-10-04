@@ -8,7 +8,10 @@ What it watches (a check runs every 30 seconds):
 * The computer sleeping or freezing. If a 30-second check suddenly comes 10 minutes
   late, the computer wasn't running us in between.
 * Each live camera. If one stops sending pictures for ``camera_down_minutes``, you
-  get an alert. When pictures come back, you get a "camera back" alert.
+  get an alert. When pictures come back, you get a "camera back" alert. Traffic
+  cameras are checked every few seconds and alert after only
+  ``traffic_camera_down_seconds`` (30 by default): every second a traffic camera
+  is down, passing vehicles go uncounted.
 * Car detection stalling while pictures still arrive (for example, the model crashed).
 * The internet. If it drops, alerts wait in an outbox on disk and go out when it
   returns, along with an "internet was down from X to Y" note. Counting never stops
@@ -32,6 +35,7 @@ can take down the parking monitor itself.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -52,12 +56,16 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT / "app"
 DATA_DIR = ROOT / "data"
 CONFIG_PATH = DATA_DIR / "alerts.json"
 HEALTH_DIR = DATA_DIR / "health"
 BACKUP_DIR = DATA_DIR / "backups"
 
 CHECK_INTERVAL_SECONDS = 30.0
+# Cameras are checked more often than everything else, so a traffic camera's
+# short alert delay actually means something.
+CAMERA_CHECK_INTERVAL_SECONDS = 5.0
 HEARTBEAT_INTERVAL_SECONDS = 60.0
 SEND_RETRY_SECONDS = 30.0
 SEND_TIMEOUT_SECONDS = 10.0
@@ -79,6 +87,8 @@ DEFAULT_CONFIG: dict = {
     },
     "camera_down_minutes": 5,
     "detection_stall_minutes": 10,
+    "traffic_camera_down_seconds": 30,
+    "traffic_detection_stall_seconds": 60,
     "outage_report_minutes": 2,
     "disk_warn_percent": 85,
     "backup_hour": 3,
@@ -89,6 +99,8 @@ DEFAULT_CONFIG: dict = {
 _NUMBER_LIMITS = {
     "camera_down_minutes": (1, 1440),
     "detection_stall_minutes": (1, 1440),
+    "traffic_camera_down_seconds": (10, 3600),
+    "traffic_detection_stall_seconds": (15, 3600),
     "outage_report_minutes": (0.5, 1440),
     "disk_warn_percent": (10, 99),
     "backup_hour": (0, 23),
@@ -100,6 +112,31 @@ _NUMBER_LIMITS = {
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
+
+
+def code_fingerprints(app_dir: Path = APP_DIR) -> dict:
+    """A short hash of each of the program's .py files. Compared with the
+    previous run's at startup: if any changed, the restart was a software
+    update (whoever installed it), not the program or the camera failing."""
+    prints = {}
+    for path in sorted(app_dir.glob("*.py")):
+        try:
+            prints[path.name] = hashlib.sha1(path.read_bytes()).hexdigest()[:12]
+        except OSError:
+            pass
+    return prints
+
+
+# Why the program (re)started, as shown next to gaps in the data.
+STARTUP_LABELS = {
+    "first_start": "Monitoring started for the first time",
+    "update": "Software update (program restarted to install it)",
+    "restart": "Program restarted",
+    "stopped": "Program was stopped",
+    "crash": "Program crashed or was force-quit",
+    "reboot": "Computer was restarted",
+    "power": "Computer lost power",
+}
 
 
 def utc_now() -> datetime:
@@ -443,6 +480,19 @@ class Notifier:
         self._wake.set()
         return alert
 
+    def log(self, title: str, message: str, kind: str = "info") -> dict:
+        """Writes to the alert history only: no phone push, no email."""
+        alert = {
+            "id": secrets.token_hex(6),
+            "created_at": self.clock().isoformat(),
+            "kind": kind,
+            "title": f"{self.config.get('site_name') or 'Parking lot monitor'}: {title}",
+            "message": message,
+            "priority": "min",
+        }
+        print(f"[health] {alert['title']} -- {message}", flush=True)
+        return self.history.add(alert)
+
     def pending(self) -> list:
         with self._lock:
             return [dict(a) for a in self._outbox]
@@ -528,8 +578,13 @@ class HealthMonitor:
         senders: Optional[dict] = None,
         internet_check: Optional[Callable[[], bool]] = None,
         clock: Callable[[], datetime] = utc_now,
+        code_fingerprints_fn: Callable[[], dict] = code_fingerprints,
     ):
         self.db_path = db_path
+        self.code_fingerprints_fn = code_fingerprints_fn
+        # Why this run started (set by load_previous_state); see STARTUP_LABELS.
+        self.startup: dict = {"reason": "restart", "label": STARTUP_LABELS["restart"], "detail": "",
+                              "down_since": None, "started_at": None}
         self.camera_statuses = camera_statuses
         self.camera_config_error = config_error_fn
         self.health_dir = health_dir or HEALTH_DIR
@@ -546,6 +601,7 @@ class HealthMonitor:
         self._last_tick_wall: Optional[float] = None
         self._last_heartbeat = 0.0
         self._problems: dict = {}  # key -> {"since", "message"}
+        self._camera_check_lock = threading.Lock()
         self._camera_since: dict = {}
         self.internet_online: Optional[bool] = None
         self._offline_since: Optional[datetime] = None
@@ -563,6 +619,7 @@ class HealthMonitor:
         self.notifier.start()
         self._thread = threading.Thread(target=self._run, daemon=True, name="health-monitor")
         self._thread.start()
+        threading.Thread(target=self._run_camera_checks, daemon=True, name="health-cameras").start()
 
     def load_previous_state(self) -> None:
         """Reads what the last run left behind, reports any downtime, and picks up
@@ -574,8 +631,12 @@ class HealthMonitor:
         if isinstance(saved, dict):
             with self._lock:
                 self._problems = {k: v for k, v in saved.items() if isinstance(v, dict) and "since" in v}
-        self._report_previous_downtime(previous if isinstance(previous, dict) else None)
-        self._state.update(started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid())
+        fingerprints = self.code_fingerprints_fn()
+        self._report_previous_downtime(previous if isinstance(previous, dict) else None, fingerprints)
+        self._state.update(
+            started_at=self.started_at.isoformat(), clean_shutdown=False, pid=os.getpid(),
+            code_fingerprints=fingerprints, startup=self.startup,
+        )
         self._save_state()
 
     def stop(self) -> None:
@@ -596,9 +657,19 @@ class HealthMonitor:
             self.last_check_error = f"could not save health state: {exc}"
 
     # -- downtime while we were not running --------------------------------
-    def _report_previous_downtime(self, previous: Optional[dict]) -> None:
+    def _set_startup(self, reason: str, since: Optional[datetime], detail: str = "") -> None:
+        self.startup = {
+            "reason": reason,
+            "label": STARTUP_LABELS.get(reason, reason),
+            "detail": detail,
+            "down_since": since.isoformat() if since else None,
+            "started_at": self.started_at.isoformat(),
+        }
+
+    def _report_previous_downtime(self, previous: Optional[dict], fingerprints: Optional[dict] = None) -> None:
         now = self.clock()
         if previous is None:
+            self._set_startup("first_start", None)
             self.notifier.notify(
                 "Alerts are on",
                 "Monitoring started. This is where alerts will show up if a camera, the internet, "
@@ -608,25 +679,55 @@ class HealthMonitor:
             return
         last_alive = parse_iso(previous.get("last_alive_at"))
         if last_alive is None:
+            self._set_startup("restart", None)
             return
         gap = (now - last_alive).total_seconds()
         clean = bool(previous.get("clean_shutdown"))
         boot = system_boot_time()
         rebooted = boot is not None and last_alive < boot <= now
-        if clean and gap < self.config["outage_report_minutes"] * 60:
-            return  # an ordinary quick restart (e.g. a code update) is not news
+        old_prints = previous.get("code_fingerprints")
+        changed = []
+        if isinstance(old_prints, dict) and fingerprints:
+            changed = sorted(name for name in set(old_prints) | set(fingerprints)
+                             if old_prints.get(name) != fingerprints.get(name))
+        updated = bool(changed) and not rebooted
         if rebooted and not clean:
+            reason = "power"
             cause = "The computer shut off without warning and restarted by itself. This is most likely a power outage."
         elif rebooted:
+            reason = "reboot"
             cause = "The computer was restarted."
+        elif updated:
+            reason = "update"
+            cause = "The program restarted to install a software update" + ("" if clean else ", and didn't shut down cleanly") + "."
         elif not clean:
+            reason = "crash"
             cause = "The monitoring program stopped unexpectedly (a crash or forced quit) and has been restarted."
+        elif gap < self.config["outage_report_minutes"] * 60:
+            reason = "restart"
+            cause = "The monitoring program was restarted."
         else:
+            reason = "stopped"
             cause = "The monitoring program was stopped, then started again."
+        detail = f"Changed: {', '.join(changed)}" if updated else ""
+        self._set_startup(reason, last_alive, detail)
+        quick_and_clean = clean and gap < self.config["outage_report_minutes"] * 60
+        if quick_and_clean:
+            # Not worth a phone alert, but written to the alert history so a
+            # look back at "how often did it go down" can tell our own
+            # restarts (updates) apart from real problems.
+            self.notifier.log(
+                "Restarted for a software update" if updated else "Program restarted",
+                f"Monitoring paused {fmt_span(last_alive, now)} ({fmt_duration(gap)}). {cause}"
+                + (f" {detail}." if detail else ""),
+                "update" if updated else "restart",
+            )
+            return
         self.notifier.notify(
             "Back online",
             f"Monitoring was down {fmt_span(last_alive, now)} ({fmt_duration(gap)}). "
-            f"{cause} Nothing was counted during that time; the reports show it as a gap.",
+            f"{cause} Nothing was counted during that time; the reports show it as a gap."
+            + (f" {detail}." if detail else ""),
             "high" if not clean else "default",
             "white_check_mark",
             "back_online",
@@ -637,6 +738,13 @@ class HealthMonitor:
         while not self._halt.is_set():
             self.tick()
             self._halt.wait(CHECK_INTERVAL_SECONDS)
+
+    def _run_camera_checks(self) -> None:
+        while not self._halt.wait(CAMERA_CHECK_INTERVAL_SECONDS):
+            try:
+                self._check_cameras()
+            except Exception as exc:
+                self.last_check_error = f"_check_cameras: {exc}"
 
     def tick(self) -> None:
         """One round of checks. Public so tests can drive it directly."""
@@ -703,9 +811,12 @@ class HealthMonitor:
 
     # -- cameras -------------------------------------------------------------
     def _check_cameras(self) -> None:
+        # Runs from both the main loop and the fast camera loop.
+        with self._camera_check_lock:
+            self._check_cameras_locked()
+
+    def _check_cameras_locked(self) -> None:
         now = self.clock()
-        down_after = self.config["camera_down_minutes"] * 60
-        stall_after = self.config["detection_stall_minutes"] * 60
         seen = set()
         for cam in self.camera_statuses():
             camera_id = cam["camera_id"]
@@ -714,6 +825,15 @@ class HealthMonitor:
             grabber = cam.get("grabber") or {}
             if not grabber.get("configured"):
                 continue
+            traffic = cam.get("kind") == "traffic"
+            if traffic:
+                down_after = self.config["traffic_camera_down_seconds"]
+                stall_after = self.config["traffic_detection_stall_seconds"]
+                impact = "Vehicles passing now are NOT being counted."
+            else:
+                down_after = self.config["camera_down_minutes"] * 60
+                stall_after = self.config["detection_stall_minutes"] * 60
+                impact = "Counting for this camera is paused."
             last_frame = parse_iso(grabber.get("last_frame_at"))
             reference = last_frame or parse_iso(grabber.get("started_at")) or self.started_at
             reference = max(reference, self.started_at)  # don't blame the camera for our own downtime
@@ -724,7 +844,7 @@ class HealthMonitor:
                 self._open_problem(
                     key, since, f"Camera '{name}' is down",
                     f"No pictures from camera '{name}' since {fmt_local(since)}. Last error: {error}. "
-                    "Counting for this camera is paused. It will reconnect by itself when the camera is "
+                    f"{impact} It will reconnect by itself when the camera is "
                     "back. If it doesn't, check the camera's cable and power.",
                 )
             elif last_frame is not None:
@@ -736,10 +856,20 @@ class HealthMonitor:
 
             # Detection stalled: pictures arrive but nothing gets analysed.
             detect_key = f"detection:{camera_id}"
+            if cam.get("paused"):
+                # Switched off on purpose from the website: not a problem.
+                with self._lock:
+                    dropped = self._problems.pop(detect_key, None)
+                if dropped is not None:
+                    self._save_state()
+                continue
             camera_ok = last_frame is not None and (now - last_frame).total_seconds() < down_after
             detection = cam.get("detection") or {}
             last_detect = parse_iso(detection.get("last_frame_at"))
             detect_ref = max(last_detect or self.started_at, self.started_at)
+            resumed_at = parse_iso(cam.get("paused_changed_at"))
+            if resumed_at is not None:
+                detect_ref = max(detect_ref, resumed_at)  # time since it was switched back on
             if camera_ok and (now - detect_ref).total_seconds() >= stall_after:
                 error = detection.get("last_error") or "no error reported"
                 self._open_problem(
@@ -911,6 +1041,7 @@ class HealthMonitor:
         return {
             "ok": not self.problems(),
             "started_at": self.started_at.isoformat(),
+            "startup": self.startup,
             "problems": self.problems(),
             "internet_online": self.internet_online,
             "alert_channels": configured_channels(self.config),

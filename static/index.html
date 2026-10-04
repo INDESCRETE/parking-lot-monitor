@@ -30,6 +30,7 @@
       </div>
       <div class="topbar-actions">
         <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
+        <a class="nav-link" href="/traffic">Traffic</a>
         <a class="nav-link" href="/dashboard">Dashboard</a>
         <a class="nav-link" href="/health">Health</a>
         <form id="uploadForm" class="upload-form">
@@ -92,6 +93,7 @@
               <option value="duration">Sort: Duration</option>
             </select>
           </div>
+          <p id="pausedNotice" class="paused-notice" hidden></p>
           <div id="statusList" class="status-list"></div>
         </section>
       </aside>
@@ -102,6 +104,7 @@
           <button id="undoPointButton" type="button" disabled>Undo Point</button>
           <button id="clearDraftButton" type="button" disabled>Clear</button>
           <button id="runDetectionButton" type="button">Run Detection</button>
+          <button id="pauseDetectionButton" type="button" class="pause-button" hidden title="Stop or restart live detection for this camera. The live picture keeps updating either way.">Pause Detection</button>
           <button id="liveViewButton" type="button" hidden>Live View</button>
           <button id="liveFeedButton" type="button" hidden>Back to Live Feed</button>
           <a id="configLink" href="/api/config/camera_1" target="_blank">View Config JSON</a>
@@ -137,7 +140,12 @@
         <h2>Add Camera</h2>
         <label for="cameraNameInput">Camera name</label>
         <input id="cameraNameInput" name="cameraName" autocomplete="off" placeholder="e.g. North Entrance" required>
-        <p class="dialog-hint">Its own separate set of images and marked spaces — nothing on your other cameras is affected.</p>
+        <fieldset class="kind-choice">
+          <legend>What will it do?</legend>
+          <label class="kind-option"><input type="radio" name="cameraKind" value="parking" checked> <span><strong>Parking spaces</strong><br>Mark spaces, see which are occupied</span></label>
+          <label class="kind-option"><input type="radio" name="cameraKind" value="traffic"> <span><strong>Traffic counting</strong><br>Draw lines, count vehicles crossing them</span></label>
+        </fieldset>
+        <p class="dialog-hint">Its own separate settings and data — nothing on your other cameras is affected.</p>
         <div class="dialog-actions">
           <button value="cancel" type="button" id="cancelCameraButton">Cancel</button>
           <button value="save" type="submit">Create</button>

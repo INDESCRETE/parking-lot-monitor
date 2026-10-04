@@ -197,6 +197,74 @@ class HealthTests(unittest.TestCase):
         h.camera(last_frame_ago_s=2, detect_ago_s=2); h.tick()
         self.assertEqual(h.titles()[-1], "Test Lot: Car detection working again for 'Front lot'")
 
+    def test_restart_after_code_change_is_logged_as_an_update_not_pushed(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h.start(); h.tick()
+        h.monitor.mark_clean_shutdown()
+        self.clock.advance(seconds=4)
+        h2 = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h2.monitor.code_fingerprints_fn = lambda: {"server.py": "bbb"}
+        h2.start()
+        self.assertEqual(h2.monitor.startup["reason"], "update")
+        self.assertIn("server.py", h2.monitor.startup["detail"])
+        history = h2.monitor.notifier.history.list()
+        self.assertIn("Restarted for a software update", history[0]["title"])
+        self.assertEqual(h2.monitor.notifier.pending(), [], "an update restart is not pushed to the phone")
+
+    def test_quick_restart_without_code_change_is_a_restart(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h.start(); h.tick()
+        h.monitor.mark_clean_shutdown()
+        self.clock.advance(seconds=4)
+        h2 = Harness(self.tmp, self.clock, BASE_CONFIG)
+        h2.monitor.code_fingerprints_fn = lambda: {"server.py": "aaa"}
+        h2.start()
+        self.assertEqual(h2.monitor.startup["reason"], "restart")
+
+    def test_traffic_camera_down_alert_after_30_seconds(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=20, detect_ago_s=20)
+        h.cameras[0]["kind"] = "traffic"
+        h.tick()
+        self.assertEqual([t for t in h.titles() if "down" in t], [])
+        h.camera(last_frame_ago_s=35, detect_ago_s=35)
+        h.cameras[0]["kind"] = "traffic"
+        h.tick()
+        self.assertEqual([t for t in h.titles() if "down" in t], ["Test Lot: Camera 'Front lot' is down"])
+        self.assertIn("NOT being counted", h.sent[-1][1])
+        # A parking camera 35 s quiet is not down (5 minutes).
+        (self.tmp / "p").mkdir()
+        h2 = Harness(self.tmp / "p", self.clock, BASE_CONFIG); h2.start()
+        h2.monitor.started_at = self.clock() - timedelta(hours=1)
+        h2.camera(last_frame_ago_s=35, detect_ago_s=35); h2.tick()
+        self.assertEqual([t for t in h2.titles() if "down" in t], [])
+
+    def test_paused_camera_is_not_a_detection_stall(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=2, detect_ago_s=15 * 60)
+        h.cameras[0]["paused"] = True
+        h.tick()
+        self.assertEqual(h.titles(), [])
+        # Resumed 1 minute ago: the clock for "stalled" starts at the resume.
+        h.cameras[0]["paused"] = False
+        h.cameras[0]["paused_changed_at"] = (self.clock() - timedelta(minutes=1)).isoformat()
+        h.tick()
+        self.assertEqual(h.titles(), [])
+
+    def test_pausing_clears_an_open_stall_quietly(self):
+        h = Harness(self.tmp, self.clock, BASE_CONFIG); h.start()
+        h.monitor.started_at = self.clock() - timedelta(hours=1)
+        h.camera(last_frame_ago_s=2, detect_ago_s=15 * 60); h.tick()
+        self.assertEqual(len(h.titles()), 1)
+        h.cameras[0]["paused"] = True
+        h.tick()
+        self.assertEqual(len(h.titles()), 1)
+        self.assertFalse([p for p in h.monitor.problems() if p["key"].startswith("detection:")])
+
     # -- internet / outbox ----------------------------------------------------------
     def test_alerts_queue_while_offline_and_survive_restart(self):
         h = Harness(self.tmp, self.clock, BASE_CONFIG, online=False, fail_send=True); h.start()

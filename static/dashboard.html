@@ -26,11 +26,12 @@
     <header class="topbar">
       <div>
         <h1>Dashboard</h1>
-        <p>Occupancy analytics across clients and lots</p>
+        <p>Parking, entrances &amp; exits, and street traffic for each lot</p>
       </div>
       <div class="topbar-actions">
         <button type="button" id="themeToggleButton" class="theme-toggle-button" title="Switch to dark mode" aria-pressed="false">&#127769;</button>
         <a class="nav-link" href="/">Annotation View</a>
+        <a class="nav-link" href="/traffic">Traffic</a>
       </div>
     </header>
 
@@ -48,7 +49,7 @@
             <option value="">Select a client first</option>
           </select>
         </label>
-        <label class="control">
+        <label class="control" id="cameraFilterWrap">
           <span class="control-label">Camera</span>
           <select id="cameraFilterSelect" disabled>
             <option value="">All cameras</option>
@@ -74,9 +75,17 @@
         <button type="button" id="downloadReportButton" disabled>Download Report</button>
       </div>
 
+      <nav class="dashboard-tabs" role="tablist" aria-label="Dashboard sections">
+        <a href="#parking" class="dashboard-tab" role="tab" data-tab="parking" id="tabButtonParking">Parking</a>
+        <a href="#entries" class="dashboard-tab" role="tab" data-tab="entries" id="tabButtonEntries">Entrances &amp; Exits</a>
+        <a href="#street" class="dashboard-tab" role="tab" data-tab="street" id="tabButtonStreet">Street Traffic</a>
+      </nav>
+
       <div id="dashboardStatus" class="dashboard-status">Loading clients…</div>
 
       <div id="dashboardContent" class="dashboard-content" hidden>
+        <!-- Parking: the parking-space cameras (occupancy, turnover, dwell). -->
+        <div class="dashboard-page" data-page="parking" role="tabpanel" aria-labelledby="tabButtonParking">
         <div class="stat-grid">
           <div class="stat-card">
             <div class="label">Occupancy Rate</div>
@@ -137,6 +146,32 @@
           <p class="panel-sub">How long a typical car stays in each space, busiest first.</p>
           <div id="dwellChart" class="chart-svg-wrap"></div>
         </section>
+        </div>
+
+        <!-- Entrances & exits: lines marked as lot entrance/exit on the lot's traffic cameras. -->
+        <div class="dashboard-page" data-page="entries" role="tabpanel" aria-labelledby="tabButtonEntries" hidden>
+        <p class="empty-panel" id="flowEmpty" hidden>No entrance/exit lines for this lot yet. On the Traffic page, draw a counting line across the driveway and mark it as a lot entrance/exit.</p>
+        <section class="chart-panel" id="flowPanel">
+          <h2>Entries &amp; Exits</h2>
+          <p class="panel-sub">Vehicles driving in and out, counted on the lines marked as lot entrance/exit on this lot's traffic cameras (set on the Traffic page).</p>
+          <p class="flow-summary" id="flowSummary"></p>
+          <h3 class="flow-subtitle">Average by hour of day</h3>
+          <div id="flowHourChart" class="chart-svg-wrap"></div>
+          <div id="flowDayWrap" hidden>
+            <h3 class="flow-subtitle">By day</h3>
+            <div id="flowDayChart" class="chart-svg-wrap"></div>
+          </div>
+          <h3 class="flow-subtitle">Vehicles in the lot</h3>
+          <p class="flow-summary" id="accumulationSummary"></p>
+          <div id="accumulationChart" class="chart-svg-wrap"></div>
+        </section>
+        </div>
+
+        <!-- Street traffic: every other counting line on the lot's traffic cameras. -->
+        <div class="dashboard-page" data-page="street" role="tabpanel" aria-labelledby="tabButtonStreet" hidden>
+        <p class="empty-panel" id="streetEmpty" hidden>No street counting lines for this lot yet. On the Traffic page, draw a counting line across the road (one that isn't marked as a lot entrance/exit).</p>
+        <div id="streetContent"></div>
+        </div>
       </div>
     </main>
 
